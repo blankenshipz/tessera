@@ -603,6 +603,17 @@ class SaladWorld:
         )
         return manifest
 
+    def record_custody(self, began: bool = True, cause: str | None = "allocation_changed") -> None:
+        """The guardian's custody status for the route, as the trusted executor records it
+        before it uploads a partial manifest."""
+        row = self.salad()
+        self.env.store.record_salad_custody_evidence(
+            self.worker,
+            row["attempt_id"],
+            self.key("custody"),
+            {"route_id": row["route_id"], "custody_work_begun": began, "stop_cause": cause},
+        )
+
     def observe_exit(self) -> None:
         from tessera_control.execution import ExecutionStore
 

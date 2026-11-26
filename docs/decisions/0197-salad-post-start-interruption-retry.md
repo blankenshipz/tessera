@@ -51,9 +51,14 @@ runs a group without a GPU at its lowest priority whatever was sent, so a readba
    guardian's sealed, incomplete custody and writes a manifest listing only the declared files
    that reached custody, each hash-verified on import and again at admission (a partial
    manifest may be written only for this end state, and only with files the plan declares;
-   control itself admits one only when the attempt's route is flagged reallocated and the
-   provider's own read confirmed the stop, and refuses it for any other lease, so a premature
-   or ordinary-run partial never blocks the complete manifest).
+   control itself admits one only when all of its own records agree: the attempt's route (read
+   within the owning campaign's org and project) is flagged reallocated, the provider's own read
+   confirmed the stop, and the guardian's custody status, which the trusted executor reads over
+   the authenticated admin channel and records before the upload, says custody work had begun
+   on an allocation change. It refuses a partial manifest for any other lease, and when any one
+   of the three is missing, so a precustody reallocation, a premature partial or an
+   ordinary-run partial is never admitted and never blocks the complete manifest. Linking the
+   manifest to the attempt repeats the check against the recorded live receipt).
    Custody is never read by operation instead. A manifest that lacks a declared output is
    never a pass: the executor's success check, the Salad verdict and an ordinary run's
    observation all refuse it, whatever receipt comes with it. The interrupted attempt's verdict stays

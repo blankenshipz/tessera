@@ -86,26 +86,54 @@ def manifest_is_partial(artifacts: list[dict[str, Any]], output_paths: Any) -> b
 
 
 def _attempt_interrupted(connection: sqlite3.Connection, lease_id: str, operation_id: str) -> bool:
-    """True when the Salad attempt holding this lease and operation ended interrupted: its
-    route is flagged reallocated and the provider's own reads confirmed the stop. A lease with
-    no Salad attempt (any ordinary run) is never interrupted."""
+    """True when the Salad attempt holding this lease and operation was moved by the provider:
+    its route is flagged reallocated, the provider's own reads confirmed the stop, and control
+    holds the guardian's own record that custody work had begun for this operation (an
+    allocation change before custody began is the precustody retry, never this). A lease with no
+    Salad attempt (any ordinary run) never is. Without any of the three it fails closed."""
     from .salad_termination import provider_termination
 
+    # The route is read only within the org and project of the campaign that owns the attempt
+    # (control's own records), the way ``SaladStageDriver.scoped_route`` does.
     attempt = connection.execute(
-        "SELECT route_id FROM campaign_salad_attempts WHERE lease_id=? AND operation_id=?",
+        """SELECT sa.attempt_id, sa.route_id, c.org_id, c.project_id FROM campaign_salad_attempts sa
+        JOIN campaign_stage_attempts a ON a.id = sa.attempt_id
+        JOIN campaigns c ON c.id = a.campaign_id
+        WHERE sa.lease_id=? AND sa.operation_id=?""",
         (lease_id, operation_id),
     ).fetchone()
     if attempt is None or attempt["route_id"] is None:
         return False
     row = connection.execute(
         """SELECT payload_json FROM events WHERE event_type='remote_execution.state'
-        AND json_extract(payload_json,'$.id')=? ORDER BY cursor DESC LIMIT 1""",
-        (attempt["route_id"],),
+        AND org_id=? AND project_id=? AND json_extract(payload_json,'$.id')=?
+        ORDER BY cursor DESC LIMIT 1""",
+        (attempt["org_id"], attempt["project_id"], attempt["route_id"]),
     ).fetchone()
     if row is None:
         return False
     route = json.loads(row["payload_json"])
-    return route.get("reallocated") is True and provider_termination(route).confirmed
+    if route.get("reallocated") is not True or not provider_termination(route).confirmed:
+        return False
+    # Control's own record of the guardian's custody status, written before the upload and
+    # scoped to this attempt's org, project and operation (never the worker's receipt).
+    evidence = connection.execute(
+        """SELECT payload_json FROM events WHERE event_type='campaign.salad_custody_observed'
+        AND org_id=? AND project_id=? AND json_extract(payload_json,'$.attempt_id')=?
+        AND json_extract(payload_json,'$.operation_id')=?
+        AND json_extract(payload_json,'$.route_id')=? ORDER BY cursor DESC LIMIT 1""",
+        (
+            attempt["org_id"],
+            attempt["project_id"],
+            attempt["attempt_id"],
+            operation_id,
+            attempt["route_id"],
+        ),
+    ).fetchone()
+    if evidence is None:
+        return False
+    seen = json.loads(evidence["payload_json"])
+    return seen.get("custody_work_begun") is True and seen.get("stop_cause") == "allocation_changed"
 
 
 def grant_manifest_is_partial(
@@ -335,8 +363,10 @@ class ArtifactManifestStore(ArtifactStore):
                 and manifest_is_partial(verified, declared)
                 and not _attempt_interrupted(connection, lease_id, body["operation_id"])
             ):
-                # Control's own record decides, never the worker's say-so: a partial manifest
-                # is admitted only after the provider moved the instance after custody began.
+                # Control's own records decide, never the worker's say-so: a partial manifest is
+                # admitted only when its route was moved by the provider, the provider's read
+                # confirmed the stop and the guardian's custody status (recorded beforehand)
+                # says custody work had begun.
                 raise Conflict("A partial artifact manifest needs an interrupted attempt.")
             canonical = self._canonical_payload(lease, grant, actor, verified, body["operation_id"])
             if body["partial"] and manifest_is_partial(verified, declared):

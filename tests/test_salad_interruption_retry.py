@@ -188,6 +188,7 @@ def interrupted_with_manifest(world, content=CHECKPOINT, path="checkpoint.bin"):
     world.to_route_started()
     _ran_and_reallocated(world, [dict(stopped=True)])
     # The diagnostic never arrived: the executor's partial manifest lists what reached custody.
+    world.record_custody()
     manifest = world.upload_manifest(content, path, placed=True, partial=True)
     world.observe_exit()
     row = world.salad()
@@ -415,6 +416,7 @@ def test_a_partial_manifest_never_verifies_as_a_pass(tmp_path):
     world = checkpoint_world(tmp_path)
     world.to_route_started()
     _ran_and_reallocated(world, [dict(stopped=True)])
+    world.record_custody()
     manifest = world.upload_manifest(CHECKPOINT, "checkpoint.bin", placed=True, partial=True)
     world.observe_exit()
     row = world.salad()

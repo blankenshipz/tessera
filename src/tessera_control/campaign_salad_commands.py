@@ -144,6 +144,33 @@ class _GuardianFinal(BaseModel):
     start_events: _StartEvents | None = None
 
 
+def _partial_without_custody_evidence(connection, row, manifest_id, receipt) -> bool:
+    """True when the manifest lists fewer files than the approved plan declares and the live
+    receipt does not carry the guardian's interruption evidence (allocation change, custody work
+    begun, provider stop confirmed)."""
+    from .artifact_manifests import grant_manifest_is_partial
+
+    manifest = connection.execute(
+        """SELECT artifacts_json, grant_id FROM artifact_manifests WHERE id=? AND lease_id=?
+        AND operation_id=?""",
+        (manifest_id, row["lease_id"], row["operation_id"]),
+    ).fetchone()
+    if manifest is None:
+        return False  # an unknown manifest is refused where it is read, as before
+    grant = connection.execute(
+        "SELECT * FROM execution_grants WHERE id=?", (manifest["grant_id"],)
+    ).fetchone()
+    if grant is not None and not grant_manifest_is_partial(
+        connection, grant, manifest["artifacts_json"]
+    ):
+        return False
+    return not (
+        receipt.get("guardian_stop_cause") == "allocation_changed"
+        and receipt.get("custody_work_begun") is True
+        and receipt.get("provider_stop_confirmed") is True
+    )
+
+
 class _SaladOutcome(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
     route_id: _Ident
@@ -155,6 +182,17 @@ class _SaladOutcome(BaseModel):
 
 
 LIVE_CHECK_NO_RECEIPT = "live_check_no_receipt"
+
+
+class _SaladCustodyEvidence(BaseModel):
+    """The guardian's own custody status for the route, as the trusted executor read it over the
+    authenticated admin channel (never the workload's word)."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    route_id: _Ident
+    custody_work_begun: bool
+    stop_cause: str | None = Field(default=None, max_length=60)
 
 
 class _SaladNoReceipt(BaseModel):
@@ -181,6 +219,9 @@ def _salad_attempt(
     if row["campaign_status"] not in _WORKER_CAMPAIGN_STATUSES:
         raise Conflict("The campaign is not running; no Salad progress is recorded.")
     return row
+
+
+CUSTODY_EVIDENCE_EVENT = "campaign.salad_custody_observed"
 
 
 def _salad_move(
@@ -294,6 +335,49 @@ class SaladWorkerCommands:
             audience="worker",
         )
 
+    def record_salad_custody_evidence(self, worker, attempt_id, key, payload):
+        """Record, before any partial manifest is uploaded, whether the guardian says custody
+        work had begun for the attempt's operation. Control's admission of a manifest that lacks
+        declared files reads this record and fails closed without it."""
+        try:
+            body = _SaladCustodyEvidence.model_validate(payload)
+        except ValidationError as error:
+            raise _invalid(error) from None
+
+        def command(connection, live):
+            row = _salad_attempt(connection, live, attempt_id)
+            if row["phase"] not in ("executing", "route_started"):
+                raise Conflict("Salad attempt has no running route.")
+            if row["route_id"] != body.route_id:
+                raise Conflict("Evidence names a route this attempt did not start.")
+            self._event(
+                connection,
+                live,
+                row["campaign_project_id"],
+                None,
+                CUSTODY_EVIDENCE_EVENT,
+                row["revision"],
+                {
+                    "campaign_id": row["campaign_id"],
+                    "attempt_id": row["attempt_id"],
+                    "route_id": body.route_id,
+                    "operation_id": row["operation_id"],
+                    "custody_work_begun": body.custody_work_begun,
+                    "stop_cause": body.stop_cause,
+                },
+            )
+            return 200, {"attempt_id": row["attempt_id"], "recorded": True}
+
+        return self._mutate(
+            worker,
+            key,
+            "POST",
+            f"/worker/campaign-salad/{attempt_id}/custody-evidence",
+            canonical_digest(dict(payload)),
+            command,
+            audience="worker",
+        )
+
     def record_salad_no_receipt(self, worker, attempt_id, key, payload):
         """The live check exited on its own without a receipt; the route stays ``executing``.
 
@@ -347,6 +431,14 @@ class SaladWorkerCommands:
                 raise Conflict("Salad attempt has no running route to record.")
             if row["route_id"] != body.route_id:
                 raise Conflict("Outcome names a route this attempt did not start.")
+            manifest_id = body.manifest_id
+            if manifest_id is not None and _partial_without_custody_evidence(
+                connection, row, manifest_id, body.live_receipt
+            ):
+                # Defence in depth (admission is the gate: it needs control's own record of the
+                # guardian's custody status): a manifest that lacks declared files is linked only
+                # when the recorded receipt agrees, else not linked: no salvage, a clean retry.
+                manifest_id = None
             exposure = (
                 None
                 if body.estimated_exposure is None
@@ -385,7 +477,7 @@ class SaladWorkerCommands:
                     "phase": "outcome_recorded",
                     "live_receipt_json": encoded,
                     "live_receipt_digest": canonical_digest(body.live_receipt),
-                    "manifest_id": body.manifest_id,
+                    "manifest_id": manifest_id,
                     "provider_id": body.provider_id,
                     "estimated_exposure": exposure,
                     "guardian_final_json": guardian_final,
@@ -393,7 +485,7 @@ class SaladWorkerCommands:
                 "campaign.salad_outcome_recorded",
                 {
                     "route_id": body.route_id,
-                    "manifest_id": body.manifest_id,
+                    "manifest_id": manifest_id,
                     "guardian_final_present": body.guardian_final is not None,
                 },
             )

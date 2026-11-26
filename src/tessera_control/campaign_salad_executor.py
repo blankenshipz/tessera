@@ -296,6 +296,7 @@ class ControlPort(Protocol):
     def record_outcome(self, attempt_id: str, payload: dict[str, Any]) -> None: ...
     def record_no_receipt(self, attempt_id: str, route_id: str) -> None: ...
     def guardian_final(self, route_id: str) -> dict[str, Any] | None: ...
+    def record_custody_evidence(self, attempt_id: str, route_id: str) -> None: ...
 
 
 RouteRunner = Callable[[Path, Path, int], "dict[str, Any] | None"]
@@ -1123,6 +1124,14 @@ class SaladCampaignExecutor:
         # declared file. It gets a partial manifest of what reached custody (each file
         # hash-verified); it never counts as a pass.
         partial = _interrupted_after_custody(receipt)
+        if partial and lease is not None:
+            # Control admits a partial manifest only against its own record of the guardian's
+            # custody status: write it first; without it nothing partial is imported.
+            try:
+                self.control.record_custody_evidence(attempt, route_id)
+            except Exception as error:
+                self._note("custody_evidence_failed", attempt, type(error).__name__)
+                partial = False
         if (receipt.get("stop_confirmed") is True or partial) and lease is not None:
             try:
                 manifest_id = self._import_and_upload(item, state, lease, partial=partial)
@@ -1522,6 +1531,22 @@ class StoreControl:
     def record_no_receipt(self, attempt_id, route_id):
         self.campaigns.record_salad_no_receipt(
             self.worker, attempt_id, _key("no-receipt", attempt_id), {"route_id": route_id}
+        )
+
+    def record_custody_evidence(self, attempt_id, route_id):
+        """Record the guardian's own custody status for the route (read over the authenticated
+        admin channel) before a partial manifest is uploaded. Raises when it cannot be read."""
+        if self.guardian_status is None:
+            raise ValueError("no guardian status client")
+        status = self.guardian_status(self.routes.get(self.worker, route_id))
+        began, cause = status.get("custody_work_begun"), status.get("stop_cause")
+        if type(began) is not bool or (cause is not None and type(cause) is not str):
+            raise ValueError("guardian status lacks custody evidence")
+        self.campaigns.record_salad_custody_evidence(
+            self.worker,
+            attempt_id,
+            _key("custody-evidence", attempt_id),
+            {"route_id": route_id, "custody_work_begun": began, "stop_cause": cause},
         )
 
     def guardian_final(self, route_id):

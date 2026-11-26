@@ -24,7 +24,13 @@ def _executor(world, tmp_path, importer):
     return SaladCampaignExecutor(
         config_for(tmp_path),
         world.profiles.get("gpu-main"),
-        StoreControl(world.env.state, world.worker, guardian_status=lambda route: dict(FINAL)),
+        StoreControl(
+            world.env.state,
+            world.worker,
+            guardian_status=lambda route: dict(
+                FINAL, custody_work_begun=True, stop_cause="allocation_changed"
+            ),
+        ),
         worker_principal_id=world.worker["id"],
         route_runner=lambda *a: None,
         importer=importer,
@@ -188,3 +194,87 @@ def test_the_plan_comparison_reports_a_subset_manifest_as_partial(tmp_path):
         assert not grant_manifest_is_partial(connection, grant, manifest["artifacts_json"])
         assert grant_manifest_is_partial(connection, grant, json.dumps(listed[:-1]))
         assert grant_manifest_is_partial(connection, dict(grant, plan_digest="0" * 64), "[]")
+
+
+def test_a_reallocated_route_of_another_project_never_admits_a_partial_manifest(
+    tmp_path, monkeypatch
+):
+    """The route state is read only within the owning campaign's org and project: a same-id
+    state a foreign tenant recorded (reallocated, stop confirmed) must not count."""
+    import test_salad_termination_confirm as confirm
+
+    real = confirm._route_event
+    world = checkpoint_world(tmp_path)
+    world.to_route_started()  # the campaign's own route: running, never moved
+    org = world.row("SELECT org_id FROM campaigns WHERE id=?", world.campaign_id)["org_id"]
+    world.env.execute(
+        "INSERT INTO projects (id, org_id, name, created_at) VALUES (?,?,?,?)",
+        "project_other",
+        org,
+        "other",
+        "2026-11-25T00:00:00Z",
+    )
+    monkeypatch.setattr(
+        confirm,
+        "_route_event",
+        lambda world, state, **kw: real(world, state, project_id="project_other"),
+    )
+    _ran_and_reallocated(world, [dict(stopped=True)])  # the moved state lands in another project
+    world.record_custody()
+    with pytest.raises(Exception, match="needs an interrupted attempt"):
+        world.upload_manifest(CHECKPOINT, "checkpoint.bin", placed=True, partial=True)
+
+
+def test_the_same_state_inside_the_campaigns_own_org_admits_it(tmp_path):
+    world = checkpoint_world(tmp_path)
+    world.to_route_started()
+    _ran_and_reallocated(world, [dict(stopped=True)])
+    world.record_custody()
+    manifest = world.upload_manifest(CHECKPOINT, "checkpoint.bin", placed=True, partial=True)
+    assert manifest["id"]
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        None,  # control holds no custody record for the operation
+        dict(began=False),  # the guardian says custody never began (the precustody retry)
+        dict(began=True, cause="deadline"),  # not an allocation change
+    ],
+)
+def test_without_custody_evidence_the_upload_is_refused_and_nothing_is_stored(tmp_path, evidence):
+    """Reallocated, stop confirmed, but no guardian record of custody having begun: refused at
+    upload time, no manifest row, no checkpoint salvaged."""
+    world = checkpoint_world(tmp_path)
+    world.to_route_started()
+    _ran_and_reallocated(world, [dict(stopped=True)])
+    if evidence is not None:
+        world.record_custody(**evidence)
+    with pytest.raises(Exception, match="needs an interrupted attempt"):
+        world.upload_manifest(CHECKPOINT, "checkpoint.bin", placed=True, partial=True)
+    assert world.row("SELECT 1 FROM artifact_manifests") is None
+
+
+def test_a_receipt_that_disagrees_with_the_custody_record_is_not_linked(tmp_path):
+    """Defence in depth: admitted on control's custody record, but linked only when the live
+    receipt agrees too."""
+    world = checkpoint_world(tmp_path)
+    world.to_route_started()
+    _ran_and_reallocated(world, [dict(stopped=True)])
+    world.record_custody()
+    manifest = world.upload_manifest(CHECKPOINT, "checkpoint.bin", placed=True, partial=True)
+    world.observe_exit()
+    row = world.salad()
+    world.env.store.record_salad_outcome(
+        world.worker,
+        row["attempt_id"],
+        world.key("outcome"),
+        dict(
+            route_id=row["route_id"],
+            live_receipt=dict(CUSTODY_BEGAN, custody_work_begun=False),
+            manifest_id=manifest["id"],
+            provider_id="provider-group-1",
+            guardian_final=FINAL,
+        ),
+    )
+    assert world.salad()["manifest_id"] is None
