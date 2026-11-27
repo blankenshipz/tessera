@@ -487,6 +487,10 @@ def read_receipt(receipt_dir: Path) -> dict[str, Any] | None:
 LEASE_HELD_PHASES = frozenset(
     {"leased", "awaiting_review", "reviewed", "capability_ready", "route_proposed"}
 )
+# Campaign statuses under which a listed ``route_started`` attempt may be launched. Control
+# also lists a blocked or paused campaign's started routes, for keepalive only (v0.104.0);
+# an item without the field (an older control) is treated as launchable, as before.
+LAUNCH_CAMPAIGN_STATUSES = frozenset({"running", "stopping", "cancel_requested"})
 
 
 # Consecutive failed provider reads after which the termination wait gives up (ADR 0149).
@@ -660,6 +664,11 @@ class SaladCampaignExecutor:
         self._concurrency_held = False  # a concurrent route ended without a receipt: drain first
         self._executing_elsewhere: set[str] = set()
         self._pass_frame_limit: Any = _UNREAD
+        # Attempts whose last control call was refused, by step: if control then stops listing
+        # one, that is journaled once instead of the executor going quiet (v0.104.0).
+        self._refused: dict[str, str] = {}
+        # Late-importable attempts with no receipt on disk, noted once per process.
+        self._late_import_noted: set[str] = set()
 
     # -- one pass ---------------------------------------------------------------------------
 
@@ -686,6 +695,11 @@ class SaladCampaignExecutor:
                 if entry.get("phase") == "executing" and entry["attempt_id"] not in self._in_flight
             }
         pending: set[str] | None = None
+        listed = {item["attempt_id"] for item in items}
+        for attempt in sorted(set(self._refused) - listed - set(self._in_flight)):
+            # Control refused this attempt's last call and no longer lists it: say so once,
+            # rather than go quiet (v0.104.0).
+            self._note("work_withdrawn_after_refusal", attempt, self._refused.pop(attempt))
         for item in items:
             attempt = item["attempt_id"]
             if concurrent and attempt in self._in_flight:
@@ -701,6 +715,10 @@ class SaladCampaignExecutor:
                 elif item["phase"] == "route_started":
                     self._step = "renew"
                     self._keepalive(item)
+                    if item.get("campaign_status", "running") not in LAUNCH_CAMPAIGN_STATUSES:
+                        # A blocked or paused campaign: kept alive, never launched.
+                        self._note("launch_held", attempt, str(item["campaign_status"])[:40])
+                        continue
                     self._step = "execute"
                     if concurrent:
                         self._launch(item)
@@ -709,12 +727,17 @@ class SaladCampaignExecutor:
                 elif item["phase"] == "executing":
                     self._step = "execute"
                     self._resume(item)
+                elif item["phase"] == "unknown":
+                    self._step = "execute"
+                    self._late_import(item)
                 elif item["phase"] in LEASE_HELD_PHASES:
                     self._step = "renew"
                     self._keepalive(item)
+                self._refused.pop(attempt, None)
             except Exception as error:
                 # Class name only: messages can carry identifiers from provider paths.
                 self._note("error", attempt, type(error).__name__)
+                self._refused[attempt] = self._step
                 self._record_rejection(attempt, error)
         return self.log[start:]
 
@@ -1087,6 +1110,7 @@ class SaladCampaignExecutor:
                 self._complete(run)
             except Exception as error:
                 self._note("error", attempt, type(error).__name__)
+                self._refused[attempt] = self._step
                 self._record_rejection(attempt, error)
         if not self._in_flight:
             self._concurrency_held = False
@@ -1173,6 +1197,21 @@ class SaladCampaignExecutor:
             self._note("no_receipt", item["attempt_id"], "resumed_without_launch_effect")
             self._report_no_receipt(item)
         self._report_group_stop(item)
+
+    def _late_import(self, item: dict[str, Any]) -> None:
+        """A late-importable ``unknown`` attempt (the runner called it silent): finish it only
+        from a receipt already on disk, by the ordinary finish (v0.104.0). Nothing is launched,
+        no lease is renewed and nothing else is reported; control re-verifies the outcome."""
+        attempt = item["attempt_id"]
+        receipts = self._route_dir(item["route_id"]) / "receipts"
+        receipt = read_receipt(receipts) if receipts.is_dir() else None
+        if receipt is None:
+            if attempt not in self._late_import_noted:
+                self._late_import_noted.add(attempt)
+                self._note("late_import_no_receipt", attempt)
+            return
+        self._note("late_import", attempt)
+        self._finish(item, receipt)
 
     def _never_launched(self, item: dict[str, Any]) -> bool:
         """True when the route has no create or start effect and names no provider group (a

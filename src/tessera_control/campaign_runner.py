@@ -56,7 +56,7 @@ from .campaign_checkpoint import (
     retry_checkpoint_from,
     salvaged_checkpoint,
 )
-from .campaign_delegation import approver_is_live
+from .campaign_delegation import FORWARD_LEGAL_STATUSES, REDUCE_ONLY_STEPS, approver_is_live
 from .campaign_exit_without_report import EXIT_REPORT_GRACE_SECONDS
 from .campaign_exit_without_report import assess as assess_unreported_exit
 from .campaign_exited_resolve import (
@@ -817,6 +817,10 @@ class CampaignRunner:
         spell. Nothing is started, cancelled or re-run and no lease is issued."""
         self._observe_stuck_leased(ctx)
         self._resolve_exited_attempts(ctx)
+        if ctx.campaign["status"] == "blocked":
+            # v0.104.0: evidence of spend already made still reaches the attempt while blocked
+            # (reduce-only steps only; a paused campaign admits none, so it waits for resume).
+            self._evidence_pass(ctx)
         for attempt in self._rows(
             """SELECT * FROM campaign_stage_attempts WHERE campaign_id=?
             AND status='unknown' ORDER BY stage_key, attempt""",
@@ -951,6 +955,15 @@ class CampaignRunner:
     ) -> StepResult:
         assert ctx.approval is not None
         self._renew_lease()
+        if (
+            step not in REDUCE_ONLY_STEPS
+            and ctx.campaign["status"] in FORWARD_LEGAL_STATUSES
+            and not self._still_forward_legal(ctx)
+        ):
+            # The campaign left running/stopping earlier in this pass: no forward step is
+            # attempted, nothing is written, and the pass for this campaign ends (the tick
+            # defers it). The attempt keeps its reservation and hold (ADR 0038 addendum).
+            raise StepTransient(f"{step}: campaign no longer running")
         provider_id = None if stage_key is None else self._spec_stage(ctx, stage_key).provider
         result = self.steps.run(
             campaign=ctx.campaign,
@@ -1646,12 +1659,21 @@ class CampaignRunner:
             "stopping",
         }:
             return
+        # Evidence first (v0.104.0): a run recorded during a block, or late-imported, is
+        # verified before any stage's silent-executor clock is read.
+        self._evidence_pass(ctx, providers)
         order = self._rows(
             "SELECT stage_key FROM campaign_stages WHERE campaign_id=? ORDER BY topo_index",
             (ctx.campaign["id"],),
         )
         for entry in order:
             if self._budget <= 0:
+                return
+            if not self._still_forward_legal(ctx):
+                # A stage of this pass blocked the campaign (an unknown attempt, a fallback
+                # hold, a settlement mismatch) or a person cancelled it: the pass ends here, so
+                # no later stage takes a forward step it would be refused (ADR 0038 addendum).
+                self._actions.append(f"pass_ended:{ctx.campaign['id']}")
                 return
             if self._drive_stage_cancel(ctx, entry["stage_key"]):
                 continue
@@ -1660,7 +1682,25 @@ class CampaignRunner:
                 self._executed = False
                 if not self._advance_stage(ctx, entry["stage_key"]) or self._executed:
                     break
+                if not self._still_forward_legal(ctx):
+                    break
         self._maybe_complete(ctx)
+
+    def _evidence_pass(self, ctx: _Ctx, providers: list[Any] | None = None) -> None:
+        """Each provider's optional evidence-only hook (``evidence_pass``): verification of
+        recorded outcomes and reduce-only steps only, never a forward step."""
+        for provider in self._providers(ctx) if providers is None else providers:
+            hook = getattr(provider, "evidence_pass", None)
+            if hook is None:
+                continue
+            try:
+                hook(self, ctx)
+            except _Waiting:
+                continue
+
+    def _still_forward_legal(self, ctx: _Ctx) -> bool:
+        """The campaign, re-read now, still admits forward steps (``running``/``stopping``)."""
+        return self._campaign(ctx.campaign["id"])["status"] in FORWARD_LEGAL_STATUSES
 
     def _drive_stage_cancel(self, ctx: _Ctx, key: str) -> bool:
         """Unwind one stage a steering request cancelled; True while it owns the stage (ADR 0061).
@@ -6022,7 +6062,11 @@ class CampaignRunner:
                     ),
                 )
                 self.store.record_runner_event(
-                    connection, campaign, "campaign.unblocked", {"cancelling": cancelling}
+                    connection,
+                    campaign,
+                    "campaign.unblocked",
+                    # ``at`` (the runner's clock) restarts the Salad silent-executor clock.
+                    {"cancelling": cancelling, "at": _iso(self.now())},
                 )
 
     # -- completion -----------------------------------------------------------------

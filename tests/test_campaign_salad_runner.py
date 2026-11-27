@@ -594,10 +594,14 @@ def test_an_executor_silent_past_the_route_window_is_unknown(tmp_path):
     world.to_route_started()
     world.tick(2)
     assert world.phase() == "route_started"
-    world.env.execute(
-        "UPDATE campaign_salad_attempts SET updated_at='2000-01-01T00:00:00Z' WHERE attempt_id=?",
-        world.attempt()["id"],
-    )
+    # Since v0.104.0 a route provably never sent anything is released at 0 instead
+    # (test_salad_silent_never_sent_released.py), and a live lease means the executor is
+    # alive: here a create was claimed and the executor stopped renewing. The clock runs from
+    # the route start (never before the campaign's last approval or unblock), so time moves.
+    from datetime import UTC, datetime, timedelta
+
+    world.claim("create")
+    world.runner.now = lambda: datetime.now(UTC) + timedelta(hours=3)
     world.tick_until(lambda: world.status() == "blocked")
     assert world.phase() == "unknown"
     assert "silent" in world.attempt()["failure_detail"]

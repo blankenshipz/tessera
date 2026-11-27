@@ -493,10 +493,37 @@ def _service_rows(results: list[deploy_services.StepResult]) -> list[dict[str, A
     ]
 
 
+def executing_salad_attempts(state_dir: Path) -> int:
+    """How many Salad campaign attempts are ``executing`` in the plan's state (a read-only
+    read; 0 when there is no database or no Salad table yet).
+
+    Restarting the Salad executor while a route's child runs loses that run by design: after a
+    restart the executor finishes only from a receipt already on disk (ADR 0160), so the attempt
+    ends ``unknown`` and the campaign blocks. A restart while stages are only reserved,
+    preparing or queued (``route_started``) is safe (v0.104.0)."""
+    database = Path(state_dir) / DATABASE_NAME
+    if not database.exists():
+        return 0
+    try:
+        connection = sqlite3.connect(database.absolute().as_uri() + "?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return 0
+    try:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM campaign_salad_attempts WHERE phase='executing'"
+        ).fetchone()
+    except sqlite3.Error:
+        return 0
+    finally:
+        connection.close()
+    return int(row[0]) if row else 0
+
+
 def run_upgrade(
     plan: Any,
     *,
     execute: bool,
+    allow_executing_salad: bool = False,
     runner: deploy_services.Runner = deploy_services.default_runner,
     probe: Callable[..., tuple[bool, str]] = deploy_services.probe_health,
     sleep: Callable[[float], None] = time.sleep,
@@ -525,6 +552,18 @@ def run_upgrade(
     for venv in plan.venvs:
         if not os.access(deploy_services.venv_python(venv), os.X_OK):
             blocking.append(f"service venv {venv} (no executable bin/python)")
+    executing = executing_salad_attempts(Path(plan.state_dir))
+    run.document["salad_executing"] = executing
+    if executing and not allow_executing_salad:
+        # v0.104.0 operator rule: no restart while a Salad route runs (the run would be lost).
+        blocking.append(
+            f"salad.executing ({executing} Salad attempt(s) executing: a restart loses the run; "
+            "wait for it to finish or pass --allow-executing-salad)"
+        )
+    elif executing:
+        run.document.setdefault("warnings", []).append(
+            f"{executing} Salad attempt(s) executing; restart allowed by --allow-executing-salad"
+        )
     unsafe = _unsafe_unstopped(plan)
     run.document["not_stopped"] = _not_stopped(plan)
     if execute:

@@ -961,7 +961,9 @@ as a second guard. ADR 0041 stage 3 renamed it `settle_frame`.
 
 A claim followed by unconfirmed termination, reallocation, synthetic-only receipts, a
 manifest that does not match the imported hashes, or an executor silent past the route
-window makes the attempt `unknown` and the stage `blocked_unknown`. Success needs a
+window makes the attempt `unknown` and the stage `blocked_unknown` (the route window counts from the
+campaign's latest unblock or approval if that is later, and a never-sent route is released
+instead; see the executor section below). Success needs a
 `verified_journey` live receipt, a terminal provider-confirmed route and a matching
 quarantined manifest; the digest is recorded as `salad_evidence_digest`.
 
@@ -1043,6 +1045,48 @@ grant and reconciles it at 0 with the store's own no-claim proof, so the attempt
 `failed_transient`/`t1_salad_unclaimed` with detail `live_check_no_receipt`, settled at 0
 with its hold released. Any claim or effect keeps the wait, and the silent-executor rule
 above still applies.
+
+**Blocked campaigns, silent executors and restarts (v0.104.0; ADR 0038, 0160 and 0205
+amendments of 2026-11-26).**
+
+- *A block stops new spend, not the record of a run.* While a campaign is `blocked` or
+  `paused_delegation_lapsed`, the executor keeps its `executing` attempts (to resume, finish and
+  keep alive) and its `route_started` ones (keepalive only) in the work list, which now carries
+  `campaign_status`. It never launches a route of a campaign that is not running. Control accepts
+  the outcome, no-receipt and custody evidence of those attempts and refuses `mark_executing` and
+  packaging. The runner verifies a recorded outcome while blocked and settles it through the
+  ordinary charge path. A runner pass that blocks a campaign ends there, so later reserved
+  stages keep their reservations and holds and continue after the unblock. If control stops
+  listing an attempt it refused, the executor journals `work_withdrawn_after_refusal`.
+- *Silent-executor clock.* The window plus 600 s now counts from the later of the attempt's
+  last move and the campaign's latest `campaign.unblocked` or `campaign.approved`, so blocked or
+  paused time is never counted and an unblock does not call a healthy route silent. A route
+  whose provider receipts already confirm termination waits for the import
+  (`campaign.salad_import_awaited`) instead of going `unknown`.
+- *Late import of a silent-unknown attempt.* An attempt that is `unknown` with detail exactly
+  `executor silent past the route window`, unsettled, and whose grant is still `active` or
+  `cancel_requested` stays in the executor's work list. If its receipt is still in the
+  executor's route directory, the running executor (or the next one after a restart) records the
+  outcome as a late import (`late_import: true`). The runner then re-runs the unchanged
+  verification and returns the stage to `running` (`campaign.salad_late_import_verified`), and
+  the attempt settles from its charge like any other run. Operator action: keep the route
+  directory and let the executor run. Do **not** reconcile the grant first (neither
+  `POST /execution-grants/{id}/reconcile` nor `reconcile-unclaimed-salad`): a reconciled grant or a
+  settled attempt is never late-imported. A late outcome whose route shows no provider-confirmed
+  termination is refused, and the attempt stays `unknown` for the human path.
+- *Never-sent route: released, not unknown.* A `route_started` route queued behind the
+  executor's limits with no provider id, no sent create or start effect, no create or start
+  claim, no manifest and no passing receipt is no longer made `unknown` when its window passes.
+  The runner cancels the route, revokes the grant and reconciles it at 0 on the store's own proof.
+  The attempt becomes `failed_transient` / `not_started` (`executor_silent_never_sent`) with its
+  hold released, and the stage is requeued without a scientific retry. An attempt already
+  `unknown` for the silent reason in that shape, which `reconcile-unclaimed-attempts --dry-run`
+  refuses only as `route_wants_run`, gets the reduce-only route cancel on the next runner pass,
+  even while blocked, and is then reconciled the same way. A route whose lease the executor keeps
+  renewing while it waits is not silent. Anything with a claim or sent effect still waits.
+- *Do not restart the executor while a route runs.* `tessera deploy-upgrade` refuses while any
+  Salad attempt is `executing` ([deploy upgrade](deploy-upgrade.md#salad-routes-in-flight)).
+  Restarts while stages are only reserved, preparing or queued are safe.
 
 After the live check and the exit report the executor reads the final guardian status
 through the existing read-only `SaladSafetyHTTPSClient.status`, projects only the recorded

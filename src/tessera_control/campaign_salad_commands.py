@@ -38,6 +38,13 @@ SALAD_ACTIVE_PHASES = (
     "unknown",
 )
 _WORKER_CAMPAIGN_STATUSES = ("running", "stopping", "cancel_requested")
+# Evidence of spend already made (an outcome, a no-receipt marker, custody evidence) is also
+# recorded while the campaign is blocked or paused: a block stops new spend, never the record
+# of a run that already happened. Forward commands (package, executing) keep the set above
+# (ADR 0038 amendment, v0.104.0).
+_EVIDENCE_CAMPAIGN_STATUSES = (*_WORKER_CAMPAIGN_STATUSES, "blocked", "paused_delegation_lapsed")
+# The runner's detail for an attempt it called silent; only this unknown is late-importable.
+SILENT_EXECUTOR = "executor silent past the route window"
 MAX_LIVE_RECEIPT_BYTES = 65536
 _Hex32 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{32}$")]
 _Hex64 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -201,12 +208,18 @@ class _SaladNoReceipt(BaseModel):
 
 
 def _salad_attempt(
-    connection: sqlite3.Connection, worker: Mapping[str, Any], attempt_id: str
+    connection: sqlite3.Connection,
+    worker: Mapping[str, Any],
+    attempt_id: str,
+    statuses: tuple[str, ...] = _WORKER_CAMPAIGN_STATUSES,
 ) -> sqlite3.Row:
-    """The Salad attempt row for this worker, tenant-checked; refuses a stopped campaign."""
+    """The Salad attempt row for this worker, tenant-checked; refuses a campaign whose status
+    is not in ``statuses`` (forward commands: running/stopping/cancel_requested)."""
     row = connection.execute(
         """SELECT sa.*, a.campaign_id, a.stage_key, a.grant_id, c.status AS campaign_status,
-        c.project_id AS campaign_project_id, g.worker_principal_id AS grant_worker
+        c.project_id AS campaign_project_id, g.worker_principal_id AS grant_worker,
+        a.status AS attempt_status, a.settled_cents AS attempt_settled_cents,
+        g.status AS grant_status
         FROM campaign_salad_attempts sa
         JOIN campaign_stage_attempts a ON a.id = sa.attempt_id
         JOIN campaigns c ON c.id = a.campaign_id
@@ -216,9 +229,23 @@ def _salad_attempt(
     ).fetchone()
     if row is None or row["grant_worker"] != worker["id"]:
         raise NotFound("Salad campaign attempt was not found.")
-    if row["campaign_status"] not in _WORKER_CAMPAIGN_STATUSES:
+    if row["campaign_status"] not in statuses:
         raise Conflict("The campaign is not running; no Salad progress is recorded.")
     return row
+
+
+def late_importable(row: Mapping[str, Any]) -> bool:
+    """The sanctioned late import (v0.104.0): an attempt the runner called ``unknown`` only
+    because the executor was silent past the route window, still unsettled, its grant
+    unresolved. Its outcome may still be recorded; the runner then re-runs the unchanged
+    ``verify_outcome``. A reconciled grant or a settled attempt is never late-imported."""
+    return (
+        row["phase"] == "unknown"
+        and row["waiting_reason"] == SILENT_EXECUTOR
+        and row["attempt_status"] == "unknown"
+        and row["attempt_settled_cents"] is None
+        and row["grant_status"] in ("active", "cancel_requested")
+    )
 
 
 CUSTODY_EVIDENCE_EVENT = "campaign.salad_custody_observed"
@@ -345,7 +372,7 @@ class SaladWorkerCommands:
             raise _invalid(error) from None
 
         def command(connection, live):
-            row = _salad_attempt(connection, live, attempt_id)
+            row = _salad_attempt(connection, live, attempt_id, _EVIDENCE_CAMPAIGN_STATUSES)
             if row["phase"] not in ("executing", "route_started"):
                 raise Conflict("Salad attempt has no running route.")
             if row["route_id"] != body.route_id:
@@ -390,7 +417,7 @@ class SaladWorkerCommands:
             raise _invalid(error) from None
 
         def command(connection, live):
-            row = _salad_attempt(connection, live, attempt_id)
+            row = _salad_attempt(connection, live, attempt_id, _EVIDENCE_CAMPAIGN_STATUSES)
             if row["phase"] != "executing":
                 raise Conflict("Salad attempt has no executing route.")
             if row["route_id"] != body.route_id:
@@ -426,8 +453,9 @@ class SaladWorkerCommands:
         digest = canonical_digest(dict(payload))
 
         def command(connection, live):
-            row = _salad_attempt(connection, live, attempt_id)
-            if row["phase"] not in ("executing", "route_started"):
+            row = _salad_attempt(connection, live, attempt_id, _EVIDENCE_CAMPAIGN_STATUSES)
+            late = late_importable(row)
+            if row["phase"] not in ("executing", "route_started") and not late:
                 raise Conflict("Salad attempt has no running route to record.")
             if row["route_id"] != body.route_id:
                 raise Conflict("Outcome names a route this attempt did not start.")
@@ -487,6 +515,9 @@ class SaladWorkerCommands:
                     "route_id": body.route_id,
                     "manifest_id": manifest_id,
                     "guardian_final_present": body.guardian_final is not None,
+                    # Present only for the sanctioned late import, so every other outcome
+                    # event keeps its shape.
+                    **({"late_import": True} if late else {}),
                 },
             )
 
@@ -504,14 +535,18 @@ class SaladWorkerCommands:
         """Read-only: this worker's attempts awaiting a lease, holding one, or executing.
 
         Every phase in which the executor holds the lease is listed (review and route approval
-        included) so it can keep the lease renewed until the route has run.
+        included) so it can keep the lease renewed until the route has run. A blocked or paused
+        campaign's ``executing`` attempts stay listed (resume, finish, keepalive) and its
+        ``route_started`` ones too, for keepalive only: ``campaign_status`` tells the executor
+        never to launch them. A late-importable ``unknown`` attempt (``late_importable``) is
+        listed so a receipt already on disk can still be recorded (v0.104.0).
         """
         connection = _connect(self.database_path)
         try:
             rows = connection.execute(
                 """SELECT sa.attempt_id, sa.phase, sa.route_id, sa.operation_id, sa.updated_at,
                 a.campaign_id, a.stage_key, a.grant_id, a.admitted_attempt_id,
-                ss.profile
+                ss.profile, c.status AS campaign_status
                 FROM campaign_salad_attempts sa
                 JOIN campaign_stage_attempts a ON a.id = sa.attempt_id
                 JOIN campaigns c ON c.id = a.campaign_id
@@ -519,11 +554,20 @@ class SaladWorkerCommands:
                   ON ss.campaign_id = a.campaign_id AND ss.stage_key = a.stage_key
                 JOIN execution_grants g ON g.id = a.grant_id
                 WHERE c.org_id = ? AND g.worker_principal_id = ?
-                AND sa.phase IN ('awaiting_lease','leased','awaiting_review','reviewed',
+                AND (
+                  (sa.phase IN ('awaiting_lease','leased','awaiting_review','reviewed',
                     'capability_ready','route_proposed','route_started','executing')
-                AND c.status IN ('running','stopping','cancel_requested')
+                   AND c.status IN ('running','stopping','cancel_requested'))
+                  OR (sa.phase IN ('route_started','executing')
+                   AND c.status IN ('blocked','paused_delegation_lapsed'))
+                  OR (sa.phase = 'unknown' AND sa.waiting_reason = ?
+                   AND a.status = 'unknown' AND a.settled_cents IS NULL
+                   AND g.status IN ('active','cancel_requested')
+                   AND c.status IN ('running','stopping','cancel_requested','blocked',
+                     'paused_delegation_lapsed'))
+                )
                 ORDER BY sa.updated_at, sa.attempt_id""",
-                (worker["org_id"], worker["id"]),
+                (worker["org_id"], worker["id"], SILENT_EXECUTOR),
             ).fetchall()
             return [dict(row) for row in rows]
         finally:

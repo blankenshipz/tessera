@@ -181,9 +181,12 @@ def test_a_claimed_create_or_start_stays_blocked(tmp_path, action):
 
 
 def test_a_route_that_still_wants_to_run_is_an_unknown_claim_state(tmp_path):
+    # Any unknown other than the silent-executor one keeps the route wanting to run: no
+    # automated cancel, the proof refuses. (The silent, never-sent shape gets the reduce-only
+    # cancel since v0.104.0: tests/test_salad_silent_never_sent_released.py.)
     world = world_with(tmp_path)
     world.to_route_started()
-    attempt = block_unknown(world, "executor silent past the route window")
+    attempt = block_unknown(world, "observed unknown, termination confirmed=False")
     event = stays_blocked(world, attempt, "claim_state_unknown")
     assert event["provider_reason"] == "route_wants_run"
 

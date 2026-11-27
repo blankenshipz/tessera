@@ -535,3 +535,56 @@ delegation the campaign was approved under (ADR 0150), or one recorded under a d
 named in a direct approval (`review_delegation_id`, ADR 0150 amendment 2026-11-25). Each is
 `campaign_delegated`, re-checked at every use and cited on the receipt; anything outside it stays with
 a person.
+
+## Amendment (2026-11-26): a block stops new spend, never the record of spend already made (q-2705, v0.104.0)
+
+**Context.** On 2026-11-26 one loop damaged a live Salad campaign: the campaign went `blocked`;
+control then dropped its attempts from the executor's work list and refused the finished route's
+outcome (`Conflict`); leases and heartbeats went stale while the runner's silent-executor clock
+kept running; when the block cleared, the first running pass called every route `unknown`,
+re-blocked the campaign mid-pass, and kept issuing `issue_grant` for later reserved stages. The
+delegation correctly refused those forward steps, but the runner recorded each refusal as a sticky
+failed intent and settled 20 stages `failed_permanent` / `step_refused`.
+
+**Decision.**
+
+1. **A pass that blocks a campaign ends there.** The runner re-reads the campaign's status before
+   each stage of a running pass, after each stage loop iteration and before each forward step, and
+   ends the pass for that campaign once it is no longer `running` or `stopping` (`stopping` keeps
+   forward steps only for the in-flight attempt, as before). Nothing is written for the step it did
+   not attempt.
+2. **A state-caused refusal is transient.** In `StepExecutor.run`, a `Forbidden` on a step that is
+   not reduce-only, while the campaign is not forward-legal (`blocked`, `cancel_requested`), raises
+   `StepTransient`: no failed intent, the intent stays `pending`, and the attempt keeps its
+   reservation and its one hold. After the unblock the same idempotency key completes. Reduce-only
+   steps keep the wider authority set. The delegation's refusal of every forward step outside
+   `running` is unchanged, and a contract refusal (undeclared step, wrong resource, digest
+   mismatch, expired approval, a recorded sticky failure) still fails closed as `step_refused`.
+3. **Evidence is accepted while blocked or paused.** The Salad worker gate is split by direction:
+   forward commands (`record_salad_package`, `mark_salad_executing`) keep requiring `running`,
+   `stopping` or `cancel_requested`; evidence commands (`record_salad_outcome`,
+   `record_salad_no_receipt`, `record_salad_custody_evidence`) are also accepted in `blocked` and
+   `paused_delegation_lapsed`. The tenant and worker checks stay at the same data access.
+   `list_salad_work` keeps such a campaign's `executing` attempts (resume, finish, keepalive) and
+   `route_started` attempts (keepalive only) and returns `campaign_status`; the executor never
+   launches a route unless the campaign is launchable. Nothing new is launched while blocked or
+   paused: no `mark_executing`, no grant, no lease.
+4. **An evidence pass before any silent-clock check.** Each provider may expose an
+   `evidence_pass` hook (verification of recorded outcomes and reduce-only steps only, never a
+   forward step). The runner calls it for a `blocked` campaign in its stuck-campaign pass, and at
+   the start of every running pass before the stage loop. The Salad hook verifies an
+   `outcome_recorded` attempt with the unchanged `verify_outcome` and settles it through the
+   ordinary collect, resolve and charge path; it also covers the late import of ADR 0160's
+   amendment and the reduce-only cancel of ADR 0205's never-sent amendment.
+5. **Unblocking does not manufacture unknowns.** `_drive_blocked` records `campaign.unblocked`
+   with the runner's clock (`at`); the Salad silent-executor clock restarts at the latest
+   `campaign.unblocked` or `campaign.approved` (ADR 0160 amendment). With points 1 and 4, the first
+   pass after an unblock neither calls a route that is still inside its window silent nor, if
+   something does block the campaign again, takes another forward step in that pass.
+
+**Consequences.** A mid-pass block leaves reserved stages reserved with their holds. A run that
+finished while its campaign was blocked is recorded and settled the ordinary way. Stages already
+burned by the earlier behaviour are not un-failed by this change; a sticky failed intent of an
+attempt number still replays (`campaign_steps._slot`), so those need a sanctioned new attempt.
+Any other `Conflict` from a delegated step (for example a stale `expected_revision` race) is still a
+sticky failure; that is a separate, deferred change.

@@ -21,7 +21,14 @@ from pydantic import ValidationError
 from .artifact_custody import ArtifactCustodyReleaseRequest, ArtifactCustodyStore
 from .artifact_dispositions import ArtifactDispositionRequest, ArtifactDispositionStore
 from .artifact_lineage import ArtifactLineageStore, LineageEdgeRequest, LineageNodeRequest
-from .campaign_delegation import STEP_TABLE, delegated_principal, intent_key, write_intent
+from .campaign_delegation import (
+    FORWARD_LEGAL_STATUSES,
+    REDUCE_ONLY_STEPS,
+    STEP_TABLE,
+    delegated_principal,
+    intent_key,
+    write_intent,
+)
 from .campaign_store import CampaignStore
 from .capabilities import CapabilityStore
 from .capability_models import ApproveCapabilities, RequestCapabilities
@@ -521,6 +528,15 @@ class StepExecutor:
                         # Cancel, expiry or supersession raced this step; it committed
                         # nothing, so it stays pending and is re-issued or abandoned.
                         raise StepTransient(f"{step}: authority changed") from None
+                    if step not in REDUCE_ONLY_STEPS and not self._forward_legal(
+                        connection, campaign
+                    ):
+                        # The campaign left a forward-legal state (blocked, cancel requested)
+                        # while this forward step was prepared. The delegation deny is about
+                        # the campaign, not the stage: the step committed nothing, so the
+                        # intent stays pending and the attempt keeps its reservation and hold
+                        # until a later pass may continue (ADR 0038 addendum, v0.104.0).
+                        raise StepTransient(f"{step}: campaign not running") from None
                 self._fail_intent(connection, campaign, intent["id"], type(error).__name__, step)
             raise StepFailed(step, type(error).__name__, str(error)[:300]) from None
         except Exception as error:
@@ -548,6 +564,15 @@ class StepExecutor:
         if row["campaign_status"] not in {"running", "stopping", "cancel_requested", "blocked"}:
             return False
         return _parse_utc(row["expires_at"]) > _parse_utc(utc_now())
+
+    @staticmethod
+    def _forward_legal(connection: sqlite3.Connection, campaign: Mapping) -> bool:
+        """The campaign's status still admits forward steps (``running`` or ``stopping``;
+        delegation decides the in-flight rule for ``stopping``)."""
+        row = connection.execute(
+            "SELECT status FROM campaigns WHERE id=?", (campaign["id"],)
+        ).fetchone()
+        return row is not None and row["status"] in FORWARD_LEGAL_STATUSES
 
     def _fail_intent(
         self,

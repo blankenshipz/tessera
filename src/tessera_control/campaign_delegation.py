@@ -27,6 +27,7 @@ from .store import Forbidden, StoreError, canonical_digest
 __all__ = [
     "CAMPAIGN_DELEGATION_KEY",
     "DELEGATED_ACTOR_KEY",
+    "FORWARD_LEGAL_STATUSES",
     "REDUCE_ONLY_STEPS",
     "STEP_TABLE",
     "admit",
@@ -132,6 +133,10 @@ _EXTRA_RESOURCES = frozenset(
 )
 _PLACEHOLDER = re.compile(r"\{([a-z_]+)\}")
 _FORWARD_STATES = frozenset({"running"})
+# Statuses in which a forward step may still be admitted: ``running``, and ``stopping`` for
+# an attempt already in flight. Any other status refuses every forward step because of the
+# campaign, never because of the stage (ADR 0038 addendum, v0.104.0).
+FORWARD_LEGAL_STATUSES = frozenset({"running", "stopping"})
 _REDUCE_STATES = frozenset({"running", "stopping", "cancel_requested", "blocked"})
 _MAX_RESPONSE_BYTES = 256 * 1024
 _DENIED = "Campaign delegation does not authorize this step."

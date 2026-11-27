@@ -168,6 +168,16 @@ cost. The live receipt read `inconclusive` / `custody_stop_or_reconnect_unresolv
    `proxy_request_kind` all null and no evidence. Anything else fails closed and the claim counts. The
    unwind settles 0¢, never infers termination and never adds a charge.
 
+   **Known limit (q-2704b review, deferred).** The rule has no build cutoff. Builds from 2026-10-14 until
+   `2b632bf5` (2026-11-23) did not record `proxy_request_kind`, so for a claim written by one of those builds
+   a transport `admission_denied` after a create POST that Salad did act on could look like this bare
+   pre-call refusal. The rule applies to every reader of `create_claimed`, including the runner's automatic
+   unwind and the never-sent release below. It is not limited to the owner's
+   `reconcile-unclaimed-attempts` request. It can only be reached for an attempt created by such a build
+   that is still `unknown`; no attempt created since can have that shape. Before an owner requests the
+   recovery of such an attempt, check the provider's own records for a group. Narrowing the rule to the
+   owner's request is a deferred follow-up.
+
 ### Consequences
 
 - From this build on, a create refused at the use-time recheck releases its hold at 0¢ on the runner's
@@ -188,3 +198,33 @@ cost. The live receipt read `inconclusive` / `custody_stop_or_reconnect_unresolv
   `reconcile-unclaimed-salad` on its own.
 - No schema change and no migration: the new records are events, and `infra_salad_create_not_sent` is a new
   value of the existing failure class.
+
+## Amendment (2026-11-26): a queued route that was never sent is released, not unknown (q-2705 F4, v0.104.0)
+
+**Context.** The executor queues routes behind `max_concurrent_paid_routes`, the guardian's frame limit or
+a no-receipt drain without writing anything to control, while the runner issues grants up to the project
+concurrency. A queued `route_started` attempt whose silent window passed went straight to `unknown` with
+the route still `desired=run`. The unclaimed proof then refused it `route_wants_run`, and no automated
+actor could cancel the route (`unwind` is not reachable for an `unknown` attempt), so its 5¢ hold and the
+block were permanent.
+
+**Decision.**
+
+1. **Past the silent window, a never-sent route takes the unclaimed unwind.** When the window passes and
+   `_never_sent` holds (the route names no provider resource, no create or start effect was sent, control
+   holds no create or start claim, and the attempt has no manifest, provider id or passing receipt), the
+   driver takes the existing `_abandon` unwind instead of `unknown`: `cancel_route`, `revoke_grant`, then
+   `reconcile_unclaimed_salad` on the store's own proof. The attempt becomes `failed_transient` /
+   `not_started` with detail `executor_silent_never_sent: ...`, settled 0¢ (`unclaimed_zero`), and the
+   stage is requeued under its own caps (an attempt number, no scientific retry).
+2. **Already-unknown attempts in that shape.** For an attempt already `unknown` as `executor silent past
+   the route window` whose route still wants to run and was provably never sent, the evidence pass (ADR
+   0038 amendment, 2026-11-26) issues the reduce-only `cancel_route` when the only unclaimed refusal is
+   `claim_state_unknown` / `route_wants_run`, also while the campaign is `blocked`. The unchanged proof
+   then decides on the runner's own reconcile.
+3. **A live executor's queue is not silence.** A `route_started` attempt whose lease the executor renewed
+   after the route started, and which is still live, is not judged silent. The route-window clock in
+   effect starts at `mark_executing`.
+
+`unclaimed_proof`, `create_claim_state` and `UNCLAIMABLE_PHASES` are unchanged. Anything with a claim or a
+sent effect stays claimed and waits for evidence or a person, as before.

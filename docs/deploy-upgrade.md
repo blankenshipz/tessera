@@ -50,6 +50,19 @@ the service-health file the units write (its `last_loop_at` must be at or after 
 HTTP 2xx. A service without `stop_argv` is not stopped: execute refuses it unless the service sets
 `"writes_state": false`; the dry run and receipt list what is not stopped.
 
+### Salad routes in flight
+
+Preflight refuses the upgrade, in the dry run and under `--execute` and before anything is stopped,
+while any Salad campaign attempt is `executing`:
+`salad.executing (N Salad attempt(s) executing: a restart loses the run; wait for it to finish or pass --allow-executing-salad)`.
+Restarting the Salad executor while a route's child runs loses that run. The restarted executor
+finishes only from a receipt already on disk or relays the guardian's confirmed group stop (ADR
+0160), so the attempt ends `unknown` for a person to reconcile. Wait for the route to finish, or
+record a [deploy request](deploy-request.md). `--allow-executing-salad` turns the refusal into a
+warning when losing the run is accepted. The receipt records the count as `salad_executing`.
+Reserved, preparing and queued (`route_started`) attempts do not block: after v0.104.0 a restart
+while stages are only in those states is safe.
+
 **Service venvs (optional).** A service that runs from its own virtualenv (for example the
 reasoning service) declares `"venv": "/abs/path/to/venv"`. Then the plan also needs
 `install_source` (a checkout or built wheel path; default `repo_root`) and may set

@@ -119,3 +119,39 @@ and the grants held project concurrency slots until a person intervened.
   holder's assertion, as for every worker observation, after matching the group to the route.
 - Closing an attempt whose exit was observed but whose report never arrived, within a bounded
   window, is not decided here; this ADR only delivers the evidence that such a rule consumes.
+
+## Amendment (2026-11-26): silent-executor clock, late import and restarts (q-2705 F3, F5, F6, v0.104.0)
+
+**Context.** The Salad runner made an attempt `unknown` as `executor silent past the route window` from the
+Salad row's last move plus the route window and 600 s, with no allowance for time the campaign spent
+blocked, when the executor could not report (ADR 0038 amendment, 2026-11-26). Phase `unknown` was then
+absorbing: the restarted executor was never shown the attempt, and control refused its outcome, so a
+finished run with provider-confirmed termination and a receipt on disk could only end as a
+human-reconciled failure.
+
+**Decision.**
+
+1. **The clock does not count blocked or paused time.** The silent-executor clock starts at the later of
+   the Salad row's last move and the campaign's latest `campaign.unblocked` (stamped with the runner's
+   clock) or `campaign.approved`.
+2. **A confirmed stop waits for its import.** Past the window, a route whose provider receipts already
+   confirm termination is not called `unknown`. The attempt waits for the executor's import, and
+   `campaign.salad_import_awaited` is recorded once.
+3. **Sanctioned late import.** For an attempt that is `unknown` only for the silent reason
+   (`waiting_reason` exactly `executor silent past the route window`), unsettled, with its grant `active` or
+   `cancel_requested`, `list_salad_work` still lists it and `record_salad_outcome` accepts its outcome. The
+   `campaign.salad_outcome_recorded` event carries `late_import: true`. The runner's evidence pass re-runs
+   the unchanged `verify_outcome`, returns the stage from `blocked_unknown` to `running`
+   (`campaign.salad_late_import_verified`), and settles through the ordinary charge path. A late outcome
+   is refused for a reconciled grant or a settled attempt, and one without provider-confirmed termination
+   leaves the attempt `unknown`. No other `unknown` is late-importable.
+4. **No deploy while a route's child runs.** A restart mid-route still loses the run: the restarted
+   executor finishes only from a receipt already on disk, or relays the guardian's exact-group stop
+   (point 3). `tessera deploy-upgrade` therefore blocks preflight while any Salad attempt is `executing`,
+   unless `--allow-executing-salad` is passed (then a warning). Adopting a live child across a restart is
+   not decided here.
+
+**Consequences.** An executor outage or a block longer than a route window no longer turns a finished,
+receipt-backed run into a human-reconciled failure, provided its receipt is still in the executor's route
+directory. A restart while stages are only reserved, preparing or queued is safe. Termination is never
+inferred and the hold is released or settled exactly once.

@@ -26,6 +26,14 @@ def add_parser(subcommands: argparse._SubParsersAction) -> None:
     )
     command.add_argument("--report-file", type=Path, help="also write the receipt JSON here")
     command.add_argument("--format", choices=("text", "json"), default="text")
+    command.add_argument(
+        "--allow-executing-salad",
+        action="store_true",
+        help=(
+            "upgrade even while a Salad attempt is executing (its run is lost and the "
+            "attempt ends unknown; default: refuse)"
+        ),
+    )
 
 
 def add_rollback_parser(subcommands: argparse._SubParsersAction) -> None:
@@ -87,7 +95,11 @@ def run(arguments: argparse.Namespace) -> int:
         print(f"deploy-upgrade: {error}", file=sys.stderr)
         return 2
     try:
-        document = deploy_upgrade.run_upgrade(plan, execute=arguments.execute)
+        document = deploy_upgrade.run_upgrade(
+            plan,
+            execute=arguments.execute,
+            allow_executing_salad=getattr(arguments, "allow_executing_salad", False),
+        )
         if arguments.execute:
             deploy_upgrade.write_receipt(plan, document)
         if arguments.report_file is not None:

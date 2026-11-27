@@ -873,6 +873,11 @@ class SaladRouteProvider:
             return
         self._translate(lambda: self.driver(rt).late_charges(ctx))
 
+    def evidence_pass(self, rt: RunnerServices, ctx: Any) -> None:
+        """Evidence-only Salad work: verify recorded (or late-imported) outcomes and cancel the
+        route of an attempt already unknown that was provably never sent (v0.104.0)."""
+        self._translate(lambda: self.driver(rt).evidence_pass(ctx))
+
     def on_settled(
         self, connection: sqlite3.Connection, attempt_id: str, cents: int, stamp: str
     ) -> None:

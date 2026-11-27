@@ -24,6 +24,7 @@ from pydantic import ValidationError
 from . import campaign_preapproval, operator_config_freshness, provider_trust
 from . import execution_frames as frames
 from .artifact_manifests import grant_manifest_is_partial
+from .campaign_autoreconcile import NOT_STARTED
 from .campaign_infra_retry import (
     INFRA_SALAD_CREATE_NOT_SENT,
     REALLOCATED_PRECUSTODY,
@@ -38,10 +39,12 @@ from .campaign_models import (
     stage_on_candidate,
 )
 from .campaign_salad_adapter import bind_workload, is_late_bound
-from .campaign_salad_commands import LIVE_CHECK_NO_RECEIPT
+from .campaign_salad_commands import LIVE_CHECK_NO_RECEIPT, SILENT_EXECUTOR
 from .campaign_settlement import apply_late_charge, confirm_settlement
 from .campaign_steps import StepFailed
 from .campaign_store import _GuardianFinal
+from .campaign_unclaimed import Refused
+from .campaign_unclaimed import assess as assess_unclaimed
 from .external_operations import current_operation_reconciliation
 from .guardian_record_reader import validate_frame_record
 from .programs import program_context
@@ -95,6 +98,16 @@ PRE_ROUTE_PHASES = ("leased", "awaiting_review", "reviewed", "capability_ready",
 DECISION_HOURS = 23
 CAPABILITY_HOURS = 23
 SILENT_EXECUTOR_GRACE_SECONDS = 600
+# v0.104.0: the silent window passed for a route control can prove was never sent anything;
+# it takes the existing unclaimed unwind and is requeued as not started (ADR 0046), never
+# ``unknown``.
+SILENT_NEVER_SENT = "executor_silent_never_sent"
+# Events after which a campaign is forward-legal again: the silent clock restarts there, so
+# time spent blocked or paused (when the executor was not allowed to report) never counts.
+RESUME_EVENTS = ("campaign.unblocked", "campaign.approved")
+# One event per attempt whose route already shows provider-confirmed termination when the
+# silent window passed: the attempt waits for the executor's import instead of going unknown.
+IMPORT_AWAITED_EVENT = "campaign.salad_import_awaited"
 PARTITION = "operational"
 CONDITION = "operational_run"
 REVIEW_REASON = (
@@ -241,6 +254,20 @@ def stage_workload(stage: dict[str, Any], spec_stage: Any) -> Any:
         return contract
     digest = stage.get("input_snapshot_digest")
     return bind_workload(contract, str(digest)) if digest else contract
+
+
+def _termination_confirmed(state: dict[str, Any] | None) -> bool:
+    """The route's own provider receipts confirm the run stopped (the precondition
+    ``verify_outcome`` checks first; a reallocated group needs the provider's own read)."""
+    if state is None:
+        return False
+    if state.get("reallocated"):
+        return provider_termination(state).confirmed
+    return (
+        state.get("termination_confirmed") is True
+        and state.get("provider_status") == "stopped"
+        and any(r.get("provenance") == "provider" for r in state.get("receipts", []))
+    )
 
 
 def _waiting() -> type[Exception]:
@@ -1623,18 +1650,72 @@ class SaladStageDriver:
             # reconcile at 0 with the store's own no-claim proof) ends it. Anything else waits
             # as before.
             return self._abandon(ctx, stage, spec_stage, attempt, LIVE_CHECK_NO_RECEIPT)
+        if row["phase"] == "route_started" and self._lease_fresh(row):
+            # Queued behind the executor's own route limits but alive (it renews the lease):
+            # not silent. The route-window clock starts at ``mark_executing`` (v0.104.0).
+            raise _waiting()()
         window = (
             state["proposal"]["selection"]["resources"]["max_seconds"]
             if state
             else self.profile(spec_stage).route_max_seconds
         )
-        deadline = _parse_utc(row["updated_at"]) + timedelta(
+        deadline = self._silent_clock_start(ctx, row) + timedelta(
             seconds=window + SILENT_EXECUTOR_GRACE_SECONDS
         )
         if self.runner.now() > deadline:
-            self._unknown(attempt, "executor silent past the route window")
+            if self._never_sent(ctx, row, state):
+                # Nothing was ever sent for this route: the existing unclaimed unwind (cancel
+                # the route, revoke, reconcile at 0 on the store's own proof), not unknown.
+                return self._abandon(ctx, stage, spec_stage, attempt, SILENT_NEVER_SENT)
+            if _termination_confirmed(state):
+                # The provider already confirmed the run stopped: its receipt is (or will be)
+                # imported by the executor; wait for it instead of calling the run unknown.
+                self._emit_once(
+                    ctx,
+                    IMPORT_AWAITED_EVENT,
+                    {"attempt_id": attempt["id"]},
+                    {"stage_key": attempt["stage_key"], "route_id": row["route_id"]},
+                )
+                raise _waiting()()
+            self._unknown(attempt, SILENT_EXECUTOR)
             return True
         raise _waiting()()
+
+    def _silent_clock_start(self, ctx: _Ctx, row: dict[str, Any]) -> datetime:
+        """When the silent-executor clock starts: the Salad row's last move, or the campaign's
+        last return to a forward-legal state if later. While blocked or paused the executor may
+        not report forward progress, so that time is never counted (v0.104.0)."""
+        start = _parse_utc(row["updated_at"])
+        marks = ",".join("?" for _ in RESUME_EVENTS)
+        for event in self.runner._rows(
+            f"""SELECT created_at, json_extract(payload_json,'$.at') AS at FROM events
+            WHERE project_id=? AND event_type IN ({marks})
+            AND json_extract(payload_json,'$.campaign_id')=?""",
+            (ctx.campaign["project_id"], *RESUME_EVENTS, ctx.campaign["id"]),
+        ):
+            try:
+                resumed = _parse_utc(event["at"] or event["created_at"])
+            except (TypeError, ValueError):
+                continue
+            start = max(start, resumed)
+        return start
+
+    def _lease_fresh(self, row: dict[str, Any]) -> bool:
+        """The executor renewed this attempt's lease since the route started, and the lease is
+        still live: a queued route of a live executor (fails closed: no lease is not fresh)."""
+        if row.get("lease_id") is None:
+            return False
+        lease = self.runner._one(
+            "SELECT expires_at, renewed_at FROM execution_leases WHERE id=?", (row["lease_id"],)
+        )
+        if lease is None:
+            return False
+        try:
+            return _parse_utc(lease["expires_at"]) > self.runner.now() and _parse_utc(
+                lease["renewed_at"]
+            ) > _parse_utc(row["updated_at"])
+        except (TypeError, ValueError):
+            return False
 
     def _never_sent(self, ctx: _Ctx, row: dict[str, Any], state: dict[str, Any] | None) -> bool:
         """True when control's own records prove no provider create or start was sent.
@@ -1704,8 +1785,116 @@ class SaladStageDriver:
         }
         if verdict != "ok":
             fields["failure_detail"] = detail[:500]
-        self.runner._set_attempt(attempt["id"], **fields)
+        if attempt["status"] != "unknown":
+            self.runner._set_attempt(attempt["id"], **fields)
+            return True
+        # The sanctioned late import (v0.104.0): the attempt was unknown only because the
+        # executor was silent. The unchanged verification passed or failed on provider-confirmed
+        # termination, so it leaves unknown and its stage resumes, in one transaction; the
+        # ordinary collect, resolve and charge path settles it (never unclaimed-zero).
+        if verdict == "ok":
+            fields.update(failure_class=None, failure_detail=None)
+        else:
+            fields["failure_class"] = None
+        with self.runner.store.runner_connection() as connection:
+            self.runner._touch(
+                connection, "campaign_stage_attempts", "id=?", (attempt["id"],), **fields
+            )
+            self.runner._touch(
+                connection,
+                "campaign_stages",
+                "campaign_id=? AND stage_key=? AND status='blocked_unknown'",
+                (ctx.campaign["id"], attempt["stage_key"]),
+                status="running",
+            )
+            self.runner.store.record_runner_event(
+                connection,
+                ctx.campaign,
+                "campaign.salad_late_import_verified",
+                {
+                    "stage_key": attempt["stage_key"],
+                    "attempt": attempt["attempt"],
+                    "attempt_id": attempt["id"],
+                    "verdict": verdict,
+                    "salad_evidence_digest": evidence,
+                },
+            )
         return True
+
+    def evidence_pass(self, ctx: _Ctx) -> None:
+        """Evidence-only work, run while the campaign is blocked and before the stage loop of a
+        running pass (so before any silent-clock check) (v0.104.0).
+
+        * An ``outcome_recorded`` attempt (recorded during a block, or late-imported for an
+          attempt called silent) is verified by the unchanged ``verify_outcome``.
+        * An attempt already ``unknown`` only for the silent reason, whose route still wants
+          to run but was provably never sent anything, gets the reduce-only ``cancel_route``
+          when the only unclaimed refusal is ``route_wants_run``; the unchanged unclaimed proof
+          then decides on the runner's own reconcile.
+
+        A reconciled grant or a settled attempt is never touched."""
+        rows = self.runner._rows(
+            """SELECT a.* FROM campaign_stage_attempts a
+            JOIN campaign_salad_attempts sa ON sa.attempt_id = a.id
+            JOIN execution_grants g ON g.id = a.grant_id
+            WHERE a.campaign_id=? AND a.settled_cents IS NULL
+            AND g.status IN ('active','cancel_requested')
+            AND ((sa.phase='outcome_recorded' AND a.status IN ('running','unknown'))
+              OR (sa.phase='unknown' AND sa.waiting_reason=? AND a.status='unknown'))
+            ORDER BY a.stage_key, a.attempt""",
+            (ctx.campaign["id"], SILENT_EXECUTOR),
+        )
+        for attempt in rows:
+            key = attempt["stage_key"]
+            try:
+                spec_stage = self._spec(ctx, key)
+            except KeyError:
+                continue
+            row = self.row(attempt["id"])
+            if row["phase"] == "outcome_recorded":
+                if attempt["status"] == "unknown" and not self._late_imported(attempt):
+                    continue
+                self._verify(ctx, self.runner._stage_row(ctx, key), spec_stage, attempt, row)
+            else:
+                self._cancel_never_sent(ctx, key, attempt, row)
+
+    def _late_imported(self, attempt: dict[str, Any]) -> bool:
+        """An unknown attempt's outcome is verified only after the sanctioned late import: the
+        runner called it silent, and control then recorded its outcome as a late import."""
+        if attempt["failure_detail"] != SILENT_EXECUTOR:
+            return False
+        found = self.runner._one(
+            """SELECT 1 FROM events WHERE event_type='campaign.salad_outcome_recorded'
+            AND json_extract(payload_json,'$.attempt_id')=?
+            AND json_extract(payload_json,'$.late_import')=1 LIMIT 1""",
+            (attempt["id"],),
+        )
+        return found is not None
+
+    def _cancel_never_sent(
+        self, ctx: _Ctx, key: str, attempt: dict[str, Any], row: dict[str, Any]
+    ) -> None:
+        state = self.route_state(row["route_id"])
+        if state is None or state.get("desired") != "run":
+            return
+        if not self._never_sent(ctx, row, state):
+            return
+        provider = self.runner._attempt_provider(ctx, key, attempt)
+        with self.runner.store.runner_connection() as connection:
+            fresh = connection.execute(
+                "SELECT * FROM campaign_stage_attempts WHERE id=?", (attempt["id"],)
+            ).fetchone()
+            verdict = assess_unclaimed(connection, fresh, ctx.campaign, provider)
+        if not (
+            isinstance(verdict, Refused)
+            and verdict.reason == "claim_state_unknown"
+            and verdict.provider_reason == "route_wants_run"
+        ):
+            return
+        try:
+            self._cancel_route(ctx, self.runner._stage_row(ctx, key), attempt, row)
+        except StepFailed:
+            return  # the unchanged proof keeps refusing; the human path stays
 
     def verify_outcome(
         self, ctx: _Ctx, attempt: dict[str, Any], row: dict[str, Any]
@@ -1944,6 +2133,13 @@ class SaladStageDriver:
         done = self.unwind(ctx, key, attempt)
         if done:
             failure_class, detail = "t1_salad_unclaimed", reason
+            if reason == SILENT_NEVER_SENT:
+                # Queued, never sent: an attempt number, not a scientific retry (ADR 0046).
+                failure_class = NOT_STARTED
+                detail = (
+                    f"{reason}: the route window passed and control holds no create or start "
+                    "claim, sent route effect or provider reference; released at 0"
+                )
             if reason == CREATE_NOT_SENT:
                 limit = spec_stage.retry.infra_retries
                 used = infra_attempts(
