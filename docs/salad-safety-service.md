@@ -554,7 +554,11 @@ never-placed group ([ADR 0206](decisions/0206-salad-provisioning-not-run-time.md
 a Salad campaign attempt also covers the provisioning allowance (lease issue plus the task's
 `max_duration_seconds` plus 1500 s, still bounded by grant and credential expiry), so
 provisioning no longer spends the stage's run time; the run itself stays bounded from first
-running by the running cap.
+running by the running cap. That cap, and the guardian's first-running latch, start only on an
+instance-level `running` (or a positive `running_count` when no instance list was read): a group
+that reads `running` over an instance still creating or downloading its image starts accrual
+(conservatively, at the first such read) but is reported to the guardian as pending, so an image
+pull never spends the declared run.
 
 ## Start-failure loop before custody
 
@@ -621,6 +625,13 @@ or any other flag still waits for a charge. A run whose first stop was retaining
 whose allocation then changed while it was stopping (custody unsealed) carries
 `retained_before_move` on its final and is the same retryable move.
 
+Since the ADR 0207 amendment of 2026-11-27, any recorded final the safety service closed by its own
+provider-confirmed reconcile (`reconciled`, `provider_confirmed_exact_group_stopped`) that is not a
+safety-plane stop settles at the guardian's estimate on the same conditions, with or without
+`retained_before_move` or a move class (an attempt recorded by an older release included). The
+attempt keeps its outcome class: only its settlement changes (a `salad_not_passed` attempt stays
+`failed_permanent`, is not retried, and none of its outputs are accepted).
+
 ## Safety-plane stops are infrastructure
 
 The guardian's first stop cause is carried on the executor's recorded final as
@@ -680,6 +691,17 @@ is never evidence of anything.
 effect may send only the exact group and instance reads; the trusted server refuses either stream
 read as `admission_denied` before any claim, so no effect nonce is spent and no provider call is
 made.
+
+One workload exit on one machine is enough (the earliest non-zero exit, when it is not 137 or
+143): unlike the start-failure loop (three distinct machines, ADR 0196), there is no retry for a node-local fault that exits non-zero
+([ADR 0193](decisions/0193-salad-allocation-deadline-machine-assignment.md) and
+[ADR 0197](decisions/0197-salad-post-start-interruption-retry.md) amendments).
+
+A frame the watch did not catch still depends on the post-stop events read. That read runs on a
+short-lived thread after the stop and is recorded on a later loop pass, so the executor can record
+its final before the exit is on the guardian's record; control then classifies without it. The
+watch closes this for a group it sees exit while armed; for any other frame the order is not
+guaranteed. This race is older than the watch.
 
 ## Allocation change after custody began
 

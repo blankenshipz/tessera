@@ -2703,7 +2703,8 @@ def test_lost_create_operator_path_needs_a_list_read_that_reached_the_project(tm
         assert s._row(b["reservation"])["reconciled_attestation"] == digest
         assert Decimal(status["estimated_exposure_cents"]) == 0
         assert [tuple(r) for r in s.db.execute("SELECT kind FROM events")] == [
-            ("operator_lost_create_absent_reconciled",)
+            ("project_group_list_full",),
+            ("operator_lost_create_absent_reconciled",),
         ]
         s.admin(_next_reservation(s, clock))
     finally:
@@ -3068,7 +3069,10 @@ def test_create_rejected_never_releases_without_both_reads(tmp_path, absence, li
         assert s._row(b["reservation"])["lost_create_resolution"] is None
         with pytest.raises(ValueError, match="single_operation_orphan_exposure"):
             s.admin(_next_reservation(s, clock))
-        assert _kinds(s) == ["create_rejection_reported"]
+        expected = ["create_rejection_reported"]
+        if list_read == "absent_partial":
+            expected.append("project_group_list_full")
+        assert _kinds(s) == expected
     finally:
         s.close()
 
@@ -3580,7 +3584,9 @@ def test_an_allocating_instance_that_names_its_machine_is_placed(tmp_path):
     # Conservative for billing and exposure: it may be started earlier than Salad bills it.
     counts = dict(allocating_count=1, creating_count=0, running_count=0, stopping_count=0)
     o, row, now = _observed(tmp_path, machine=MACHINE, counts=counts)
-    assert o.state == "running" and o.instance_count == 1
+    # Accrual is conservative (below), but the guardian's running cap (state ``running``) starts
+    # only on the instance's own ``running``, never on a placed-but-allocating instance.
+    assert o.state == "pending" and o.instance_count == 1
     assert o.allocation_id == "unallocated"  # bound only once it is really running
     assert row["first_running_at"] is not None and row["seen_running"] == 1
 

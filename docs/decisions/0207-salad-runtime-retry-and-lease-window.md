@@ -51,7 +51,8 @@ campaign on a person, with a healthy workload:
    records `infra_salad_reallocated` (outputs never accepted), settles under item 1 and retries
    within `retry.infra_retries`. Custody is not sealed: the guardian still cannot prove a writer
    died after an allocation change, so sealing those retained outputs is left open (see
-   Consequences). Without that record the attempt waits for a person as before.
+   Consequences). ~~Without that record the attempt waits for a person as before.~~ Superseded by
+   the 2026-11-27 amendment below: a provider-confirmed reconcile settles at the estimate without it.
 3. **Safety-plane stops are infrastructure.** `campaign_infra_retry.SAFETY_STOP_CAUSES` is a
    closed table: `heartbeat_silence`, `control_disconnect`, `missed_poll`, `clock_uncertain`,
    `guardian_restart`, `loop_frame_failed`, `rate_unknown`, `provider_unknown`,
@@ -103,3 +104,15 @@ authority check is loosened, and nothing infers termination, a charge or a refun
 Open: sealing outputs that custody retained before an allocation change during stopping. Today
 those outputs are lost and the stage reruns. A safe seal needs proof that no writer on the moved
 allocation could have written after retention; until then the run is retried, never accepted.
+
+## Amendment (2026-11-27): attempts recorded before the move markers
+
+A guardian final closed by the safety service's own provider-confirmed reconcile
+(`RECONCILE_PROVIDER`) now settles the same way whether or not the attempt carries
+`retained_before_move` or a move class, so an attempt recorded by an older release leaves
+`awaiting_charge` without a person recording a charge. The rule is unchanged: control's own read
+of the guardian record must confirm the close, the estimate must be finite and within the hold
+(rounded up, at least one cent), no other flag may be set, and an operator's attested reconcile
+never qualifies. A safety-plane stop keeps settling the whole hold. The settlement stays
+provisional (`guardian_bounded_hold`); a human charge already recorded wins and is never doubled,
+and a later charge adds only its excess.

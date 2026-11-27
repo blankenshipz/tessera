@@ -45,6 +45,11 @@ from .campaign_models import (
 )
 from .campaign_salad_adapter import bind_workload, is_late_bound
 from .campaign_salad_commands import LIVE_CHECK_NO_RECEIPT, SILENT_EXECUTOR
+from .campaign_salad_executor import (
+    FINISH_RETRY_SECONDS,
+    SUBPROCESS_GRACE_SECONDS,
+    TERMINATION_CONFIRM_MAX_SECONDS,
+)
 from .campaign_settlement import apply_late_charge, confirm_settlement
 from .campaign_steps import StepFailed
 from .campaign_store import _GuardianFinal
@@ -109,6 +114,14 @@ PRE_ROUTE_PHASES = ("leased", "awaiting_review", "reviewed", "capability_ready",
 DECISION_HOURS = 23
 CAPABILITY_HOURS = 23
 SILENT_EXECUTOR_GRACE_SECONDS = 600
+# An ``executing`` attempt whose lease the executor keeps renewing is not called silent while
+# it is inside the executor's own budget: the route window, the child's subprocess grace, the
+# longest termination-confirmation wait an operator may configure and the deferred finish.
+# Derived from the executor's constants so the two sides cannot drift; never past this cap, and
+# never past the lease's own expiry.
+EXECUTING_RENEWED_GRACE_SECONDS = (
+    SUBPROCESS_GRACE_SECONDS + TERMINATION_CONFIRM_MAX_SECONDS + int(FINISH_RETRY_SECONDS)
+)
 # ``resolve_decision`` slots of a carried-over review (plan, source use): apart from the
 # pre-approval's 0 and 1, so a refused carryover never replays into the pre-approval path.
 CARRYOVER_ORDINAL = 10
@@ -448,6 +461,20 @@ def _retained_before_move(row: dict[str, Any]) -> bool:
     stopping (custody unsealed): a provider-confirmed move, settled like one."""
     final = _recorded_final(row)
     return final is not None and final.get("retained_before_move") is True
+
+
+def _provider_closed(row: dict[str, Any]) -> bool:
+    """The recorded guardian final was closed by the safety service's own provider-confirmed
+    reconcile (``RECONCILE_PROVIDER``), whatever recorded marker (``retained_before_move``) or
+    class the attempt carries: an attempt recorded before those markers existed settles the same
+    way as one recorded after, on the guardian's own evidence only. Not a safety-plane stop."""
+    final = _recorded_final(row)
+    return (
+        final is not None
+        and final.get("status") == "reconciled"
+        and final.get("reason") == RECONCILE_PROVIDER
+        and not _safety_stopped(row)
+    )
 
 
 def _safety_stopped(row: dict[str, Any]) -> bool:
@@ -1850,6 +1877,16 @@ class SaladStageDriver:
         deadline = self._silent_clock_start(ctx, row) + timedelta(
             seconds=window + SILENT_EXECUTOR_GRACE_SECONDS
         )
+        if (
+            row["phase"] == "executing"
+            and self.runner.now() > deadline
+            and self.runner.now()
+            <= self._silent_clock_start(ctx, row)
+            + timedelta(seconds=window + EXECUTING_RENEWED_GRACE_SECONDS)
+            and self._lease_fresh(row)
+        ):
+            # The executor is still renewing a live lease inside its own time budget.
+            raise _waiting()()
         if self.runner.now() > deadline:
             if self._never_sent(ctx, row, state):
                 # Nothing was ever sent for this route: the existing unclaimed unwind (cancel
@@ -2715,7 +2752,8 @@ class SaladStageDriver:
             if estimate is None or hold < 1 or math.ceil(estimate) > hold:
                 return None
             return max(1, math.ceil(estimate))
-        if _provider_moved(attempt) or _retained_before_move(row):
+        if _provider_moved(attempt) or _retained_before_move(row) or _provider_closed(row):
+            # (``_provider_closed``: an attempt recorded before the move markers existed.)
             # The provider moved the instance and its own read confirmed the stop (control's
             # verify step; never a receipt reason). The guardian accrued only while it saw the
             # group running and froze accrual at its provider-confirmed close, so its estimate
@@ -2792,6 +2830,7 @@ class SaladStageDriver:
                     if _was_interrupted(attempt)
                     or _provider_moved(attempt)
                     or _retained_before_move(row)
+                    or _provider_closed(row)
                     or _safety_stopped(row)
                     else {"stopped"}
                 )

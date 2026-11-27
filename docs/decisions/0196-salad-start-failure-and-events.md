@@ -79,3 +79,11 @@ The tail appears only in the guardian's final status, the recorded guardian fina
 `guardian_container_exit.stderr_tail`, as an operator explanation of a failure, never as evidence
 or in any authority, admission or settlement decision. A failed, rate-limited or unread query
 records a closed reason instead.
+
+A non-zero exit no longer waits for three machines. The three-machine rule above still governs a
+start-failure loop with no failing exit code. When the earliest non-zero exit on a single machine
+is the workload's own (not 137 or 143), while its frame is armed and seen running with no retained
+output, the group is stopped at once and the attempt fails permanently
+(`salad_container_exited_nonzero`); see the amendment to
+[ADR 0193](0193-salad-allocation-deadline-machine-assignment.md). When the earliest non-zero exit
+is 137 or 143 (a kill or platform stop came first), the behaviour above is kept.

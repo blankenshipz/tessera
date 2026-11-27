@@ -33,3 +33,19 @@ deadline never fired and no fallback ran.
    `proxy_detail`, `proxy_field` and `proxy_request_kind` of the failed read (never a value, body, URL or
    path). The model refuses these diagnostics on any readback that is not unknown, and the server omits them
    on a reallocation.
+
+## Amendment: one non-zero container exit fails the attempt
+
+The "several machines" rule for blaming the image is [ADR 0196](0196-salad-start-failure-and-events.md)
+(three distinct machines before the guardian stops a start-failure loop). It no longer holds for a
+container that exits with a failing code. While a frame is armed, seen running and has no retained
+output, the guardian's safety service reads the group's system events (`salad_exit_watch`). When
+the earliest non-zero `instance_exited` code on a single machine is the workload's own (not 137 or
+143; when the earliest non-zero exit is 137 or 143, a kill or platform stop came first and this
+amendment does not apply), the guardian stops the group with the cause `container_exited_nonzero`,
+and control records the
+attempt `failed_permanent` with the failure class `salad_container_exited_nonzero`. It is not an
+infrastructure class, so `retry.infra_retries` and the class fallback do not apply. A node-local
+fault that exits non-zero (a bad GPU node, for example) therefore gets no retry. The allocation
+deadline and the assigned-machine rules above are unchanged. See `docs/salad-safety-service.md`,
+"Container exited non-zero".

@@ -541,6 +541,28 @@ def _running(observation):
     return observation.get("state") == "running" and not _no_placed_instance(observation)
 
 
+def _instance_running(observation):
+    """True when a machine itself runs: a listed instance in ``running``, or (no instance list was
+    read) a positive ``running_count`` while the group says ``running``; a group whose counts
+    cannot be read stays fail closed. A group ``running`` over a still creating/downloading
+    instance is accrual-conservative (``_running``) but is not the workload running, so it must
+    not start the running cap (an image pull is not the declared run)."""
+    instances = observation.get("instances") or []
+    if instances:
+        return any(i.get("state") == "running" for i in instances)
+    if observation.get("state") != "running":
+        return False
+    counts = observation.get("instance_status_counts")
+    if (
+        observation.get("instance_counts_complete", True) is True
+        and type(counts) is dict
+        and set(counts) == _COUNT_KEYS
+        and all(type(v) is int and v >= 0 for v in counts.values())
+    ):
+        return counts["running_count"] > 0
+    return not _no_placed_instance(observation)
+
+
 FRAME_RECORD_SCHEMA = """
 CREATE TABLE IF NOT EXISTS frame_records (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -695,6 +717,9 @@ class SaladSafetyService(ContainerExitWatch):
             "first_running_at": "REAL",
             "last_unseen_at": "REAL",
             "seen_running_at": "REAL",
+            # first_running_at was set by a group-level ``running`` read over an instance that was
+            # not itself running (accrual only): it must not start the running cap.
+            "accrual_only": "INTEGER DEFAULT 0",
             "running_seconds": "REAL",
             # Authenticated chunked-output requests charged before any provider read.
             "output_requests": "INTEGER DEFAULT 0",
@@ -1136,12 +1161,20 @@ class SaladSafetyService(ContainerExitWatch):
                 (format(estimate, "f"), max(now, last), int(escalation), row["reservation"]),
             )
 
+    @staticmethod
+    def _cap_start(row):
+        """When the running cap starts: the instance's own first ``running`` (or the workload's
+        begin), never an accrual-only group ``running`` read over a pulling instance."""
+        if row["seen_running_at"] is not None:
+            return row["seen_running_at"]
+        return None if row["accrual_only"] else row["first_running_at"]
+
     def _stop_deadline(self, row):
         """Earliest billed-time bound: route (provisioning) deadline, or the
         first-running instant plus the approved running window once running."""
         # Accrual is backdated (first_running_at) for cost; the stop deadline runs
         # from the actual first sighting so a backdate never cuts a run short.
-        started = row["seen_running_at"] or row["first_running_at"]
+        started = self._cap_start(row)
         if row["running_seconds"] is None or started is None:
             return row["deadline"]
         return min(row["deadline"], started + row["running_seconds"])
@@ -1149,7 +1182,7 @@ class SaladSafetyService(ContainerExitWatch):
     def _billed_remaining(self, row):
         """Worst-case remaining billed seconds from now."""
         now = self.clock()
-        if row["running_seconds"] is None or row["first_running_at"] is None:
+        if row["running_seconds"] is None or self._cap_start(row) is None:
             window = row["deadline"] - now
             if row["running_seconds"] is not None:
                 window = min(window, row["running_seconds"])
@@ -1179,12 +1212,14 @@ class SaladSafetyService(ContainerExitWatch):
         the whole watch means a reopening can never push the total past the cap. A frame
         proven absent after Salad's own clean create rejection (``create_rejected``) is a
         rejected-absent frame, not a lost create: it frees its hold at once (ADR 0041 7.2).
+        So does a ``never_ready`` frame: it never answered "ready", so no create was sent.
+        An ``automatic`` resolution keeps the hold, since a create may have been sent.
         An unreadable resolution record holds (fails closed)."""
         if not self._lost_create_closed(row):
             return False
         try:
             record = json.loads(row["lost_create_resolution"])
-            if record["kind"] == "create_rejected":
+            if record["kind"] in {"create_rejected", "never_ready"}:
                 return False
             return self.clock() - float(record["resolved_at"]) < LOST_CREATE_WATCH_SECONDS
         except Exception:
@@ -1771,6 +1806,27 @@ class SaladSafetyService(ContainerExitWatch):
             and now >= row["heartbeat"] + NEVER_READY_SETTLE_SECONDS
         )
 
+    def _note_group_list_full(self, row):
+        """Operator-visible, closed note (once per reservation) that the project group list
+        is full (100+ groups, no documented paging), so no automatic release can prove
+        absence and this frame waits for an operator reconcile. Never releases anything."""
+        with self.db:
+            if self.db.execute(
+                "SELECT 1 FROM events WHERE reservation=? AND kind='project_group_list_full'",
+                (row["reservation"],),
+            ).fetchone():
+                return
+            self.db.execute(
+                "INSERT INTO events(reservation,operation,at,kind,detail) VALUES(?,?,?,?,?)",
+                (
+                    row["reservation"],
+                    row["operation"],
+                    self.clock(),
+                    "project_group_list_full",
+                    json.dumps(dict(count_bucket="100_plus", list_read="absent_partial")),
+                ),
+            )
+
     def _resolve_lost_create(self, row, *, attestation=None, rejected=False, never_ready=False):
         """Make a never-bound recovering reservation terminal on proven absence.
 
@@ -1829,6 +1885,8 @@ class SaladSafetyService(ContainerExitWatch):
             raise ValueError("lost_create_group_listed")
         # Automatic: a complete page proves absence. Operator: the list read must still
         # have reached the project (a well-formed page, 100+ items allowed).
+        if o["list_read"] == "absent_partial" and attestation is None:
+            self._note_group_list_full(row)
         accepted = {"absent"} if attestation is None else {"absent", "absent_partial"}
         if o["list_read"] not in accepted:
             raise ValueError("lost_create_absence_unconfirmed")
@@ -2135,13 +2193,25 @@ class SaladSafetyService(ContainerExitWatch):
         if _running(observation):
             # Billing may have begun any time after the last poll that did not see
             # the instance running; start accrual there, conservatively.
+            # The running cap (seen_running_at) starts only on the instance's own ``running``;
+            # accrual still starts at the first group-level read.
+            latch = _instance_running(observation)
             with self.db:
                 self.db.execute(
                     "UPDATE reservations SET seen_running=1,"
+                    "accrual_only=CASE WHEN first_running_at IS NULL AND seen_running_at IS NULL"
+                    " AND ?=0 THEN 1 ELSE accrual_only END,"
                     "first_running_at=COALESCE(first_running_at,last_unseen_at,?),"
-                    "seen_running_at=COALESCE(seen_running_at,?) WHERE reservation=?",
+                    "seen_running_at=COALESCE(seen_running_at,"
+                    "CASE WHEN ?=1 THEN ? END) WHERE reservation=?",
                     # No earlier unseen poll: it may have run up to one poll gap.
-                    (now - self.unseen_run_gap_seconds, now, row["reservation"]),
+                    (
+                        int(latch),
+                        now - self.unseen_run_gap_seconds,
+                        int(latch),
+                        now,
+                        row["reservation"],
+                    ),
                 )
         elif row["first_running_at"] is None:
             if terminal and row["provider_id"]:
@@ -2169,7 +2239,9 @@ class SaladSafetyService(ContainerExitWatch):
             else "pending"
         )
         if _running(observation):
-            state = "running"
+            # The guardian starts its running cap on ``running``: a group-level read over a
+            # still-pulling instance is reported pending (accrual above already started).
+            state = "running" if _instance_running(observation) else "pending"
         if row["allocation_uncertain"]:
             state = "unknown"
         return ProviderObservation(

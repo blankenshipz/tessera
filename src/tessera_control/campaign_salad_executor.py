@@ -78,6 +78,9 @@ LIVE_RECEIPT_SCHEMA = "tessera.salad.live-check.v1"
 # inside bounded windows (salad_live_check.CUSTODY_SEAL_SECONDS, VERIFY_RETRY_SECONDS); this
 # grace past the route window covers them. The group is stopped while the tail runs.
 SUBPROCESS_GRACE_SECONDS = 900
+# The most an operator may configure for ``termination_confirm_seconds``: the runner bounds its
+# wait for a lease-renewing executor by it (it cannot read the executor's own configuration).
+TERMINATION_CONFIRM_MAX_SECONDS = 3600
 KEEPALIVE_PHASES = ("leased", "route_started", "executing")
 _IDENT = re.compile(r"[a-zA-Z0-9_-]{1,200}\Z")
 _Path = Annotated[str, StringConstraints(min_length=1, max_length=4096)]
@@ -202,7 +205,9 @@ class ExecutorConfig(_Closed):
     # ADR 0149: after a reallocated route stops, read the provider again (one route observe per
     # poll) until it confirms the group terminated, for at most this long. 0 disables the wait;
     # the attempt is then left held as termination-unconfirmed at once.
-    termination_confirm_seconds: Annotated[int, Field(ge=0, le=3600)] = 600
+    termination_confirm_seconds: Annotated[int, Field(ge=0, le=TERMINATION_CONFIRM_MAX_SECONDS)] = (
+        600
+    )
     termination_poll_seconds: Annotated[int, Field(ge=5, le=60)] = 15
     stage_watcher: StageWatcherBlock | None = None
     # How many paid routes (live-check children) this executor drives at once. The default 1
@@ -750,6 +755,9 @@ class _Keepalive:
         self._stop.set()
         self.thread.join(KEEPALIVE_JOIN_SECONDS)
         if self.thread.is_alive():
+            # The beat still in flight finishes on its own thread after the pass read its
+            # snapshot: a refusal it meets then is not applied by this pass. Nothing is lost:
+            # the next pass renews that lease itself (``_keepalive``) and fences on the refusal.
             with self._lock:
                 self.join_timed_out = True
 
@@ -820,6 +828,7 @@ class SaladCampaignExecutor:
         self._leases: dict[str, tuple[str, int]] = {}
         # Attempts whose lease renewal was refused: never retried past the fence.
         self.fenced: dict[str, str] = {}
+        # Consecutive transient renewal failures per listed, unfenced attempt (pass keepalive).
         self._renewal_streak: dict[str, int] = {}
         self._step = "grant_poll"  # the control call in flight, named on a recorded refusal
         # Attempts whose live check exited on its own with no receipt, until control has the
@@ -898,6 +907,9 @@ class SaladCampaignExecutor:
             # Control refused this attempt's last call and no longer lists it: say so once,
             # rather than go quiet (v0.104.0).
             self._note("work_withdrawn_after_refusal", attempt, self._refused.pop(attempt))
+        for attempt in set(self._renewal_streak) - listed:
+            # An attempt control no longer lists has ended: its renewal streak goes with it.
+            del self._renewal_streak[attempt]
         for item in items:
             attempt = item["attempt_id"]
             if concurrent and attempt in self._in_flight:
@@ -1059,8 +1071,10 @@ class SaladCampaignExecutor:
                     type(error).__name__,
                 )
                 self.fenced[attempt] = TRANSIENT_CAP
+                self._renewal_streak.pop(attempt, None)  # fenced: never renewed again
                 self._note("lease_renewal_refused", attempt, TRANSIENT_CAP)
                 return
+            self._renewal_streak.pop(attempt, None)
             self.fenced[attempt] = type(error).__name__
             self._note("lease_renewal_refused", attempt, type(error).__name__)
 

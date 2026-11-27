@@ -279,15 +279,6 @@ def test_a_retained_run_on_a_route_flagged_move_is_retried_the_same_way(tmp_path
     _retried_without_charge(world)
 
 
-def test_without_the_retained_flag_the_same_final_fails_closed(tmp_path):
-    world = _retained_world(tmp_path, RECONCILED)
-    world.tick_until_phase("awaiting_charge")
-    world.tick(3)
-    assert world.phase() == "awaiting_charge"
-    assert world.attempt()["settled_cents"] is None
-    assert len(_attempts(world)) == 1
-
-
 def test_the_projection_carries_retained_before_move_only_for_the_provider_close():
     base = dict(STATUS, status="reconciled", reason=RECONCILE_PROVIDER, allocation_uncertain=True)
     assert project_guardian_final(dict(base, output_retained=True))["retained_before_move"] is True

@@ -127,13 +127,16 @@ def test_blocked_campaign_keeps_started_routes_listed_and_refuses_forward_comman
     assert world.salad()["phase"] == "route_started"
 
 
-def test_paused_campaign_lists_no_pre_route_work(tmp_path):
+def test_paused_campaign_lists_pre_route_work_for_keepalive_only(tmp_path):
     world = SaladWorld(tmp_path)
     world.to_awaiting_review()
     world.env.execute(
         "UPDATE campaigns SET status='paused_delegation_lapsed' WHERE id=?", world.campaign_id
     )
-    assert world.salad()["attempt_id"] not in _listed(world)
+    item = _listed(world)[world.salad()["attempt_id"]]
+    assert (
+        item["phase"] == "awaiting_review" and item["campaign_status"] == "paused_delegation_lapsed"
+    )
 
 
 def test_outcome_recorded_during_a_block_verifies_and_settles_by_the_charge_path(tmp_path):

@@ -57,7 +57,9 @@ Live campaigns failed on Salad placement, not on their workloads:
    attempt settles at the guardian's own accrued estimate, rounded up (zero when nothing was seen
    running), not the whole hold. The basis stays the provisional `guardian_bounded_hold`, so a
    recorded charge raises or confirms it. Only the guardian's recorded evidence selects this,
-   never a receipt reason.
+   never a receipt reason. The same estimate settlement also applies to the older allocation-deadline
+   timeout of [ADR 0193](0193-salad-allocation-deadline-machine-assignment.md) (recorded as
+   `allocation_timeout` with no route deadline); it is not limited to the two new records.
 5. **A provider-confirmed reallocation is infrastructure.** A route-flagged reallocation with the
    provider's stop and an exited worker confirmed, but without the guardian's custody word, is
    the transient `infra_salad_reallocated`. Its outputs are never accepted. It is retried within
@@ -77,4 +79,8 @@ Starved capacity or a slow pull costs one infrastructure retry and about zero ce
 campaign. Every retry is a new attempt with its own claim and hold under the campaign and project
 caps. No stop, cap or authority check is loosened: the new paths only stop earlier, or
 reclassify an attempt whose guardian evidence shows it never ran. A lease for a Salad route lasts
-up to 1500 s longer, within its grant and credential.
+up to 1500 s longer, within its grant and credential. The longer lease applies only to campaign
+Salad attempts, not to direct Salad routes. It has two side effects: automatic reconciliation of
+an attempt that never started (ADR 0046) waits for every lease to expire, and a stuck campaign's
+leased grant keeps its project slot and hold while any lease's hard expiry is ahead (ADR 0153), so
+each can wait up to 1500 s longer for a Salad attempt.

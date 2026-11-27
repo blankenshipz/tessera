@@ -96,3 +96,14 @@ Each retry holds its own exposure under the campaign cap. A recorded checkpoint 
 `tests/test_salad_interruption_retry.py` (classification, one retry spent, settlement at the
 estimate, unconfirmed stays held, exhaustion, checkpoint recording and binding, clean retry) and
 `tests/test_salad_cpu_priority_readback.py` (CPU readback priorities, GPU unchanged).
+
+## Amendment: a non-zero container exit is not an interruption
+
+A group whose recorded system events name `instance_exited` and whose earliest non-zero exit code
+is not 137 or 143 is no longer a `salad_interrupted` (or pre-custody reallocation) retry, whatever
+stop cause the
+guardian recorded. Control checks it before those classes and records `failed_permanent` with the
+failure class `salad_container_exited_nonzero`, so one non-zero exit on one machine fails the
+attempt without spending `retry.infra_retries`. A node-local fault that exits non-zero therefore
+gets no retry. An interruption with no such exit keeps this ADR unchanged. When the earliest
+non-zero exit is 137 or 143 (a kill or platform stop came first), the interruption path is kept.

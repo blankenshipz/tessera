@@ -1053,7 +1053,8 @@ amendments of 2026-11-26).**
 
 - *A block stops new spend, not the record of a run.* While a campaign is `blocked` or
   `paused_delegation_lapsed`, the executor keeps its `executing` attempts (to resume, finish and
-  keep alive) and its `route_started` ones (keepalive only) in the work list, which now carries
+  keep alive) and its `route_started` and pre-route (`leased` through `route_proposed`) ones
+  (keepalive only, so their leases do not lapse into a requeue) in the work list, which now carries
   `campaign_status`. It never launches a route of a campaign that is not running. Control accepts
   the outcome, no-receipt and custody evidence of those attempts and refuses `mark_executing` and
   packaging. The runner verifies a recorded outcome while blocked and settles it through the
@@ -1066,7 +1067,11 @@ amendments of 2026-11-26).**
   whose provider receipts already confirm termination waits for the import
   (`campaign.salad_import_awaited`) instead of going `unknown`. That wait is bounded: one more
   route window plus 600 s after the first wait, the attempt goes `unknown` for the silent reason
-  (so a person is asked) and stays late-importable as below.
+  (so a person is asked) and stays late-importable as below. An `executing` attempt whose lease
+  the executor keeps renewing is not called silent while it is inside the executor's own budget
+  (the route window plus the child's subprocess grace, the longest configurable termination
+  confirmation and the deferred finish); past that cap, or without renewals, the window plus
+  600 s applies as before.
 - *Late import of a silent-unknown attempt.* An attempt that is `unknown` with detail exactly
   `executor silent past the route window`, unsettled, and whose grant is still `active` or
   `cancel_requested` stays in the executor's work list. If its receipt is still in the

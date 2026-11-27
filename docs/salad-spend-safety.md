@@ -212,7 +212,9 @@ set. Once in recovery, with preconditions 1, 3 and 4 above, no reported rejectio
 earlier late-group void, it is released `NEVER_READY_SETTLE_SECONDS` (30 s) after its last
 heartbeat instead of at the route deadline plus the margin: `reason: "never_ready_absent"`,
 a `lost_create` record of kind `never_ready`, the event `never_ready_absent_reconciled`, and
-the same 24 h watch. Status shows `never_ready_eligible_at` until then. A repeated `reserve`
+the same 24 h watch. Like a create-rejected frame, and unlike an automatic resolution (where a
+create may have been sent), it frees its per-run hold from the total cap at resolution; a
+group seen later under its name still reopens and blocks it. Status shows `never_ready_eligible_at` until then. A repeated `reserve`
 of such a reservation (the live check's pre-create retry) refreshes its heartbeat, so the
 retry cannot push it into recovery; nothing else changes the silence bound.
 
@@ -361,6 +363,12 @@ margin path can resolve it again and a later report is refused. An unknown
 watch read only re-blocks: the rejection is kept, so a fresh definite absence
 resolves it again through the fast path. A failed report changes nothing: the
 reservation stays on the ordinary lost-create path.
+
+A project list of 100 or more groups is never complete (the published list has no
+pagination, at most 100 items), so none of these automatic releases can apply there. The
+service then records one closed `project_group_list_full` event per reservation
+(`count_bucket: "100_plus"`) so an operator sees why the frame still blocks: delete settled
+groups or reconcile it with an attestation.
 
 Pre-validation (`salad_resources.py`): the container-group create and get pages
 of the Salad API reference (docs.salad.com) give prose limits stricter than the

@@ -590,7 +590,8 @@ class SaladWorkerCommands:
         Every phase in which the executor holds the lease is listed (review and route approval
         included) so it can keep the lease renewed until the route has run. A blocked or paused
         campaign's ``executing`` attempts stay listed (resume, finish, keepalive) and its
-        ``route_started`` ones too, for keepalive only: ``campaign_status`` tells the executor
+        lease-held ones too (``leased`` through ``route_started``), for keepalive only, never
+        ``awaiting_lease``: ``campaign_status`` tells the executor
         never to launch them. A late-importable ``unknown`` attempt (``late_importable``) is
         listed so a receipt already on disk can still be recorded (v0.104.0).
         """
@@ -611,7 +612,8 @@ class SaladWorkerCommands:
                   (sa.phase IN ('awaiting_lease','leased','awaiting_review','reviewed',
                     'capability_ready','route_proposed','route_started','executing')
                    AND c.status IN ('running','stopping','cancel_requested'))
-                  OR (sa.phase IN ('route_started','executing')
+                  OR (sa.phase IN ('leased','awaiting_review','reviewed','capability_ready',
+                    'route_proposed','route_started','executing')
                    AND c.status IN ('blocked','paused_delegation_lapsed'))
                   OR (sa.phase = 'unknown' AND sa.waiting_reason = ?
                    AND a.status = 'unknown' AND a.settled_cents IS NULL
