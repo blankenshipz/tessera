@@ -560,6 +560,9 @@ class ProvidersFile(_Strict):
     # Absolute path of the guardian-read config (ADR 0041): control reads each Salad frame's
     # guardian record itself. Read by the Salad provider module.
     salad_guardian_read: str | None = None
+    # ADR 0208: the Salad executor's ``max_concurrent_paid_routes``. Unset means unbounded;
+    # when set, a non-bool integer from 1 to 4 (same rule as the Salad provider module).
+    salad_max_concurrent_routes: Annotated[int, Field(strict=True, ge=1, le=4)] | None = None
     # Third-party vendor plugins: ``{entry point or module name: that plugin's config}``.
     # Read by ``campaign_providers.load_plugin``; opaque here.
     plugins: dict[str, Any] = {}  # noqa: RUF012
