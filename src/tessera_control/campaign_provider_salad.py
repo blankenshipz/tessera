@@ -55,6 +55,7 @@ from .campaign_salad import (
     salad_config,
 )
 from .campaign_salad_adapter import CUSTODY_KINDS, bind_workload, is_late_bound
+from .campaign_salad_lease_cap import admission_refusal as lease_cap_admission_refusal
 from .campaign_store import SALAD_REFUSAL
 from .models import ExecutionSpec
 from .remote_execution_models import salad_route_window_refusal
@@ -547,6 +548,13 @@ class SaladRouteProvider:
             config.workload.workload_seconds,
             profile.route_max_seconds,
             f"profile {profile.name!r} route_max_seconds",
+        )
+        if refusal is not None:
+            raise Conflict(f"Salad stage refused: {refusal}.")
+        # Every lease is capped by the grant lifetime: one shorter than what a lease must cover
+        # could only stop the stage after any wait (ADR 0207 amendment).
+        refusal = lease_cap_admission_refusal(
+            config.grant_ttl_seconds, stage.max_duration_seconds, profile.route_max_seconds
         )
         if refusal is not None:
             raise Conflict(f"Salad stage refused: {refusal}.")

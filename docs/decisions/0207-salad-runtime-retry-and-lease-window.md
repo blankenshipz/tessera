@@ -116,3 +116,47 @@ of the guardian record must confirm the close, the estimate must be finite and w
 never qualifies. A safety-plane stop keeps settling the whole hold. The settlement stays
 provisional (`guardian_bounded_hold`); a human charge already recorded wins and is never doubled,
 and a later charge adds only its excess.
+
+## Amendment: a lease no fresh lease could beat is not requeued in a loop
+
+The short-window requeue (decision 4) helps only when a fresh lease would be long enough. Two
+shapes made every fresh lease as short as the one it replaced, so the attempt was requeued until
+the identical-repeat bound and then spent a scientific retry:
+
+- the route window was longer than any lease is issued for (the window may reach the plan bound,
+  declared duration plus 3600 s, while a lease covers declared duration plus the 1500 s
+  provisioning allowance);
+- an expiry bound capped every fresh grant and lease below the run: the worker's or approver's
+  credential, the campaign approval, or the stage's grant lifetime.
+
+1. **What a lease must still cover** is the route window, but never more than a lease is issued
+   for: `min(route window, declared duration + provisioning allowance)`. Control and the executor
+   use the same measure (`campaign_salad_lease_cap.needed_seconds`), so the executor never defers
+   a launch control would not requeue.
+2. **Before requeueing**, control reads the latest hard expiry a fresh grant and lease could have:
+   the earliest of the campaign approval's expiry, the approver's and the worker's unrevoked
+   credentials, and now plus the stage's grant lifetime. If that leaves less than the run needs,
+   the attempt is unwound the same way (nothing sent, released at 0 on the store's own no-claim
+   proof) and closed `failed_transient` / `lease_capped_by_expiry`. That class is neither a
+   scientific retry nor a not-started requeue. The campaign event
+   `campaign.salad_lease_capped_by_expiry` records the binding bound, the seconds needed and the
+   seconds available, and the attempt's failure detail says the same.
+3. **For a renewable bound the stage waits** instead of placing another attempt while a fresh
+   lease still could not cover the run (one `campaign.salad_lease_cap_waiting` event). It
+   continues once that bound is lifted: an operator renews the worker credential through its own
+   renewal path, the approver's credential is renewed, or the campaign is re-approved (for the
+   approval bound); an expired approval pauses the campaign as before. An approved review carries
+   over to the next attempt like any pre-route lapse.
+4. **The stage's grant lifetime is not renewable**: `grant_ttl_seconds` is part of the approved
+   spec, so no renewal or re-approval lifts it and waiting could never end. Salad admission
+   refuses a stage whose grant lifetime is shorter than what a lease must cover
+   (`min(route window, declared duration + provisioning allowance)`, the route window at most the
+   profile's `route_max_seconds`) with `lease_bound_by_grant_ttl`. A stage admitted before that
+   rule whose lease is capped by its grant lifetime is unwound the same way (released at 0) and
+   closed `failed_permanent` / `lease_bound_by_grant_ttl`: the stage fails with that
+   configuration reason, telling the owner to raise `grant_ttl_seconds` or lower
+   `max_duration_seconds`. It is not a scientific retry. The grant lifetime is checked first, so a
+   renewable bound that happens to be earlier never makes such a stage wait.
+
+Nothing here renews a credential, extends a grant or an approval, or loosens a stop, cap or
+deadline: the change only declines a requeue that could not help.

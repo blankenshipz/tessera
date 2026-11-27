@@ -24,6 +24,11 @@ and the guardian would cut the workload at the shortened deadline (a permanent
 ``PRE_ROUTE_WAIT_TOLERANCE_SECONDS`` to waiting and whose remaining hard life is shorter than the
 route window is requeued for a fresh grant and lease, at 0 on the store's own no-claim proof,
 under the same repeat bound. The route still never runs past its lease, grant or credential.
+The run a lease must still cover is the route window, but never more than any lease is issued
+for (declared duration plus provisioning allowance), and when no fresh lease could cover it either
+(a credential, grant or approval expiry binds) the attempt is closed ``lease_capped_by_expiry``
+instead of being requeued in a loop, or ``lease_bound_by_grant_ttl`` (the stage fails) when the
+stage's own grant lifetime is what caps it (``campaign_salad_lease_cap``).
 
 Everything here is read from the store, never parsed from a refusal message, and it applies
 only before the route ran: a completed ``start_route`` takes this path only while the route has no
@@ -39,6 +44,7 @@ import math
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from . import campaign_salad_lease_cap as lease_cap
 from .campaign_autoreconcile import MAX_AUTO_REQUEUES, NOT_STARTED, repeat_count
 from .salad_precreate import launch_effects
 from .store import _parse_utc
@@ -131,7 +137,13 @@ def window_shortfall(
 
 def window_problem(driver: SaladStageDriver, row: dict[str, Any], now: datetime) -> str | None:
     """``LEASE_WINDOW_SHORT_BEFORE_ROUTE`` when the attempt's lease can no longer cover its route
-    window (``window_shortfall``) and nothing was sent for the route, else None.
+    window (``window_shortfall``) and nothing was sent for the route, else None."""
+    return None if short_need(driver, row, now) is None else LEASE_WINDOW_SHORT_BEFORE_ROUTE
+
+
+def short_need(driver: SaladStageDriver, row: dict[str, Any], now: datetime) -> int | None:
+    """The seconds the lease must still cover (``lease_cap.needed_seconds``) when it falls short
+    of them after waiting and nothing was sent for the route, else None.
 
     Only a route with no create or start effect, no provider reference and no live receipt, in
     ``route_proposed`` or ``route_started`` (never ``executing``) qualifies. Anything unreadable
@@ -152,7 +164,10 @@ def window_problem(driver: SaladStageDriver, row: dict[str, Any], now: datetime)
     except (KeyError, TypeError, ValueError):
         return None
     lease = driver.runner._one(
-        "SELECT issued_at, hard_expires_at FROM execution_leases WHERE id=?", (row["lease_id"],)
+        """SELECT l.issued_at, l.hard_expires_at, t.max_duration_seconds
+        FROM execution_leases l LEFT JOIN execution_grants g ON g.id = l.grant_id
+        LEFT JOIN tasks t ON t.id = g.task_id WHERE l.id=?""",
+        (row["lease_id"],),
     )
     if lease is None:
         return None
@@ -161,9 +176,44 @@ def window_problem(driver: SaladStageDriver, row: dict[str, Any], now: datetime)
         hard = _parse_utc(lease["hard_expires_at"])
     except (TypeError, ValueError):
         return None
-    if window_shortfall(issued, hard, now, window) is None:
+    need = lease_cap.needed_seconds(window, lease["max_duration_seconds"])
+    if window_shortfall(issued, hard, now, need) is None:
         return None
-    return LEASE_WINDOW_SHORT_BEFORE_ROUTE
+    return need
+
+
+def capped_problem(
+    driver: SaladStageDriver, ctx: _Ctx, attempt: dict[str, Any], need: int, now: datetime
+) -> str | None:
+    """``LEASE_CAPPED_BY_EXPIRY`` (its record emitted once) when no fresh grant and lease could
+    cover ``need`` seconds either, so a requeue would only loop, or ``LEASE_BOUND_BY_GRANT_TTL``
+    when the stage's own grant lifetime is what caps it (waiting could never end); else None
+    (requeue)."""
+    from .campaign_salad import salad_config
+    from .campaign_steps import StepFailed
+
+    try:
+        worker = driver._grant(attempt)["worker_principal_id"]
+        ttl = salad_config(driver._spec(ctx, attempt["stage_key"])).grant_ttl_seconds
+        record = lease_cap.shortfall(driver.runner, ctx.approval, worker, ttl, need, now)
+    except (KeyError, TypeError, ValueError, StepFailed):
+        return None  # unreadable: the ordinary bounded requeue still applies
+    if record is None:
+        return None
+    driver._emit_once(
+        ctx,
+        lease_cap.CAPPED_EVENT,
+        {"attempt_id": attempt["id"]},
+        {
+            "stage_key": attempt["stage_key"],
+            "attempt": attempt["attempt"],
+            "worker_principal_id": worker,
+            **record,
+        },
+    )
+    if lease_cap.is_static(record):
+        return lease_cap.LEASE_BOUND_BY_GRANT_TTL
+    return lease_cap.LEASE_CAPPED_BY_EXPIRY
 
 
 def worker_problem(driver: SaladStageDriver, grant: dict[str, Any], now: datetime) -> str | None:
@@ -243,6 +293,25 @@ def requeue(
     )
     if not driver.unwind(ctx, key, attempt):
         return True
+    if reason in (lease_cap.LEASE_CAPPED_BY_EXPIRY, lease_cap.LEASE_BOUND_BY_GRANT_TTL):
+        # No fresh lease could cover the run: not requeued (that would loop), not a scientific
+        # retry. A renewable bound makes the stage wait for it; the stage's own grant lifetime
+        # fails the stage, since no renewal lifts it (``campaign_salad_lease_cap``).
+        record = lease_cap.recorded(driver.runner, ctx, attempt["id"]) or {
+            "binding": "unreadable",
+            "available_seconds": None,
+            "need_seconds": None,
+        }
+        static = reason == lease_cap.LEASE_BOUND_BY_GRANT_TTL
+        driver.runner._set_attempt(
+            attempt["id"],
+            status="failed_permanent" if static else "failed_transient",
+            failure_class=reason,
+            failure_detail=lease_cap.detail(
+                {**record, "binding": lease_cap.STATIC_BINDING} if static else record
+            )[:500],
+        )
+        return True
     why = _DETAILS.get(
         reason,
         "worker authority lapsed before the route started; nothing was sent to the provider",
@@ -283,7 +352,10 @@ def before_handler(
         lapsed = lease_problem(driver, row, now)
         if lapsed is not None:
             return lapsed
-    return window_problem(driver, row, now)
+    need = short_need(driver, row, now)
+    if need is None:
+        return None
+    return capped_problem(driver, ctx, attempt, need, now) or LEASE_WINDOW_SHORT_BEFORE_ROUTE
 
 
 # The refusal classes control itself raises when a step's worker authority is not current

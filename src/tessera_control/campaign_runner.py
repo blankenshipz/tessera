@@ -36,6 +36,7 @@ from . import campaign_holdout as holdout
 from . import campaign_image_pull as image_pull
 from . import campaign_placement as placement
 from . import campaign_salad_fallback as salad_fallback
+from . import campaign_salad_lease_cap as lease_cap
 from . import execution_frames as frames
 from . import late_bound_inputs as late_bound
 from .artifact_manifests import grant_manifest_is_partial
@@ -1883,6 +1884,7 @@ class CampaignRunner:
                 - infra_attempts(attempts)
                 - realloc_used
                 - moved
+                - lease_cap.capped_attempts(attempts)
             )
             if (
                 latest["failure_class"] == REALLOCATED_PRECUSTODY
@@ -1905,6 +1907,8 @@ class CampaignRunner:
                 or stage["attempts_used"] >= MAX_ATTEMPT_NUMBERS
             ):
                 return self._stage_failed(ctx, key, f"{latest['failure_class']}_exhausted")
+            if self._lease_cap_waiting(ctx, key, spec_stage, latest):
+                return False
             return self._place_and_reserve(ctx, key)
         try:
             return self._advance_attempt(ctx, stage, spec_stage, latest)
@@ -3689,6 +3693,33 @@ class CampaignRunner:
             f"({claim['status']})",
         )
         return False
+
+    def _lease_cap_waiting(
+        self, ctx: _Ctx, key: str, spec_stage: NormalStage, latest: dict[str, Any]
+    ) -> bool:
+        """True while the stage's latest attempt closed ``lease_capped_by_expiry`` and no fresh
+        lease could cover its run yet: no new attempt is placed (that would only loop) until an
+        operator renews the expiring bound or the campaign is re-approved. One event per wait."""
+        if latest["failure_class"] != lease_cap.LEASE_CAPPED_BY_EXPIRY:
+            return False
+        from .campaign_salad import salad_config
+
+        try:
+            ttl = salad_config(spec_stage).grant_ttl_seconds
+        except StepFailed:
+            ttl = None  # the decision's own reads still bound the wait
+        # Control's wall clock, as the expiry bounds and the decision that closed the attempt.
+        record = lease_cap.still_capped(self, ctx, latest, ttl, datetime.now(UTC))
+        if record is None:
+            return False
+        self.emit_once(
+            ctx,
+            lease_cap.WAITING_EVENT,
+            {"stage_key": key, "attempt": latest["attempt"]},
+            {"attempt_id": latest["id"], **record},
+        )
+        self._actions.append(f"waiting:{key}:{lease_cap.LEASE_CAPPED_BY_EXPIRY}")
+        return True
 
     def _deadline_too_short(
         self, ctx: _Ctx, stage: dict[str, Any], spec_stage: NormalStage, attempt: dict[str, Any]

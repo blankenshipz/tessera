@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from .campaign_salad_lease_cap import LEASE_CAPPED_BY_EXPIRY
 from .campaign_salad_lease_lapse import (
     LEASE_LAPSED_BEFORE_ROUTE,
     LEASE_WINDOW_SHORT_BEFORE_ROUTE,
@@ -47,7 +48,12 @@ from .store import Forbidden, _parse_utc
 CARRYOVER_EVENT = "campaign.review_approval_carried_over"
 DECLINED_EVENT = "campaign.review_carryover_declined"
 LAPSE_REASONS = frozenset(
-    {LEASE_LAPSED_BEFORE_ROUTE, WORKER_UNAVAILABLE_BEFORE_ROUTE, LEASE_WINDOW_SHORT_BEFORE_ROUTE}
+    {
+        LEASE_LAPSED_BEFORE_ROUTE,
+        WORKER_UNAVAILABLE_BEFORE_ROUTE,
+        LEASE_WINDOW_SHORT_BEFORE_ROUTE,
+        LEASE_CAPPED_BY_EXPIRY,
+    }
 )
 _COLUMNS = {"plan": "plan_decision_id", "source_use": "source_decision_id"}
 

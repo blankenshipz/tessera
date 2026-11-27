@@ -16,7 +16,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from salad_campaign_fixture import SaladWorld, salad_provider_reset  # noqa: F401
-from test_campaign_salad_executor import PROFILE, FakeControl, Harness, item
+from test_campaign_salad_executor import PLAN, PROFILE, FakeControl, Harness, item
 from test_salad_executor_concurrent_routes import (
     ConcurrentControl,
     GatedRunner,
@@ -30,6 +30,7 @@ from tessera_control.campaign_autoreconcile import MAX_AUTO_REQUEUES, NOT_STARTE
 from tessera_control.campaign_infra_retry import infra_attempts
 from tessera_control.campaign_salad import FRAME_FENCE_BEFORE_CREATE, FRAME_FENCE_REFUSAL
 from tessera_control.campaign_salad_executor import EXECUTOR_WINDOW_MARGIN_SECONDS
+from tessera_control.campaign_salad_lease_cap import needed_seconds
 from tessera_control.campaign_salad_lease_lapse import (
     LEASE_WINDOW_SHORT_BEFORE_ROUTE,
     PRE_ROUTE_WAIT_TOLERANCE_SECONDS,
@@ -88,10 +89,21 @@ def _window(world: SaladWorld) -> int:
     return int(state["proposal"]["selection"]["resources"]["max_seconds"])
 
 
+def _long_lived_credentials(world: SaladWorld) -> None:
+    """A worker credential that outlives the route window, so a fresh lease could cover it and the
+    short-window requeue applies (this world's credentials otherwise last about an hour, which
+    caps every fresh lease below the 3600 s window: ``lease_capped_by_expiry``)."""
+    later = (datetime.now(UTC) + timedelta(hours=6)).isoformat()
+    world.env.execute(
+        "UPDATE credentials SET expires_at=? WHERE principal_id=?", later, world.worker["id"]
+    )
+
+
 def _age_lease(world: SaladWorld, *, remaining_vs_window: int, waited: int = 3600) -> None:
     """Rewrite the attempt's lease: issued ``waited`` s ago, hard expiry ``window + delta`` s
     from now (the soft expiry equal to it, so the lease is current and only its window is
     short)."""
+    _long_lived_credentials(world)
     now = datetime.now(UTC)
     hard = (now + timedelta(seconds=_window(world) + remaining_vs_window)).isoformat()
     world.env.execute(
@@ -236,6 +248,11 @@ class BoundedControl(FakeControl):
         return self.capacity
 
 
+# What the executor's lease must still cover: the route window, never more than a lease is
+# issued for (the plan's duration plus the provisioning allowance).
+NEED = needed_seconds(PROFILE.route_max_seconds, PLAN["max_duration_seconds"])
+
+
 def _bounds(*, remaining, waited=3600):
     return NOW - timedelta(seconds=waited), NOW + timedelta(seconds=remaining)
 
@@ -251,7 +268,7 @@ def _details(log):
 
 
 def test_a_short_lease_defers_the_launch_with_nothing_marked(tmp_path):
-    control = BoundedControl(bounds=_bounds(remaining=PROFILE.route_max_seconds - 10))
+    control = BoundedControl(bounds=_bounds(remaining=NEED - 10))
     h = _harness(tmp_path, control)
     control.items = [item("route_started")]
     log = h.executor.run_once()
@@ -263,9 +280,7 @@ def test_a_short_lease_defers_the_launch_with_nothing_marked(tmp_path):
 def test_the_executor_margin_defers_before_control_would_requeue(tmp_path):
     # Remaining life covers the window by less than the margin: control would not requeue yet,
     # the executor already defers.
-    control = BoundedControl(
-        bounds=_bounds(remaining=PROFILE.route_max_seconds + EXECUTOR_WINDOW_MARGIN_SECONDS - 5)
-    )
+    control = BoundedControl(bounds=_bounds(remaining=NEED + EXECUTOR_WINDOW_MARGIN_SECONDS - 5))
     h = _harness(tmp_path, control)
     control.items = [item("route_started")]
     log = h.executor.run_once()
@@ -273,9 +288,7 @@ def test_the_executor_margin_defers_before_control_would_requeue(tmp_path):
 
 
 def test_a_lease_that_covers_the_window_launches(tmp_path):
-    control = BoundedControl(
-        bounds=_bounds(remaining=PROFILE.route_max_seconds + EXECUTOR_WINDOW_MARGIN_SECONDS + 5)
-    )
+    control = BoundedControl(bounds=_bounds(remaining=NEED + EXECUTOR_WINDOW_MARGIN_SECONDS + 5))
     h = _harness(tmp_path, control)
     control.items = [item("route_started")]
     h.executor.run_once()

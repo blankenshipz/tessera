@@ -52,6 +52,7 @@ from pydantic import (
 
 from . import maintenance_lock
 from .campaign_infra_retry import SAFETY_STOP_CAUSES
+from .campaign_salad_lease_cap import needed_seconds
 from .campaign_salad_lease_lapse import window_shortfall
 from .remote_execution_models import SALAD_PROVISIONING_ALLOWANCE_SECONDS
 from .salad_campaign_profiles import (
@@ -1352,7 +1353,10 @@ class SaladCampaignExecutor:
             return None
         if admit is not None and not admit(attempt):
             return None
-        if not self._lease_covers_window(item, derived.resources.max_seconds):
+        # The run the lease must still cover: the route window, never more than a lease is
+        # issued for (the same measure control requeues on; ``campaign_salad_lease_cap``).
+        need = needed_seconds(derived.resources.max_seconds, plan.get("max_duration_seconds"))
+        if not self._lease_covers_window(item, need):
             return None
         if not self._guardian_has_room(item, attempt):
             return None
