@@ -43,6 +43,8 @@ _FAILURES = {
     "infra_container_killed": "the infrastructure killed the container",
     "infra_resource_limit": "the container hit a resource limit",
     "infra_allocation_timeout": "no cloud instance was allocated in time",
+    "infra_salad_create_not_sent": "the cloud create was refused before it was sent, so it "
+    "was retried",
     "start_failure_suspected": "the container failed to start on several cloud machines",
     "salad_interrupted": "the cloud provider interrupted the run after it had started",
     "not_started": "it was never started",

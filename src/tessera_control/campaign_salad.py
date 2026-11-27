@@ -24,7 +24,12 @@ from pydantic import ValidationError
 from . import campaign_preapproval, operator_config_freshness, provider_trust
 from . import execution_frames as frames
 from .artifact_manifests import grant_manifest_is_partial
-from .campaign_infra_retry import REALLOCATED_PRECUSTODY, SALAD_INTERRUPTED
+from .campaign_infra_retry import (
+    INFRA_SALAD_CREATE_NOT_SENT,
+    REALLOCATED_PRECUSTODY,
+    SALAD_INTERRUPTED,
+    infra_attempts,
+)
 from .campaign_models import (
     SALAD_TARGET,
     TERMINAL_CAMPAIGN,
@@ -1930,15 +1935,28 @@ class SaladStageDriver:
         attempt: dict[str, Any],
         reason: str,
     ) -> bool:
-        """A pre-route failure: cancel authority, prove no claim, retry within the budget."""
+        """A pre-route failure: cancel authority, prove no claim, retry within the budget.
+
+        A create proven never sent (``CREATE_NOT_SENT``) with an infrastructure retry left
+        spends that retry (``infra_salad_create_not_sent``), not a scientific one; every other
+        reason, or none left, keeps ``t1_salad_unclaimed`` (ADR 0205 amendment)."""
         key = stage["stage_key"]
         done = self.unwind(ctx, key, attempt)
         if done:
+            failure_class, detail = "t1_salad_unclaimed", reason
+            if reason == CREATE_NOT_SENT:
+                limit = spec_stage.retry.infra_retries
+                used = infra_attempts(
+                    [a for a in self.runner._attempts(ctx, key) if a["id"] != attempt["id"]]
+                )
+                if used < limit:
+                    failure_class = INFRA_SALAD_CREATE_NOT_SENT
+                    detail = f"{reason}; infrastructure failure, retry {used + 1} of {limit}"
             self.runner._set_attempt(
                 attempt["id"],
                 status="failed_transient",
-                failure_class="t1_salad_unclaimed",
-                failure_detail=reason,
+                failure_class=failure_class,
+                failure_detail=detail,
             )
         return done
 

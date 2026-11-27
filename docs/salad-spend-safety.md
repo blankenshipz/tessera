@@ -43,7 +43,7 @@ So the stop path is entirely Tessera's guardian plus the operator.
 | Single-operation orphan fence | no new reservation while another is not stopped/reconciled | Existing; an uncertain orphan closes automatically on an exact provider read of the group stopped (`provider_confirmed_exact_group_stopped`), or by operator `reconcile` |
 | Lost-create resolution | a never-bound reservation (create failed, no `provider_id`) becomes `reconciled` (`lost_create_absent`) only after route deadline + 900 s, a definite ProblemDetails 404 on the exact reserved name and a complete project group list without it; operator `reconcile` needs the same margin and 404 plus a list read that reached the project; a 24 h watch voids it on any non-absent read | Done; see "Lost create" |
 | Create-rejected release | a create answered with a fully read HTTP 400/422 ProblemDetails body is classified `provider_rejected_request` (a create that provably never left the process, `request_not_sent` with status 0, takes the same release) (not `provider_unavailable`) with a bounded summary (status, `title`/`detail` <= 200 chars, `errors` field names) in the dispatch receipt and live-check receipt; the trusted server reports it (admin `create_rejected`), which fences at once, and the guardian releases the never-bound reservation as `reconciled` (`create_rejected_absent`) 30 s after max(report, last `ready`), only on its own exact-name 404 and complete project list | Done; see "Create rejected" |
-| Pre-create failure release | a run that ends before any create was sent retries its transient pre-create steps (at most 4 dispatches, only while the route shows no create effect), then ends `create_not_attempted`; control unwinds it at zero (`unclaimed_zero`, no person) on its own claim and route records, a create refused before its use-time claim counts as never sent, and the guardian releases a reservation that never answered `ready` 30 s after its last heartbeat on its own absence reads (`never_ready_absent`) | Done; see "Lost create" and [ADR 0205](decisions/0205-salad-precreate-auto-release.md) |
+| Pre-create failure release | a run that ends before any create was sent retries its transient pre-create steps (at most 4 dispatches, only while the route shows no create effect), then ends `create_not_attempted`; control unwinds it at zero (`unclaimed_zero`, no person) on its own claim and route records, a create refused at the trusted server's use-time recheck counts as never sent when the server recorded `salad_proxy.claim_refused` for it, or, for a build before that record, when its receipt is the bare pre-call refusal with no group identity, allocation or provider exchange field (ADR 0205 amendment; an infrastructure retry when one is left), and the guardian releases a reservation that never answered `ready` 30 s after its last heartbeat on its own absence reads (`never_ready_absent`) | Done; see "Lost create" and [ADR 0205](decisions/0205-salad-precreate-auto-release.md) |
 | Create shape pre-validation | Salad's documented create limits (whole vCPUs 1..16, memory 1024..61440 MB, storage a whole GiB within 1..250 GiB, GPU class UUIDs) checked at setup, route proposal/approval, the create action and in the transport before the POST (never at start of an existing group); refused before any reservation exists; stored proposals keep parsing | Done; see "Create rejected" |
 | Estimate-only labelling | every status/receipt carries `actual_billed_cost_cents: null`, `financial_hard_cap: false`, `price_basis: published_gpu_hourly_rate_not_actual_cost` | Existing; verified |
 
@@ -215,6 +215,33 @@ a `lost_create` record of kind `never_ready`, the event `never_ready_absent_reco
 the same 24 h watch. Status shows `never_ready_eligible_at` until then. A repeated `reserve`
 of such a reservation (the live check's pre-create retry) refreshes its heartbeat, so the
 retry cannot push it into recovery; nothing else changes the silence bound.
+
+Create refused at admission ([ADR 0205 amendment](decisions/0205-salad-precreate-auto-release.md#amendment-2026-11-26-a-create-refused-at-the-use-time-recheck-after-its-claim-q-2704)):
+a create effect whose only receipt is the trusted server's `admission_denied` refusal
+(provider provenance, state `unknown`, no provider id or allocation) always follows a
+committed `salad_proxy.claim`. It counts as never sent when the server also recorded
+`salad_proxy.claim_refused` for that nonce, which it writes when its own use-time recheck
+refuses the claim before the one provider call, or, for a build before that record, when the
+bare receipt and route show no group identity, allocation or other sign of a provider call. The runner then releases the hold at 0¢ on
+its own. An attempt that is still `unknown` and `blocked` (past the automatic limit, or left
+by an earlier build) is recovered only by the owner:
+
+```sh
+tessera campaign reconcile-unclaimed-attempts --campaign-id CAMPAIGN_ID --dry-run --owner-header FILE
+tessera campaign reconcile-unclaimed-attempts --campaign-id CAMPAIGN_ID --reason TEXT --owner-header FILE
+```
+
+Over HTTP the same recovery is `POST /campaigns/{id}/reconcile-unclaimed-attempts`. Proceed only
+when the dry run reports `reconcilable`. `reconcile-unclaimed-salad` on its own is not this
+recovery, because the blocked campaign pass then settles the attempt `failed_permanent`. An
+attempt from a build before this change (v0.102.0) has no refusal record; it still reads
+never sent, and the dry run reports it `reconcilable`, when its create is the route's only
+create or start effect, nothing on the operation, route or receipts names a provider id or
+allocation, and the effect's receipts are the bare `admission_denied` refusal with no request
+id, response status, cost, rejection, transport diagnostic or evidence. Anything else reads
+`create_claimed` and the request refuses it and writes nothing. Do not hand-write the record,
+and do not record a termination or a token charge, to get past that refusal.
+See [Campaigns](campaigns.md).
 
 Residual risk: nothing watches the reserved name more than 24 hours after
 resolution. A group that first appears later (only possible if a create request

@@ -26,6 +26,10 @@ INFRA_RESOURCE_LIMIT = "infra_resource_limit"
 # No instance was allocated before the provider's allocation deadline: a placement failure, bounded
 # by ``retry.infra_retries`` and rerouted like any infrastructure failure, never a task failure.
 INFRA_ALLOCATION_TIMEOUT = "infra_allocation_timeout"
+# ADR 0205 amendment: a Salad create the trusted server refused at its use-time admission, before
+# any provider call, unwound at zero as unclaimed. With an infrastructure retry left it takes one
+# (never a scientific retry); with none it keeps ``t1_salad_unclaimed`` as before.
+INFRA_SALAD_CREATE_NOT_SENT = "infra_salad_create_not_sent"
 RESOURCE_LIMIT_CLASSES = frozenset({INFRA_CONTAINER_KILLED, INFRA_RESOURCE_LIMIT})
 
 

@@ -2127,6 +2127,7 @@ FAILURE_CLASSES = (
     "budget_refused",
     "exposure_unknown",
     "t1_salad_unclaimed",
+    "infra_salad_create_not_sent",
     "infra_container_killed",
     "infra_resource_limit",
     "infra_allocation_timeout",

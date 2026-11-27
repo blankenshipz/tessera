@@ -14,6 +14,7 @@ import socket
 import stat
 import struct
 import time
+import uuid
 
 from .execution_targets import require_admission_hook
 from .provider_inputs import ProviderInputStore
@@ -69,6 +70,10 @@ RESERVED_REFUSAL_CODES = frozenset({"unavailable"})
 # A create the provider cleanly rejected, or one that provably never left this process:
 # both are reported to the guardian, which releases only on its own absence reads.
 CREATE_RELEASE_REASONS = frozenset({"provider_rejected_request", "request_not_sent"})
+# A committed create/start claim this server's own use-time recheck refused before any provider
+# call is recorded as ``salad_proxy.claim_refused`` (ADR 0205 amendment); only these actions.
+CLAIM_REFUSAL_ACTIONS = frozenset({"create", "start"})
+CLAIM_REFUSAL_STAGE = "use_time_recheck"
 
 
 class ProviderReadUnavailable(Conflict):
@@ -534,6 +539,77 @@ class TrustedSaladExecutionStore(RemoteExecutionStore):
             )
         return allowed
 
+    def record_claim_refused(self, worker, ident, effect_id):
+        """Record that this server's own use-time recheck refused a committed create/start claim.
+
+        Server-only (no public route): the trusted server calls it from ``request`` when a
+        ``claim_proxy(recheck=True)`` raised, which every path to the provider call passes
+        first, so no provider call was made for this one-use nonce in that request, and no other
+        request can make one (``claim_proxy`` refuses a consumed nonce and any effect with a
+        receipt). Accepted only for the route's newest create/start effect, while it has no
+        receipt, with its committed claim, from the operation's own worker on a store composed
+        with the trusted server. Idempotent per nonce (ADR 0205 amendment)."""
+
+        def command(db, live):
+            state = self._load(db, live, ident)
+            op, _ = self._operation(db, live, state["proposal"])
+            effect = state["effects"][-1] if state["effects"] else None
+            if (
+                not self._bound(state)
+                or op["worker_principal_id"] != live["id"]
+                or effect is None
+                or effect["id"] != effect_id
+                or effect["action"] not in CLAIM_REFUSAL_ACTIONS
+                or any(r["effect_id"] == effect_id for r in state["receipts"])
+            ):
+                raise Forbidden("Salad claim refusal binding mismatch.")
+            claim = db.execute(
+                "SELECT payload_json FROM events WHERE org_id=? AND event_type='salad_proxy.claim' "
+                "AND json_extract(payload_json,'$.nonce')=? "
+                "AND json_extract(payload_json,'$.route_id')=?",
+                (live["org_id"], effect_id, ident),
+            ).fetchone()
+            if claim is None:
+                raise Conflict("Salad proxy has no committed claim to refuse.")
+            seen = db.execute(
+                "SELECT payload_json FROM events WHERE org_id=? "
+                "AND event_type='salad_proxy.claim_refused' "
+                "AND json_extract(payload_json,'$.nonce')=?",
+                (live["org_id"], effect_id),
+            ).fetchone()
+            if seen is not None:
+                return 200, json.loads(seen[0])
+            claimed = json.loads(claim[0])
+            payload = dict(
+                nonce=effect_id,
+                route_id=ident,
+                operation_id=claimed["operation_id"],
+                action=claimed["action"],
+                stage=CLAIM_REFUSAL_STAGE,
+                reason="admission_denied",
+                provider_call_made=False,
+            )
+            self._event(
+                db,
+                live,
+                state["project_id"],
+                state["task_id"],
+                "salad_proxy.claim_refused",
+                1,
+                payload,
+            )
+            return 201, payload
+
+        return self._mutate(
+            worker,
+            uuid.uuid4().hex,
+            "POST",
+            f"/internal/salad/{ident}/claim-refused",
+            canonical_digest([ident, effect_id]),
+            command,
+            audience="worker",
+        )[1]
+
     def get(self, actor, ident):
         state = super().get(actor, ident)
         if self._bound(state):
@@ -773,12 +849,16 @@ class TrustedSaladServer:
             _reraise_read_timeout(error, request)
             return ProxyResult(status="blocked", reason="admission_denied")
         failure_reason = "credential_unavailable"
+        # True only while a use-time recheck of the committed claim runs; both rechecks precede
+        # the one provider call, so a failure while it is set made no provider call.
+        rechecking = False
         try:
             self._credential()
             with self.resolver.resolve(
                 self.policy.management.reference, self.policy.management.version
             ) as secret:
                 failure_reason = "admission_denied"
+                rechecking = True
                 state = self.store.claim_proxy(
                     self.worker,
                     request.route_id,
@@ -787,6 +867,7 @@ class TrustedSaladServer:
                     preflight,
                     recheck=True,
                 )
+                rechecking = False
                 failure_reason = "credential_unavailable"
                 self._credential()
                 failure_reason = "provider_unavailable"
@@ -802,6 +883,7 @@ class TrustedSaladServer:
                 # IPC can stall just like secret resolution. It cannot extend
                 # target freshness, credential expiry or current execution authority.
                 failure_reason = "admission_denied"
+                rechecking = True
                 state = self.store.claim_proxy(
                     self.worker,
                     request.route_id,
@@ -810,6 +892,7 @@ class TrustedSaladServer:
                     preflight,
                     recheck=True,
                 )
+                rechecking = False
                 failure_reason = "credential_unavailable"
                 self._credential()
                 failure_reason = "provider_unavailable"
@@ -856,7 +939,22 @@ class TrustedSaladServer:
                 return result
         except Exception as error:
             _reraise_read_timeout(error, request)
+            if rechecking and request.operation in {"create_stopped", "start"}:
+                self._record_claim_refused(request)
             return ProxyResult(status="unknown", reason=failure_reason)
+
+    def _record_claim_refused(self, request):
+        """Best effort: a failed write leaves the claim standing (fail closed, ADR 0205)."""
+        try:
+            self.store.record_claim_refused(self.worker, request.route_id, request.effect_id)
+        except Exception as error:  # noqa: BLE001 - never turns a refusal into anything else
+            self.input_log.append(
+                dict(
+                    route_id=request.route_id,
+                    event="claim_refusal_unrecorded",
+                    error=type(error).__name__,
+                )
+            )
 
     # ---- input delivery (ADR 0036 phase 2) -------------------------------------------------
     def _push_input_ticket(self, route_id, state, ticket):

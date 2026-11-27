@@ -90,3 +90,101 @@ Nothing was sent, no group existed and nothing was spent, yet a person was neede
 - Not covered: the serial executor still does not ask the guardian whether the frame limit is reached before
   `mark_executing`; with the never-ready release and the reserve retry a following launch normally waits less
   than a minute instead of failing.
+
+## Amendment (2026-11-26): a create refused at the use-time recheck, after its claim (q-2704)
+
+### Context
+
+A live seed launch ended before any group existed, but neither the attempt nor its 5¢ hold released
+itself. The route's only create effect had one receipt from the trusted server: `provenance: provider`,
+`proxy_reason: admission_denied`, state `unknown`, no provider id, allocation, request id, response status or
+cost. The live receipt read `inconclusive` / `custody_stop_or_reconnect_unresolved` with no stop confirmed.
+
+1. Point 4 described this receipt as a refusal *before* the use-time claim, so it required that no
+   `salad_proxy.claim` exist for the operation. That can never hold for this receipt: control accepts a
+   provider-provenance receipt only for an effect with a committed claim (`_provider_receipt_allowed`), so the
+   receipt always follows a claim. It came from the server's use-time recheck (`claim_proxy(recheck=True)`),
+   which runs after the claim is committed and before the one provider call. Point 5's automatic release
+   therefore never matched, and the attempt became `unknown` (`observed_unknown`) and the campaign `blocked`.
+2. The executor held the outcome for about six minutes (`group_stop_held` / `group_identity_unrecorded`),
+   waiting for the guardian to confirm a stop of a group that was never created.
+3. No sanctioned recovery fitted. The grant route `reconcile-unclaimed-salad` refuses a claimed create. Even
+   where it can release a hold, the runner's blocked pass then settles the attempt `failed_permanent`, which
+   ends the stage. ADR 0157's automatic reconcile stops at the per-campaign limit.
+
+### Decision
+
+1. **The server records its own refusal.** When a use-time recheck of a committed create or start claim
+   raises, the trusted server records `salad_proxy.claim_refused` (`nonce`, `route_id`, `operation_id`,
+   `action`, `stage: use_time_recheck`, `reason: admission_denied`, `provider_call_made: false`). Both rechecks
+   come before the provider call, so no call was made for that one-use nonce. `claim_proxy` refuses a nonce
+   that was already used and any effect that already has a receipt, so no later request can make a call for
+   it either. The record has no public route. It is accepted only for the route's newest create or start
+   effect, only while that effect has no receipt and has a committed claim, only from the operation's own
+   worker, and only on a store that is composed with the trusted server. It is idempotent per nonce. Writing
+   it is best effort: if the write fails, the claim stands (fail closed) and the server's input log records
+   `claim_refusal_unrecorded`. A failure after the recheck records nothing.
+2. **What counts as claimed.** `salad_unclaimed.create_claimed` ignores a create or start claim when a
+   `salad_proxy.claim_refused` exists with the same nonce, route and operation, or (point 6) when an earlier
+   build's bare pre-call refusal shows no provider call. Every other claim still counts as a possible
+   provider call. Point 4 now reads: the effect's receipt is the server's `admission_denied`
+   refusal (unchanged), and the operation has no unrefused claim. Point 5, ADR 0157's proof and the operator
+   `unclaimed_proof` all use this one reading.
+3. **The executor does not hold a group it never had.** A route that has no recorded `provider_id` and no
+   create or start effect that counts as sent (`salad_precreate.sent_launch_effects`) is not held for a
+   guardian group stop. The runner's own proof decides. A create that may have been sent, or a recorded
+   group, still holds as before.
+4. **An infrastructure retry, not a scientific one.** When the driver unwinds an attempt as
+   `live_check_create_not_sent` and `retry.infra_retries` has a retry left, the attempt is `failed_transient` /
+   `infra_salad_create_not_sent` with detail `live_check_create_not_sent; infrastructure failure, retry N of
+   M`, settled at zero. With no infrastructure retry left it keeps `t1_salad_unclaimed`, as before.
+5. **Owner-requested unwind of a blocked attempt.** `tessera campaign reconcile-unclaimed-attempts
+   --campaign-id ID [--dry-run]` (`GET /campaigns/{id}/unclaimed-attempts`,
+   `POST /campaigns/{id}/reconcile-unclaimed-attempts`) uses the owner's human control credential. An agent
+   or worker is refused. For each `unknown` attempt it runs the same `campaign_unclaimed.assess` the runner
+   uses. For each attempt that assessment accepts, it writes one audited `campaign.unclaimed_reconcile_requested`
+   event bound to the verdict's evidence digest. Nothing is settled in that request. On its next pass the
+   runner applies its existing unclaimed unwind to exactly those attempts. The only thing the request lifts
+   is the per-campaign automatic limit; every guard is re-read in the runner's own transaction. The grant is
+   reconciled at zero and its hold released. The attempt becomes `failed_transient` / `not_started`, settled
+   `unclaimed_zero`. The stage is re-queued under its own caps, with no scientific retry. A `blocked` campaign
+   with no other unknown attempt returns to `running`. The events carry `automatic: false` and
+   `requested_by_principal_id`, and such requests do not count toward the automatic limit. A changed
+   evidence digest voids the request. A refusal names the closed reason and writes nothing, and a repeat is a
+   no-op. This route exists because `reconcile-unclaimed-salad` on its own lets the blocked pass settle the
+   attempt `failed_permanent`. It never infers a termination and never charges.
+
+6. **A refusal from a build before the record (q-2704 follow-up).** Builds before v0.103.0 (v0.102.0) ran
+   the same use-time recheck but wrote no `salad_proxy.claim_refused`. In that code the trusted server's
+   `admission_denied` with status `unknown` comes only from a recheck, which precedes the one provider call;
+   the HTTP transport's own `admission_denied` after a create POST (a 201 that did not read settled) names
+   `proxy_request_kind`. So `create_claimed` also ignores a claim with no refusal record when all of these
+   hold (`salad_unclaimed._unrecorded_refusal`, `salad_precreate.unrecorded_refusal_unsent`): the claim is a
+   `create`; the operation records no provider id; the claimed route's newest state (same org and operation)
+   records no provider id and no allocation, and its only create or start effect is the claimed one; no
+   receipt on the route names a provider id or allocation; and every receipt of that effect is point 4's
+   `admission_denied` refusal (provider provenance, state `unknown`, termination not confirmed) with
+   `request_id`, `response_status`, `cost_cents`, `provider_rejection`, `proxy_detail`, `proxy_field` and
+   `proxy_request_kind` all null and no evidence. Anything else fails closed and the claim counts. The
+   unwind settles 0¢, never infers termination and never adds a charge.
+
+### Consequences
+
+- From this build on, a create refused at the use-time recheck releases its hold at 0¢ on the runner's
+  next passes, with no person involved, provided the server's refusal record was written. The stage retries
+  on an infrastructure retry.
+- A claimed create without the server's refusal record stays held exactly as before unless it has point
+  6's bare pre-call receipt; one with any other receipt stays held. Only the server writes the record.
+- **Attempts already stuck under an earlier build (q-2704 follow-up).** No build before v0.103.0 wrote
+  `salad_proxy.claim_refused`, and the record cannot be added later because the effect already has a
+  receipt. Point 6 covers the shape those builds left: a create whose only receipt is the bare pre-call
+  `admission_denied` refusal, with no group identity and no allocation, now reads never sent, so
+  `reconcile-unclaimed-attempts --dry-run` reports it `reconcilable` and the owner's request recovers it at
+  0¢ (`failed_transient` / `not_started`, no scientific retry; a `blocked` campaign whose only unknown
+  attempt it is returns to `running`). The runner's automatic unwind also takes it while under its limit.
+  Any other earlier-build claim (one whose route or receipt shows a provider id, allocation, request id,
+  response status, transport diagnostic, charge, evidence or a start) still reads `create_claimed` and is
+  refused. Never hand-write the refusal record, invent a termination or a charge, or use
+  `reconcile-unclaimed-salad` on its own.
+- No schema change and no migration: the new records are events, and `infra_salad_create_not_sent` is a new
+  value of the existing failure class.

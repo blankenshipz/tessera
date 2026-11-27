@@ -4,10 +4,13 @@ A leased and packaged Salad operation cannot use the Kubernetes never-submitted
 attestations, and an ordinary reconcile needs a confirmed-terminated observation. This
 store closes the narrow case in between (ADR 0038 amendment): the grant was cancelled,
 exactly one ``kubernetes-job-v1`` operation exists, control holds no ``salad_proxy.claim``
-for a create or start of that operation, and no route of the operation still wants to run or
-has a create or start effect, other than one the trusted server refused before its use-time
-claim (ADR 0205). Control writes the claim before any call to the provider, so no claim means
-no provider mutation can have happened. It never infers a stop.
+for a create or start of that operation (other than one the trusted server's own use-time
+recheck refused before any provider call, recorded or, for a build before that record, shown by
+a bare pre-call refusal receipt with no group identity or allocation), and no route of the
+operation still wants to run or has a create or start effect, other than one the trusted server
+refused at its use-time admission (ADR 0205 and its amendment). Control writes the claim before
+any call to the provider, so no claim means no provider mutation can have happened.
+It never infers a stop.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ from pydantic import ValidationError
 
 from .execution import ExecutionStore, reconcile_grant_row
 from .execution_models import ExecutionRequest, Revision
-from .salad_precreate import sent_launch_effects
+from .salad_precreate import sent_launch_effects, unrecorded_refusal_unsent
 from .store import Conflict, StoreError, utc_now
 
 ADAPTER = "kubernetes-job-v1"
@@ -41,16 +44,67 @@ def create_claimed(connection: sqlite3.Connection, org_id: str, operation_id: st
     """True when control holds a provider create or start claim for the operation.
 
     The one reading of a ``salad_proxy.claim`` for an operation: control writes the claim in
-    the same transaction as the intent to call the provider (ADR 0038 amendment)."""
+    the same transaction as the intent to call the provider (ADR 0038 amendment). A claim the
+    trusted server's own use-time recheck refused before any provider call is not a claim of a
+    provider effect: either the server recorded it (``salad_proxy.claim_refused`` for the same
+    nonce and route, ADR 0205 amendment), or a build before that record existed refused a
+    create whose route and receipt show no sign of a provider call
+    (``_unrecorded_refusal``, q-2704 follow-up). Every other claim is."""
     if operation_id is None:
         return False
-    row = connection.execute(
-        """SELECT 1 FROM events WHERE org_id=? AND event_type='salad_proxy.claim'
-        AND json_extract(payload_json,'$.operation_id')=?
-        AND json_extract(payload_json,'$.action') IN ('create','start') LIMIT 1""",
+    rows = connection.execute(
+        """SELECT json_extract(claim.payload_json,'$.nonce') AS nonce,
+        json_extract(claim.payload_json,'$.route_id') AS route_id,
+        json_extract(claim.payload_json,'$.action') AS action
+        FROM events AS claim WHERE claim.org_id=?
+        AND claim.event_type='salad_proxy.claim'
+        AND json_extract(claim.payload_json,'$.operation_id')=?
+        AND json_extract(claim.payload_json,'$.action') IN ('create','start')
+        AND NOT EXISTS (
+            SELECT 1 FROM events AS refused WHERE refused.org_id=claim.org_id
+            AND refused.event_type='salad_proxy.claim_refused'
+            AND json_extract(refused.payload_json,'$.nonce')
+                = json_extract(claim.payload_json,'$.nonce')
+            AND json_extract(refused.payload_json,'$.route_id')
+                = json_extract(claim.payload_json,'$.route_id')
+            AND json_extract(refused.payload_json,'$.operation_id')
+                = json_extract(claim.payload_json,'$.operation_id')
+        )""",
         (org_id, operation_id),
+    ).fetchall()
+    return any(not _unrecorded_refusal(connection, org_id, operation_id, row) for row in rows)
+
+
+def _unrecorded_refusal(
+    connection: sqlite3.Connection, org_id: str, operation_id: str, claim: sqlite3.Row
+) -> bool:
+    """True when a create claim with no ``claim_refused`` record provably made no provider call.
+
+    The operation names no provider id, and the claimed route's newest state (same org and
+    operation) holds the claimed create as its only launch effect with only the trusted
+    server's bare pre-call ``admission_denied`` receipt and no group identity or allocation
+    anywhere (``salad_precreate.unrecorded_refusal_unsent``). Fail closed otherwise."""
+    if claim["action"] != "create" or not claim["nonce"] or not claim["route_id"]:
+        return False
+    operation = connection.execute(
+        "SELECT provider_id FROM external_operations WHERE operation_id=? AND org_id=?",
+        (operation_id, org_id),
     ).fetchone()
-    return row is not None
+    if operation is None or operation["provider_id"] is not None:
+        return False
+    row = connection.execute(
+        """SELECT payload_json FROM events WHERE org_id=?
+        AND event_type='remote_execution.state' AND json_extract(payload_json,'$.id')=?
+        ORDER BY cursor DESC LIMIT 1""",
+        (org_id, claim["route_id"]),
+    ).fetchone()
+    if row is None:
+        return False
+    state = json.loads(row["payload_json"])
+    if (state.get("proposal") or {}).get("operation_id") != operation_id:
+        return False
+    effects = [e for e in state.get("effects") or [] if e.get("id") == claim["nonce"]]
+    return len(effects) == 1 and unrecorded_refusal_unsent(state, effects[0])
 
 
 def unclaimed_proof(

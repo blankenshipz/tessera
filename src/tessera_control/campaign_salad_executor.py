@@ -63,7 +63,7 @@ from .salad_campaign_profiles import (
     route_window_source,
 )
 from .salad_events import closed_record
-from .salad_precreate import launch_effects
+from .salad_precreate import launch_effects, sent_launch_effects
 from .salad_termination import provider_termination
 from .salad_workload_contract import WorkloadContractV1
 from .store import canonical_digest
@@ -1437,7 +1437,11 @@ class SaladCampaignExecutor:
             or state.get("termination_confirmed") is True
             or provider_termination(state).confirmed
             or not any(effect.get("action") == "create" for effect in state.get("effects", []))
+            or (not state.get("provider_id") and not sent_launch_effects(state))
         ):
+            # The last: no group identity was ever recorded and every create/start was refused
+            # at the trusted server's use-time admission (ADR 0205 amendment), so there is no
+            # group for the guardian to confirm stopped; the runner's own proof decides.
             return False
         try:
             self._report_group_stop(item)

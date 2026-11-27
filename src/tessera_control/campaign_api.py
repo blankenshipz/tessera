@@ -26,6 +26,7 @@ from .campaign_steering import (
     SteerCampaignPlacement,
 )
 from .campaign_store import CampaignStore
+from .campaign_unclaimed_recovery import ReconcileUnclaimedAttempts
 from .external_agent_api import Actor as external_actor_dep
 from .store import canonical_digest
 
@@ -106,6 +107,25 @@ def reconcile_completion_cancels(
     payload = body.model_dump(mode="json")
     return result(
         store.reconcile_completion_cancels(
+            actor, campaign_id, key, canonical_digest(payload), payload
+        )
+    )
+
+
+@router.get("/campaigns/{campaign_id}/unclaimed-attempts")
+def list_unclaimed_attempts(campaign_id: str, actor: Actor, store: Campaigns) -> dict[str, Any]:
+    """Dry run (ADR 0205 amendment): each unknown attempt's unclaimed recovery verdict."""
+    return store.list_unclaimed_attempts(actor, campaign_id)
+
+
+@router.post("/campaigns/{campaign_id}/reconcile-unclaimed-attempts")
+def reconcile_unclaimed_attempts(
+    campaign_id: str, body: ReconcileUnclaimedAttempts, actor: Actor, key: Key, store: Campaigns
+) -> JSONResponse:
+    """Ask the runner to unwind provably unclaimed unknown attempts at zero; audited, no charge."""
+    payload = body.model_dump(mode="json")
+    return result(
+        store.reconcile_unclaimed_attempts(
             actor, campaign_id, key, canonical_digest(payload), payload
         )
     )

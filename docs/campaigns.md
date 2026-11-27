@@ -451,6 +451,33 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
   (default 2, 0 disables) such reconciles per campaign; past it the attempt stays `unknown`
   with `campaign.autoreconcile_stopped` (`kind: unclaimed`). The operator route
   `reconcile-unclaimed-salad` is unchanged and still human-only.
+- **Owner-requested unclaimed recovery (ADR 0205 amendment).** An attempt that is `unknown`
+  past that limit, or one left `unknown` by an earlier build, keeps its campaign `blocked`.
+  The owner recovers it with
+  `tessera campaign reconcile-unclaimed-attempts --campaign-id ID [--campaign-id ID2]
+  [--dry-run] [--reason TEXT] --owner-header FILE` (the owner's human control credential; an
+  automation label is allowed; agents and workers are refused). Over HTTP it is
+  `GET /campaigns/{id}/unclaimed-attempts` for the dry run and
+  `POST /campaigns/{id}/reconcile-unclaimed-attempts` with `{"reason": "...", "dry_run": false}`
+  and an `Idempotency-Key`. Run `--dry-run` first. For each `unknown` attempt it lists the
+  runner's own verdict: `reconcilable` (with its proof and evidence digest), `requested`, or
+  `refused` with the closed reason (for example `create_claimed`). A create refused at the trusted
+  server's use-time recheck is `reconcilable` even when an earlier build (v0.102.0) wrote no
+  `salad_proxy.claim_refused`, provided its receipt is the bare `admission_denied` refusal and
+  nothing records a group identity, allocation or other sign of a provider call (ADR 0205
+  amendment, point 6). The real request writes one
+  `campaign.unclaimed_reconcile_requested` per reconcilable attempt, bound to that evidence
+  digest, and settles nothing itself. On its next pass the runner applies the unwind above to
+  exactly those attempts, regardless of the per-campaign limit, and re-reads every guard. The grant
+  is reconciled at 0 with its hold released, the attempt becomes `failed_transient` /
+  `not_started` (`unclaimed_zero`), the stage is re-queued without a scientific retry, and a
+  `blocked` campaign with no other unknown attempt returns to `running`. The events carry
+  `automatic: false` and `requested_by_principal_id`. If the evidence changes, the request no
+  longer applies. A request that finds nothing reconcilable refuses with each attempt's reason
+  and writes nothing, and a repeat does nothing. Do not use `reconcile-unclaimed-salad` on its
+  own for such an attempt: it releases the hold, but the runner's blocked pass then settles the
+  attempt `failed_permanent`, which ends the stage. Never record an invented termination or a
+  token charge to unblock it.
 - **Data class (ADR 0039).** Inputs are `public` or `private_derived`; the class of a
   snapshot is the one the control plane recorded when it was staged
   (`snapshot_data_classes`), never the spec's claim. A spec naming a snapshot `public` is

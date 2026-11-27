@@ -203,10 +203,12 @@ def assess(
 
 
 def automatic_count(connection: sqlite3.Connection, campaign: dict[str, Any]) -> int:
-    """Automatic unclaimed reconciles this campaign has already applied."""
+    """Automatic unclaimed reconciles this campaign has already applied (one the owner asked
+    for through ``reconcile-unclaimed-attempts`` is not automatic and is not counted)."""
     return connection.execute(
         """SELECT count(*) FROM events WHERE project_id=?
         AND event_type='campaign.attempt_unclaimed_reconciled'
-        AND json_extract(payload_json,'$.campaign_id')=?""",
+        AND json_extract(payload_json,'$.campaign_id')=?
+        AND COALESCE(json_extract(payload_json,'$.automatic'), 1)=1""",
         (campaign["project_id"], campaign["id"]),
     ).fetchone()[0]

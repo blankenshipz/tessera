@@ -160,6 +160,7 @@ from .campaign_steps import (
 from .campaign_store import CampaignStore, LicenseRefused
 from .campaign_unclaimed import Refused, Unclaimed, automatic_count
 from .campaign_unclaimed import assess as assess_unclaimed
+from .campaign_unclaimed_recovery import requested as unclaimed_requested
 from .code_approval import snapshot_code_approval
 from .data_class import DataClassRefused
 from .execution import reconcile_grant_row
@@ -5488,10 +5489,17 @@ class CampaignRunner:
                 return False
             verdict = assess_unclaimed(connection, fresh, ctx.campaign, provider)
             used = automatic_count(connection, ctx.campaign)
+            # The owner's ``reconcile-unclaimed-attempts`` request for exactly this evidence
+            # lifts only the per-campaign automatic limit; every guard still holds.
+            asked = (
+                None
+                if isinstance(verdict, Refused)
+                else unclaimed_requested(connection, ctx.campaign, attempt["id"], verdict.digest)
+            )
         if isinstance(verdict, Refused):
             return self._unclaimed_refused(ctx, key, attempt, verdict)
         limit = self.unclaimed_autoreconcile_limit
-        if used >= limit:
+        if used >= limit and asked is None:
             # Re-admission itself stays under the stage's own caps (attempt numbers, retries).
             reason = (
                 "not auto-reconciled: automatic unclaimed reconcile is disabled"
@@ -5540,7 +5548,11 @@ class CampaignRunner:
                 return again
             if again.digest != verdict.digest:
                 return False  # the records moved: judge them afresh next tick
-            if automatic_count(connection, ctx.campaign) >= self.unclaimed_autoreconcile_limit:
+            asked = unclaimed_requested(connection, ctx.campaign, attempt["id"], again.digest)
+            if (
+                asked is None
+                and automatic_count(connection, ctx.campaign) >= self.unclaimed_autoreconcile_limit
+            ):
                 return False
             grant = connection.execute(
                 "SELECT * FROM execution_grants WHERE id=? AND project_id=?",
@@ -5595,7 +5607,8 @@ class CampaignRunner:
                     "proof": verdict.proof,
                     "settlement_cents": 0,
                     "currency": None if limits is None else limits["currency"],
-                    "automatic": True,
+                    "automatic": asked is None,
+                    **({} if asked is None else {"requested_by_principal_id": asked}),
                     "provider_termination_inferred": False,
                     "operational_only": True,
                 },
@@ -5616,7 +5629,8 @@ class CampaignRunner:
                     "settlement_cents": 0,
                     "released_hold_cents": grant["max_exposure_cents"],
                     "consumed_scientific_retry": False,
-                    "automatic": True,
+                    "automatic": asked is None,
+                    **({} if asked is None else {"requested_by_principal_id": asked}),
                     "is_evidence": False,
                 },
                 task_id=grant["task_id"],

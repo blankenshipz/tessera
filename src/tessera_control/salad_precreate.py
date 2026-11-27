@@ -8,9 +8,16 @@ create or start effect. Once an effect exists nothing here retries anything.
 
 The same module holds the one reading of "this route's create was provably never sent" that the
 runner, the provider's claim state and the operator's unclaimed route share: a create or start
-effect counts as sent unless control recorded the trusted server's refusal of it *before* the
-use-time claim (``salad_proxy.claim`` is committed before any provider call, so a refused claim
-means no provider call happened for that effect).
+effect counts as sent unless control recorded the trusted server's own refusal of it at its
+use-time admission. ``salad_proxy.claim`` is committed before any provider call, and a provider
+receipt is accepted only for a claimed effect, so such a refusal always follows a committed
+claim; it proves nothing was sent only together with the server's
+``salad_proxy.claim_refused`` record for that nonce, written when its use-time recheck refused
+the claim before the provider call (ADR 0205 amendment). A claim without that record still
+counts as a possible provider call (``salad_unclaimed.create_claimed``), except a create a
+build before v0.103.0 refused at that recheck without writing the record: its receipt is the
+bare pre-call refusal with no group identity, allocation or provider exchange field
+(``unrecorded_refusal_unsent``, q-2704 follow-up).
 """
 
 from __future__ import annotations
@@ -70,15 +77,17 @@ def launch_effects(state: dict[str, Any] | None) -> list[dict[str, Any]]:
 
 
 def effect_unsent(state: dict[str, Any], effect: dict[str, Any]) -> bool:
-    """True when control recorded the trusted server's pre-claim refusal of ``effect``.
+    """True when control recorded the trusted server's use-time admission refusal of ``effect``.
 
     The receipt for the effect must exist (the dispatch returned; ``claim_proxy`` refuses any
     later claim of an effect that has a receipt), come from the trusted server, name no
     provider resource, read ``unknown`` with no termination, and carry the closed pre-claim
-    refusal reason. The
-    caller must separately prove no ``salad_proxy.claim`` exists for the operation: a refusal
-    after a committed claim uses the same reason, and only the missing claim proves that no
-    provider call was made."""
+    refusal reason. The caller must separately prove that no unrefused ``salad_proxy.claim``
+    exists for the operation (``salad_unclaimed.create_claimed``): the transport can also
+    answer ``admission_denied`` after a provider call, so only the server's own
+    ``salad_proxy.claim_refused`` record for the nonce, or for a build before that record the
+    stricter ``unrecorded_refusal_unsent``, proves its use-time recheck refused the claim before
+    that call."""
     receipts = [r for r in state.get("receipts") or [] if r.get("effect_id") == effect.get("id")]
     return bool(receipts) and all(
         r.get("proxy_reason") == UNSENT_PROXY_REASON
@@ -88,6 +97,53 @@ def effect_unsent(state: dict[str, Any], effect: dict[str, Any]) -> bool:
         and r.get("state") == "unknown"
         and r.get("termination_confirmed") is not True
         for r in receipts
+    )
+
+
+# Receipt fields set only by a provider exchange or by the HTTP transport (a request id, an HTTP
+# status, a charge, evidence links, a create rejection, or the closed failed-read diagnostics).
+# The trusted server's own pre-call refusal (``ProxyResult(reason="admission_denied")`` with no
+# observation) leaves every one empty; the transport's ``admission_denied`` after a create POST
+# (a 201 that did not read settled) names ``proxy_request_kind``.
+EXCHANGE_FIELDS = (
+    "request_id",
+    "response_status",
+    "cost_cents",
+    "provider_rejection",
+    "proxy_detail",
+    "proxy_field",
+    "proxy_request_kind",
+)
+
+
+def unrecorded_refusal_unsent(state: dict[str, Any], effect: dict[str, Any]) -> bool:
+    """True when ``effect`` is a create refused before any provider call even with no
+    ``salad_proxy.claim_refused`` record (q-2704 follow-up, ADR 0205 amendment).
+
+    A build before v0.103.0 (v0.102.0) refused a committed claim at its use-time recheck without
+    writing that record, and once the effect has a receipt none can be added. Its trusted
+    server's ``admission_denied`` with status ``unknown`` comes only from that recheck, which
+    precedes the one provider call; the transport's own ``admission_denied`` after a create POST
+    carries ``proxy_request_kind``. So the claim reads unsent only when: the effect is the
+    route's only create/start effect and is a create; the route records no group identity and
+    no allocation; no receipt of the route names a provider resource or allocation; and every
+    receipt of the effect is the pre-call refusal (``effect_unsent``) with every exchange field
+    empty. Anything that looks like a provider call (a provider or allocation id, request id,
+    response status, charge, evidence, rejection, transport diagnostic or a start) fails
+    closed. Never infers termination or a charge."""
+    if (
+        effect.get("action") != "create"
+        or state.get("provider_id") is not None
+        or state.get("allocation_id") is not None
+        or [e.get("id") for e in launch_effects(state)] != [effect.get("id")]
+    ):
+        return False
+    receipts = state.get("receipts") or []
+    if any(r.get(name) is not None for r in receipts for name in ("provider_id", "allocation_id")):
+        return False
+    own = [r for r in receipts if r.get("effect_id") == effect.get("id")]
+    return effect_unsent(state, effect) and all(
+        all(r.get(name) is None for name in EXCHANGE_FIELDS) and not r.get("evidence") for r in own
     )
 
 

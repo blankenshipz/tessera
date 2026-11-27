@@ -86,6 +86,7 @@ from .campaign_salad_commands import (  # noqa: F401
 )
 from .campaign_standing_store import StandingApprovalCommands
 from .campaign_steering import CampaignSteeringCommands
+from .campaign_unclaimed_recovery import UnclaimedRecovery
 from .data_class import DataClassRefused, snapshot_data_class
 from .execution import ExecutionStore
 from .external_agents import ExternalAgentStore
@@ -209,6 +210,7 @@ def _verified_spec_stages(spec_json: str, stored_digest: str) -> list | None:
 
 class CampaignStore(
     CompletionCancelRecovery,
+    UnclaimedRecovery,
     CampaignGateCommands,
     CampaignSteeringCommands,
     StandingApprovalCommands,

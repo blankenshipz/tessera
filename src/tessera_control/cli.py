@@ -268,6 +268,27 @@ def _add_campaign_commands(subcommands: argparse._SubParsersAction) -> None:
         "--dry-run", action="store_true", help="list each attempt's verdict; change nothing"
     )
     common(recover, mutating=True, label=True, optional_key=True)
+    unclaimed = actions.add_parser(
+        "reconcile-unclaimed-attempts",
+        help="ask the runner to unwind unknown attempts that provably claimed no provider "
+        "create (settled 0, hold released, stage retried under its own caps); audited, "
+        "idempotent, never charges",
+    )
+    unclaimed.add_argument(
+        "--campaign-id",
+        required=True,
+        action="append",
+        help="a campaign with unknown attempts; repeat for several (never a warehouse walk)",
+    )
+    unclaimed.add_argument(
+        "--reason",
+        default="unknown attempt provably claimed no provider create",
+        help="recorded on the audit event",
+    )
+    unclaimed.add_argument(
+        "--dry-run", action="store_true", help="list each unknown attempt's verdict; change nothing"
+    )
+    common(unclaimed, mutating=True, label=True, optional_key=True)
     _add_standing_commands(actions, common)
 
 
@@ -373,24 +394,31 @@ def _cancel_running(transport, response: dict, key: str) -> list[dict]:
     return outcomes
 
 
-def _reconcile_completion_cancels(arguments: argparse.Namespace, transport, key) -> int:
-    """One call per named campaign: the dry-run read, or the idempotent recovery POST."""
+def _reconcile_completion_cancels(
+    arguments: argparse.Namespace,
+    transport,
+    key,
+    *,
+    listing: str = "/completion-cancels",
+    action: str = "/reconcile-completion-cancels",
+    prefix: str = "completion-cancels-",
+) -> int:
+    """One call per named campaign: the dry-run read, or the idempotent recovery POST (also
+    ``reconcile-unclaimed-attempts``, which has the same shape)."""
     from urllib.parse import quote
 
     if not arguments.dry_run and not key:
-        key = "completion-cancels-" + uuid.uuid4().hex
+        key = prefix + uuid.uuid4().hex
         print(f"idempotency-key: {key}", file=sys.stderr)
     results, ok = [], True
     for campaign_id in dict.fromkeys(arguments.campaign_id):
         path = f"/campaigns/{quote(campaign_id, safe='')}"
         if arguments.dry_run:
-            status, response = transport("GET", path + "/completion-cancels", None, None)
+            status, response = transport("GET", path + listing, None, None)
         else:
             body = {"reason": arguments.reason, "dry_run": False}
             call_key = f"{key}-{campaign_id}"[:200]
-            status, response = transport(
-                "POST", path + "/reconcile-completion-cancels", body, call_key
-            )
+            status, response = transport("POST", path + action, body, call_key)
         ok = ok and 200 <= status < 300
         results.append({"campaign_id": campaign_id, "status": status, "body": response})
     print(json.dumps({"results": results}, sort_keys=True))
@@ -482,6 +510,15 @@ def run_campaign(arguments: argparse.Namespace, transport_factory=None) -> int:
         if action == "reconcile-completion-cancels":
             # Its --campaign-id is a repeatable list; it quotes each id itself.
             return _reconcile_completion_cancels(arguments, transport, key)
+        if action == "reconcile-unclaimed-attempts":
+            return _reconcile_completion_cancels(
+                arguments,
+                transport,
+                key,
+                listing="/unclaimed-attempts",
+                action="/reconcile-unclaimed-attempts",
+                prefix="unclaimed-attempts-",
+            )
         project = quote(getattr(arguments, "project_id", "") or "", safe="")
         campaign = quote(getattr(arguments, "campaign_id", "") or "", safe="")
         if action == "standing":
