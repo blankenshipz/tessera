@@ -338,6 +338,19 @@ class SaladSafetyClient:
             raise ValueError("independent service unavailable")
         return result
 
+    def open_frames(self, state):
+        """The guardian's read-only capacity answer for this route: ``(open, limit)``, where
+        ``open`` counts the frames that may still bill exactly as a reserve counts them. Raises
+        when the answer is missing or malformed (the caller then defers; it never launches)."""
+        result = self._call(dict(operation="open_frames", reservation=self._reservation(state)))
+        if type(result) is not dict:
+            raise ValueError("independent service unavailable")
+        count = result.get("open_billable_frames")
+        limit = result.get("max_open_billable_frames")
+        if type(count) is not int or type(limit) is not int or count < 0 or limit < 1:
+            raise ValueError("independent service unavailable")
+        return count, limit
+
     def import_retained(self, state, destination=None, partial=False):
         """Import sealed custody after confirmed stop and verify it against the profile.
 

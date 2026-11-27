@@ -20,9 +20,13 @@ from . import provider_trust
 from .campaign_delegation import STEP_TABLE
 from .campaign_image_pull import DEFAULT_INTERRUPTIBLE_MAX_IMAGE_PULL_BYTES
 from .campaign_infra_retry import (
+    GUARDIAN_UNAVAILABLE_PRESTART_CLASSES,
+    INFRA_SALAD_GUARDIAN_UNAVAILABLE,
     INFRA_SALAD_PROVISIONING_OVERRUN,
     INFRA_SALAD_REALLOCATED,
+    INFRA_SALAD_SAFETY_STOP,
     REALLOCATED_PRECUSTODY,
+    SAFETY_STOP_CAUSES,
     SALAD_INTERRUPTED,
     provisioning_overrun,
 )
@@ -61,6 +65,9 @@ from .salad_campaign_profiles import (
     SaladCampaignProfiles,
     stage_has_nonpublic_input,
 )
+from .salad_exit_watch import FAILURE_CLASS as EXIT_FAILURE_CLASS
+from .salad_exit_watch import container_exit_receipt
+from .salad_exit_watch import failure_detail as exit_failure_detail
 from .salad_live_check import PRESTART_FAILURE_CLASSES
 from .salad_unclaimed import CLAIMS, PROOF, unclaimed_proof
 from .salad_workload_contract import COMMAND as SALAD_COMMAND
@@ -735,6 +742,22 @@ class SaladRouteProvider:
                 evidence_digest=evidence,
                 manifest_id=attempt.get("manifest_id"),
             )
+        exited = exit_failure_detail(self._guardian_record(rt, attempt, "start_events"))
+        if exited is not None:
+            # The recorded system events name a non-zero process exit (not a kill or a platform
+            # stop): the workload's own entry failure. A replacement machine would fail the same
+            # way, so this is permanent, never ``salad_interrupted`` (which spends an infra
+            # retry) or a pre-custody reallocation, whatever stop cause the guardian recorded.
+            # Checked before the route-deadline records (q-2711 x ADR 0206): a run that exited
+            # non-zero and also reached its route limit is never a provisioning-overrun retry.
+            return Observation(
+                "failed_permanent",
+                failure_class=EXIT_FAILURE_CLASS,
+                detail=exited,
+                evidence_kind="salad_live_receipt",
+                evidence_digest=evidence,
+                manifest_id=attempt.get("manifest_id"),
+            )
         deadline = self._route_deadline(rt, attempt)
         if provisioning_overrun(deadline):
             # The machine was placed but the workload never got going before the route limit
@@ -747,6 +770,21 @@ class SaladRouteProvider:
                     f"{INFRA_SALAD_PROVISIONING_OVERRUN}: the route deadline came after "
                     f"{deadline['running_seconds']}s running with no custody work begun"
                 )[:500],
+                evidence_kind="salad_live_receipt",
+                evidence_digest=evidence,
+                manifest_id=attempt.get("manifest_id"),
+            )
+        if self._guardian_unavailable_prestart(rt, attempt):
+            # The guardian's IPC was down while the server minted or checked the input ticket,
+            # before any start effect: an outage, not the stage's logic. Retried as
+            # infrastructure within ``retry.infra_retries``.
+            return Observation(
+                "failed_transient",
+                failure_class=INFRA_SALAD_GUARDIAN_UNAVAILABLE,
+                detail=(
+                    f"{INFRA_SALAD_GUARDIAN_UNAVAILABLE}: the guardian was unavailable before "
+                    "the group was started"
+                ),
                 evidence_kind="salad_live_receipt",
                 evidence_digest=evidence,
                 manifest_id=attempt.get("manifest_id"),
@@ -808,6 +846,42 @@ class SaladRouteProvider:
                 evidence_digest=evidence,
                 manifest_id=attempt.get("manifest_id"),
             )
+        if self._guardian_record(rt, attempt, "retained_before_move") is True:
+            # The run retained its output first; then the provider changed the allocation while
+            # the group was stopping, so the guardian could only close the frame by the
+            # provider-confirmed reconcile and never sealed custody (it cannot confirm a writer
+            # died after a move). The outputs are not accepted; the provider's own move is
+            # infrastructure, retried within ``retry.infra_retries``. Selected only by the
+            # guardian's recorded final, never by the receipt's reason.
+            return Observation(
+                "failed_transient",
+                failure_class=INFRA_SALAD_REALLOCATED,
+                detail=(
+                    f"{INFRA_SALAD_REALLOCATED}: the allocation changed while the group was "
+                    "stopping after its output was retained; the provider confirmed the exact "
+                    "group stopped; custody unsealed, outputs not accepted"
+                )[:500],
+                evidence_kind="salad_live_receipt",
+                evidence_digest=evidence,
+                manifest_id=attempt.get("manifest_id"),
+            )
+        safety_cause = self._guardian_record(rt, attempt, "safety_stop_cause")
+        if safety_cause in SAFETY_STOP_CAUSES:
+            # The safety plane stopped the route for its own health (silence, a restart, an
+            # unreadable provider or rate, an uncertain clock, a failed loop pass). Only the
+            # guardian's first stop cause on the executor's recorded final selects this, never
+            # a receipt reason: infrastructure, retried within ``retry.infra_retries``.
+            return Observation(
+                "failed_transient",
+                failure_class=INFRA_SALAD_SAFETY_STOP,
+                detail=(
+                    f"{INFRA_SALAD_SAFETY_STOP}: the Salad safety plane stopped the route "
+                    f"({safety_cause}); not evidence about the stage"
+                )[:500],
+                evidence_kind="salad_live_receipt",
+                evidence_digest=evidence,
+                manifest_id=attempt.get("manifest_id"),
+            )
         detail = f"salad:{failure_detail or 'not_passed'}"[:500]
         return Observation(
             "failed_permanent",
@@ -816,6 +890,26 @@ class SaladRouteProvider:
             evidence_kind="salad_live_receipt",
             evidence_digest=evidence,
             manifest_id=attempt.get("manifest_id"),
+        )
+
+    def _guardian_unavailable_prestart(
+        self, rt: RunnerServices, attempt: Mapping[str, Any]
+    ) -> bool:
+        """True only for a failed receipt that proves no start was dispatched (``_prestart_record``)
+        and whose pre-start failure is a ticket mint or input delivery check that raised
+        ``GuardianUnavailable``. Anything else, unreadable or older is False."""
+        if rt is None or attempt.get("id") is None or attempt.get("campaign_id") is None:
+            return False
+        try:
+            receipt = self._prestart_record(rt._one, attempt)
+        except Exception:  # noqa: BLE001 - unreadable evidence is not proof
+            return False
+        record = None if receipt is None else receipt.get("prestart_failure")
+        return (
+            type(record) is dict
+            and record.get("class") in GUARDIAN_UNAVAILABLE_PRESTART_CLASSES
+            and record.get("exception") == "GuardianUnavailable"
+            and receipt.get("create_rejection") is None
         )
 
     @staticmethod
@@ -1032,19 +1126,35 @@ class SaladRouteProvider:
         an intent before the provider is called, so none means the start call never happened)
         and was never reallocated, and the executor's live receipt did not pass and names the
         pre-start step that failed (or the provider's create rejection)."""
-        row = connection.execute(
+        receipt = self._prestart_record(
+            lambda sql, params: connection.execute(sql, params).fetchone(), attempt
+        )
+        if receipt is None:
+            return None
+        if receipt.get("create_rejection") is not None:
+            return "create_rejected"
+        failure = receipt.get("prestart_failure")
+        code = failure.get("class") if isinstance(failure, dict) else None
+        return code if code in PRESTART_FAILURE_CLASSES else None
+
+    @staticmethod
+    def _prestart_record(fetch: Any, attempt: Mapping[str, Any]) -> dict[str, Any] | None:
+        """The attempt's failed live receipt when control's own records prove it never started
+        (the route, read within the campaign's organization and project, carries no ``start``
+        effect and was never reallocated), else None. ``fetch(sql, params)`` returns one row."""
+        row = fetch(
             "SELECT route_id, live_receipt_json FROM campaign_salad_attempts WHERE attempt_id=?",
             (attempt["id"],),
-        ).fetchone()
+        )
         if row is None or row["route_id"] is None or row["live_receipt_json"] is None:
             return None
-        found = connection.execute(
+        found = fetch(
             """SELECT e.payload_json FROM events e JOIN campaigns c ON c.id=?
             WHERE e.event_type='remote_execution.state' AND e.org_id=c.org_id
             AND e.project_id=c.project_id AND json_extract(e.payload_json,'$.id')=?
             ORDER BY e.cursor DESC LIMIT 1""",
             (attempt["campaign_id"], row["route_id"]),
-        ).fetchone()
+        )
         if found is None:
             return None
         state = json.loads(found["payload_json"])
@@ -1058,11 +1168,7 @@ class SaladRouteProvider:
         receipt = json.loads(row["live_receipt_json"])
         if not isinstance(receipt, dict) or receipt.get("status") == "passed":
             return None
-        if receipt.get("create_rejection") is not None:
-            return "create_rejected"
-        failure = receipt.get("prestart_failure")
-        code = failure.get("class") if isinstance(failure, dict) else None
-        return code if code in PRESTART_FAILURE_CLASSES else None
+        return receipt
 
     def cpu_profile(self, stage: Any) -> bool:
         """True only when ``stage``'s Salad block and its operator profile are both CPU (no
@@ -1239,6 +1345,9 @@ class SaladRouteProvider:
                 if final.get(key):
                     # Closed tokens only (event names, exit codes, machine count).
                     fields["guardian_" + key] = final[key]
+            exited = container_exit_receipt(final.get("start_events"))
+            if exited is not None:
+                fields["guardian_container_exit"] = exited
             rebinds = final.get("prestart_rebinds")
             if rebinds:
                 # Recorded by the guardian: an allocation change before anything ran, re-bound.

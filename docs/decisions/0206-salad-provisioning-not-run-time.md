@@ -7,6 +7,11 @@ Accepted. Narrows the Salad guardian's allocation deadline (ADR 0193), the route
 reallocation retries (ADR 0179, ADR 0197) and the lost-create release (ADR 0205). No schema change
 and no migration (the guardian's private database gains one column the usual additive way).
 
+Amended by [ADR 0207](0207-salad-runtime-retry-and-lease-window.md): item 5's
+provider-confirmed reallocation now settles at the guardian's estimate (at least one cent) when
+the guardian closed the frame by its provider-confirmed reconcile, and retries without a person's
+charge; waiting before the route never spends the route window.
+
 ## Context
 
 Live campaigns failed on Salad placement, not on their workloads:

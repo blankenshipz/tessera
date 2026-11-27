@@ -41,6 +41,7 @@ from .remote_execution_models import (
 )
 from .salad_custody import CustodyBinding, SaladCustody, private_database
 from .salad_events import empty_record
+from .salad_exit_watch import ContainerExitWatch
 from .salad_guardian import (
     DEFAULT_ALLOCATION_SECONDS,
     DEFAULT_PRESTART_READ_DEADLINE_SECONDS,
@@ -420,6 +421,12 @@ LOST_CREATE_WATCH_INTERVAL_SECONDS = 60
 # After resolution the guardian keeps reading the reserved name at a low rate for this
 # long; a late group is bound and stopped by the existing stop path, and blocks again.
 LOST_CREATE_WATCH_SECONDS = 86400
+# Lost-create absence reads (the late-group watch and re-resolution) are provider reads made on
+# the loop thread, which also serves reserve, bind and ticket IPC between passes. At most this
+# many run in one pass, so a backlog (every frame resolved in the last day, right after a
+# restart) is spread over passes and IPC is answered between them. A read that waits is only
+# later; nothing is released, voided or unblocked by the wait.
+LOST_CREATE_READS_PER_PASS = 1
 # Per-operation authenticated request budget for the chunked-output endpoints:
 # twice the planned chunks plus this slack (plan calls, retries, final-chunk acks).
 OUTPUT_REQUEST_SLACK = 32
@@ -571,7 +578,7 @@ def frame_verdict(status, reason):
     return "open"
 
 
-class SaladSafetyService:
+class SaladSafetyService(ContainerExitWatch):
     """Single-thread service owns all SQLite connections and guardian execution."""
 
     def __init__(
@@ -757,9 +764,12 @@ class SaladSafetyService:
         # The one system-events read per stopped operation runs off the loop thread.
         self._start_events_done = []
         self._start_events_threads = []
+        self._init_exit_watch()
         self.next_close_check = {}
         self.next_rate = {}
         self.next_absence = {}
+        self._absence_reads_left = LOST_CREATE_READS_PER_PASS
+        self._pass_count = 0
 
     def close(self):
         self.guardian.close()
@@ -1906,6 +1916,15 @@ class SaladSafetyService:
         seen also voids a create-rejected fast release for good; after an unknown
         read the fast path may resolve it again on a fresh definite absence."""
         try:
+            # The guardian's own credential not being ready (a restart, a rotation) means no
+            # read was made: nothing was learned about the provider, so the resolution stands
+            # and the read is retried shortly. A read that was made and did not prove absence
+            # still voids below.
+            self._credential()
+        except Exception:
+            self.next_absence[row["reservation"]] = now + LOST_CREATE_READ_SECONDS
+            return
+        try:
             result = self._send(row, "read_absence")
             o = result.observation
             observed = result.status == "observed" and type(o) is dict
@@ -2270,6 +2289,23 @@ class SaladSafetyService:
             fields |= {"rejection"}
         if set(body) != fields:
             raise ValueError("invalid_admin_request")
+        if action == "open_frames":
+            # Read-only capacity answer (the executor asks before it commits an attempt, so a
+            # full open-frame fence defers the launch instead of failing a reserve). Counted
+            # exactly as the reserve counts (``_open_frames``, never-bound frames included),
+            # without accounting writes; ``reservation`` is the asking route's own digest and
+            # is excluded only if a frame for it already exists. Nothing is reserved or changed.
+            if type(reservation) is not str or not re.fullmatch(r"[0-9a-f]{64}", reservation):
+                raise ValueError("invalid_admin_request")
+            own = self.db.execute(
+                "SELECT operation FROM reservations WHERE reservation=?", (reservation,)
+            ).fetchone()
+            return dict(
+                reservation=reservation,
+                open_billable_frames=len(self._open_frames(own[0] if own else "", account=False)),
+                max_open_billable_frames=self.max_open_billable_frames,
+                observed_at=self.loop_at,
+            )
         now = self.clock()
         if action == "reserve":
             from .experiment_budget_models import SaladBudgetBinding
@@ -2656,7 +2692,27 @@ class SaladSafetyService:
         finally:
             self.retry_windows = None
 
+    def _absence_read_slot(self):
+        """True (and spent) while this pass may still make a lost-create absence read."""
+        if self._absence_reads_left <= 0:
+            return False
+        self._absence_reads_left -= 1
+        return True
+
+    def _watch_due(self, reservation, now):
+        """When this frame's next late-group watch read is due. A frame first seen by this
+        process (a restart) is not due at once: its first read is spread over one watch
+        interval by a stable per-reservation offset, so a restart never queues every resolved
+        frame's read into its first passes. The watch interval itself is unchanged."""
+        due = self.next_absence.get(reservation)
+        if due is None:
+            offset = int(hashlib.sha256(reservation.encode()).hexdigest()[:8], 16)
+            due = now + offset % LOST_CREATE_WATCH_INTERVAL_SECONDS
+            self.next_absence[reservation] = due
+        return due
+
     def _loop_pass(self):
+        self._absence_reads_left = LOST_CREATE_READS_PER_PASS
         self._drain_start_events()
         now = self.clock()
         if self.jwt.refreshed is None or now - self.jwt.refreshed >= 1800:
@@ -2665,7 +2721,14 @@ class SaladSafetyService:
                     self.jwt.refresh()
             except Exception:
                 pass
-        for (reservation,) in self.db.execute("SELECT reservation FROM reservations").fetchall():
+        frames = [r for (r,) in self.db.execute("SELECT reservation FROM reservations").fetchall()]
+        if frames:
+            # Start each pass one frame later, so the per-pass absence read slot goes round
+            # every frame instead of always to the first ones listed.
+            start = self._pass_count % len(frames)
+            frames = frames[start:] + frames[:start]
+        self._pass_count += 1
+        for reservation in frames:
             try:
                 self._loop_frame(reservation, now)
             except Exception as error:  # never KeyboardInterrupt/SystemExit
@@ -2753,7 +2816,11 @@ class SaladSafetyService:
             try:
                 resolved_at = json.loads(row["lost_create_resolution"])["resolved_at"]
                 watching = now - resolved_at < LOST_CREATE_WATCH_SECONDS
-                if watching and now >= self.next_absence.get(reservation, 0):
+                if (
+                    watching
+                    and now >= self._watch_due(reservation, now)
+                    and self._absence_read_slot()
+                ):
                     self.next_absence[reservation] = now + LOST_CREATE_WATCH_INTERVAL_SECONDS
                     self._watch_lost_create(row, now)
             except Exception as error:
@@ -2824,6 +2891,7 @@ class SaladSafetyService:
                         not row["provider_id"]
                         and (margin or rejected or never_ready)
                         and now >= self.next_absence.get(reservation, 0)
+                        and self._absence_read_slot()
                     ):
                         self.next_absence[reservation] = now + LOST_CREATE_READ_SECONDS
                         try:
@@ -2870,6 +2938,7 @@ class SaladSafetyService:
         except Exception:
             # No failed observation/custody write is a confirmed stop.
             pass
+        self._watch_container_exit(reservation)
         self._read_start_events(reservation)
         # A pre-start read failure being retried across polls backs off (bounded).
         try:

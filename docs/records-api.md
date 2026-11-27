@@ -17,7 +17,7 @@ committed placement is durable custody only, not a release or scientific claim.
 | Route | Behavior |
 |---|---|
 | `POST /projects/{id}/studies` | Record purpose, protocol and exploratory/confirmatory mode |
-| `GET /projects/{id}/studies` | List authorized studies with offset/limit (at most 200 per page, default 100; page until a short page). `campaign_id` narrows the list to the studies that campaign's stages run under |
+| `GET /projects/{id}/studies` | List authorized studies with offset/limit (at most 200 per page, default 100; page until a short page). `campaign_id` narrows the list to the studies that campaign's Salad stages run under (each Salad stage records its run under its own study; other stages create none) |
 | `GET /studies/{id}` | Read complete bounded study detail |
 | `POST /studies/{id}/variants` | Register name, method/input digests and explicit metadata |
 | `POST /variants/{id}/record` | Record completed, failed, excluded or abandoned outcome |

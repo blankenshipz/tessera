@@ -441,7 +441,9 @@ def test_real_signature_begin_output_stop_and_reconnect(service_case):
     assert imported["output"] == output
     assert imported["manifest"]["complete"]
     assert all(
-        action in {"gpu_class", "read_group", "read_instance", "stop"} for action in provider.calls
+        # ``read_events``: the bounded exit watch (salad_exit_watch) while the frame ran.
+        action in {"gpu_class", "read_group", "read_instance", "read_events", "stop"}
+        for action in provider.calls
     )
 
 
@@ -2982,6 +2984,9 @@ def test_create_rejected_releases_early_on_the_guardians_own_absence_reads(tmp_p
         second = _next_reservation(s, clock)
         s.admin(second)
         clock[0] += 61
+        s.loop()
+        # At most one absence read per pass (LOST_CREATE_READS_PER_PASS): the second waits.
+        assert _absence_reads(provider) == 2
         s.loop()
         # One watch read of the released frame, plus (ADR 0205) the never-ready release read
         # of the second reservation, which went silent without ever answering ready.

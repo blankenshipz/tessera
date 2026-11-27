@@ -132,13 +132,21 @@ def test_retries_exhausted_fails_the_stage_with_salad_interrupted(tmp_path):
 def test_anything_but_a_confirmed_post_custody_allocation_change_keeps_todays_class(
     tmp_path, receipt
 ):
+    from tessera_control.campaign_infra_retry import INFRA_SALAD_REALLOCATED
+
     world = world_for(tmp_path)
     interrupted(world, receipt=receipt)
-    world.tick(12)  # it waits for a charge, as any failed run does: no automatic retry
-    attempt = world.attempt()
-    assert attempt["failure_class"] != SALAD_INTERRUPTED
-    assert SALAD_INTERRUPTED not in str(attempt["failure_detail"])
-    assert len(world.env.query("SELECT 1 FROM campaign_stage_attempts")) == 1
+    # Never an interruption: without the guardian's custody word the route-flagged move is the
+    # provider's own (``infra_salad_reallocated``). Since v0.108.0 it settles at the guardian's
+    # estimate (rounded up, at least a cent) and retries without a person's charge.
+    world.tick_until(lambda: len(world.env.query("SELECT 1 FROM campaign_stage_attempts")) == 2)
+    first = world.env.query(
+        "SELECT * FROM campaign_stage_attempts WHERE campaign_id=? AND attempt=1",
+        world.campaign_id,
+    )[0]
+    assert first["failure_class"] == INFRA_SALAD_REALLOCATED
+    assert SALAD_INTERRUPTED not in str(first["failure_detail"])
+    assert (first["settled_cents"], first["settlement_basis"]) == (4, "guardian_bounded_hold")
 
 
 def test_an_estimate_above_the_hold_never_settles_an_interrupted_attempt_automatically(tmp_path):

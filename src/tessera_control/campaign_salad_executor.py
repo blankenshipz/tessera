@@ -34,7 +34,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
@@ -51,6 +51,8 @@ from pydantic import (
 )
 
 from . import maintenance_lock
+from .campaign_infra_retry import SAFETY_STOP_CAUSES
+from .campaign_salad_lease_lapse import window_shortfall
 from .remote_execution_models import SALAD_PROVISIONING_ALLOWANCE_SECONDS
 from .salad_campaign_profiles import (
     DATA_POLICIES,
@@ -620,6 +622,14 @@ def _renewal_refused(error: BaseException) -> bool:
 # How long the pass waits for the keepalive thread to stop after a child returns. A beat stuck
 # in a lock wait finishes on its own; the pass goes on without it (and records that).
 KEEPALIVE_JOIN_SECONDS = 5.0
+# Consecutive non-refusal renewal failures of one lease after which the executor stops retrying
+# it and fences the attempt as a refusal does (a bug or a dead control would otherwise retry
+# every interval until the lease lapses). Counted per lease, reset by any successful renewal.
+MAX_CONSECUTIVE_RENEWAL_FAILURES = 5
+TRANSIENT_CAP = "TransientRenewalCapExceeded"
+# The executor defers a launch whose lease would no longer cover its route window this much
+# earlier than control requeues it, so control never unwinds a route the executor just launched.
+EXECUTOR_WINDOW_MARGIN_SECONDS = 120
 KEEPALIVE_MARKER = "keepalive.json"
 
 
@@ -629,17 +639,31 @@ class _Keepalive:
     It holds a private copy of the leases to renew and writes only its own record, under its
     lock; the pass reads a snapshot of that record after ``stop`` and applies it
     (``self.fenced``) on its own thread. A refused renewal is recorded once and never retried
-    past the fence; a transient failure is counted and retried at the next interval. The
-    running route's own lease is renewed by its child, never here."""
+    past the fence; a transient failure is counted and retried at the next interval.
+
+    ``own`` is the lease of the route this keepalive runs beside (its child, or its finish). The
+    child renews it while it polls, but not in its tail (stop confirmation, custody seal,
+    verification) and nobody does while the executor finishes the route (termination confirm,
+    guardian final, import, upload), so it is renewed here too, every interval. A refusal of it
+    is recorded (``own_refused``) and stops its renewal, but never fences the route here: the
+    child and the finish decide from control's own answers, as before. Every renewal stays
+    bounded by the lease's hard expiry, its epoch and an active grant."""
 
     def __init__(
-        self, control: Any, leases: Mapping[str, tuple[str, int]], interval: float
+        self,
+        control: Any,
+        leases: Mapping[str, tuple[str, int]],
+        interval: float,
+        own: tuple[str, tuple[str, int]] | None = None,
     ) -> None:
         self.control, self.interval = control, interval
         self.leases = dict(leases)
+        self.own = own
+        self.own_refused: str | None = None
         self.refused: dict[str, str] = {}
         self.transient: dict[str, int] = {}
         self.last_transient: dict[str, str] = {}
+        self._streak: dict[str, int] = {}
         self.beats = 0
         self.heartbeat_failures: list[str] = []
         self.join_timed_out = False
@@ -664,6 +688,8 @@ class _Keepalive:
                 return  # stopping: the pass renews what is left itself
             try:
                 self.control.renew(*lease)
+                with self._lock:
+                    self._streak.pop(attempt, None)
             except Exception as error:  # noqa: BLE001 - classified below
                 with self._lock:
                     if _renewal_refused(error):
@@ -672,12 +698,42 @@ class _Keepalive:
                     else:
                         self.transient[attempt] = self.transient.get(attempt, 0) + 1
                         self.last_transient[attempt] = type(error).__name__
+                        streak = self._streak[attempt] = self._streak.get(attempt, 0) + 1
+                        if streak >= MAX_CONSECUTIVE_RENEWAL_FAILURES:
+                            self.refused[attempt] = TRANSIENT_CAP
+                            del self.leases[attempt]
+                            _LOG.error(
+                                "lease renewal for attempt %s failed %d times in a row "
+                                "(last: %s); no longer renewing it",
+                                attempt,
+                                streak,
+                                type(error).__name__,
+                            )
+        own = self.own
+        if own is None or self._stop.is_set():
+            return
+        try:
+            self.control.renew(*own[1])
+            with self._lock:
+                self._streak.pop(own[0], None)
+        except Exception as error:  # noqa: BLE001 - classified below
+            with self._lock:
+                if _renewal_refused(error):
+                    self.own_refused = type(error).__name__
+                    self.own = None
+                else:
+                    self.transient[own[0]] = self.transient.get(own[0], 0) + 1
+                    self.last_transient[own[0]] = type(error).__name__
+                    streak = self._streak[own[0]] = self._streak.get(own[0], 0) + 1
+                    if streak >= MAX_CONSECUTIVE_RENEWAL_FAILURES:
+                        self.own_refused, self.own = TRANSIENT_CAP, None
 
     def snapshot(self) -> dict[str, Any]:
         """A consistent copy of the record (the thread may still be finishing a beat)."""
         with self._lock:
             return {
                 "refused": dict(self.refused),
+                "own_refused": self.own_refused,
                 "transient": dict(self.transient),
                 "last_transient": dict(self.last_transient),
                 "beats": self.beats,
@@ -702,13 +758,14 @@ def keepalive_counts(record: Mapping[str, Any]) -> dict[str, Any] | None:
     beyond the attempts' own), or None when the keepalive saw nothing to report."""
     transient = sum(record["transient"].values())
     failures = record["heartbeat_failures"]
-    if not (transient or failures or record["refused"] or record["join_timed_out"]):
+    own = 1 if record.get("own_refused") else 0
+    if not (transient or failures or record["refused"] or own or record["join_timed_out"]):
         return None
     return {
         "beats": record["beats"],
         "heartbeat_failures": len(failures),
         "renewal_transient_failures": transient,
-        "renewals_refused": len(record["refused"]),
+        "renewals_refused": len(record["refused"]) + own,
         "join_timed_out": record["join_timed_out"],
     }
 
@@ -732,9 +789,12 @@ class SaladCampaignExecutor:
         clock: Callable[[], float] = time.monotonic,
         observer: Callable[[str, SaladCampaignProfile], None] | None = None,
         keepalive_seconds: float = KEEPALIVE_SECONDS,
+        wall_clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.sleep = sleep
         self.keepalive_seconds = keepalive_seconds
+        # Wall-clock UTC, the clock control judges lease bounds on (never the monotonic one).
+        self.wall_clock = wall_clock or (lambda: datetime.now(UTC))
         # This pass's listed work (the keepalive thread renews its held leases while a child
         # runs); read and written by the pass's own thread only.
         self._pass_items: list[dict[str, Any]] = []
@@ -759,6 +819,7 @@ class SaladCampaignExecutor:
         self._leases: dict[str, tuple[str, int]] = {}
         # Attempts whose lease renewal was refused: never retried past the fence.
         self.fenced: dict[str, str] = {}
+        self._renewal_streak: dict[str, int] = {}
         self._step = "grant_poll"  # the control call in flight, named on a recorded refusal
         # Attempts whose live check exited on its own with no receipt, until control has the
         # report (a failed report is re-sent on the next pass of this process only).
@@ -841,7 +902,10 @@ class SaladCampaignExecutor:
             if concurrent and attempt in self._in_flight:
                 # Its child owns the route (and renews the lease and registry heartbeat) until
                 # a cancel fences the lease's epoch or the child returns, exactly as in the
-                # serial executor; it is finished by ``_harvest`` only, never resumed.
+                # serial executor; it is finished by ``_harvest`` only, never resumed. The pass
+                # also renews its lease (the child sends none in its tail), as the serial
+                # child's keepalive does.
+                self._renew_running(attempt)
                 continue
             try:
                 self._step = "grant_poll"
@@ -930,6 +994,9 @@ class SaladCampaignExecutor:
                 package_digest=response["package_digest"],
             ),
         )
+        # The listed phase is stale from here: the attempt now holds a lease, so any keepalive
+        # later in this pass (a serial child's, a finish's) must renew it.
+        item["phase"] = "leased"
         self._note("packaged", attempt, package["operation_id"])
 
     def _heartbeat_before_lease(self, attempt_id: str) -> None:
@@ -975,23 +1042,58 @@ class SaladCampaignExecutor:
             self._note("heartbeat_failed", attempt, type(error).__name__)
         try:
             self.control.renew(*lease)
+            self._renewal_streak.pop(attempt, None)
         except Exception as error:
             if not _renewal_refused(error):
-                # A held write lock or a timeout: retried next pass, never a fence.
+                # A held write lock or a timeout: retried next pass, up to the cap.
+                streak = self._renewal_streak[attempt] = self._renewal_streak.get(attempt, 0) + 1
                 self._note("lease_renewal_transient", attempt, type(error).__name__)
+                if streak < MAX_CONSECUTIVE_RENEWAL_FAILURES:
+                    return
+                _LOG.error(
+                    "lease renewal for attempt %s failed %d passes in a row (last: %s); "
+                    "no longer renewing it",
+                    attempt,
+                    streak,
+                    type(error).__name__,
+                )
+                self.fenced[attempt] = TRANSIENT_CAP
+                self._note("lease_renewal_refused", attempt, TRANSIENT_CAP)
                 return
             self.fenced[attempt] = type(error).__name__
             self._note("lease_renewal_refused", attempt, type(error).__name__)
 
+    def _renew_running(self, attempt: str) -> None:
+        """Renew an in-flight route's own lease from the pass (concurrent mode). A refusal is
+        noted, never a fence here: the child and the finish decide from control's answers."""
+        lease = self._leases.get(attempt)
+        if lease is None or attempt in self.fenced:
+            return
+        try:
+            self.control.renew(*lease)
+        except Exception as error:  # noqa: BLE001 - noted; the child keeps its own renewals
+            name = type(error).__name__
+            if _renewal_refused(error):
+                self._note("running_lease_renewal_refused", attempt, name)
+            else:
+                self._note("lease_renewal_transient", attempt, name)
+
     def _child_keepalive(self, running: str) -> _Keepalive:
-        """The keepalive for one serial child: every other listed attempt whose lease this
-        pass keeps alive (not fenced), plus the registry heartbeat."""
+        """The keepalive for one serial child or one finish: every other listed attempt whose
+        lease this pass keeps alive (not fenced; a lease taken earlier in this pass included),
+        the running route's own lease (``_Keepalive.own``), and the registry heartbeat. Another
+        concurrent route's child renews its own lease and is left to it."""
         leases: dict[str, tuple[str, int]] = {}
+        found = None if running in self.fenced else self._leases.get(running)
+        own = None if found is None else (running, found)
         for item in self._pass_items:
             attempt = item["attempt_id"]
-            if attempt == running or attempt in self.fenced:
+            if attempt == running or attempt in self.fenced or attempt in self._in_flight:
                 continue
-            if item.get("phase") not in KEPT_ALIVE_PHASES:
+            if item.get("phase") not in KEPT_ALIVE_PHASES and not (
+                # A lease acquired in this pass whose packaging then failed.
+                item.get("phase") == "awaiting_lease" and attempt in self._leases
+            ):
                 continue
             try:
                 lease = self._lease_for(item)
@@ -1000,12 +1102,26 @@ class SaladCampaignExecutor:
                 continue
             if lease is not None:
                 leases[attempt] = lease
-        return _Keepalive(self.control, leases, self.keepalive_seconds)
+        return _Keepalive(self.control, leases, self.keepalive_seconds, own)
+
+    @contextmanager
+    def _kept_alive(self, running: str):
+        """Run the body (a route's finish) with the same keepalive as a serial child: the pass
+        thread may block for minutes there (termination confirmation up to
+        ``termination_confirm_seconds``, guardian-final retries, import and upload)."""
+        keepalive = self._child_keepalive(running)
+        try:
+            with keepalive:
+                yield
+        finally:
+            self._apply_keepalive(keepalive)
 
     def _apply_keepalive(self, keepalive: _Keepalive) -> dict[str, Any]:
         """Record, on the pass's thread, what the stopped keepalive thread saw; returns the
         snapshot it applied."""
         record = keepalive.snapshot()
+        if record["own_refused"]:
+            self._note("running_lease_renewal_refused", None, record["own_refused"])
         for attempt, name in sorted(record["refused"].items()):
             if attempt not in self.fenced:
                 self.fenced[attempt] = name
@@ -1029,10 +1145,17 @@ class SaladCampaignExecutor:
         resumed from disk) records the same receipt."""
         counts = keepalive_counts(record)
         if counts is None:
+            self._clear_keepalive(route_id)  # never leave an earlier run's counts behind
             return
         try:
             _write_private_json(self._route_dir(route_id) / KEEPALIVE_MARKER, counts)
         except Exception as error:  # noqa: BLE001 - counts are diagnostics only
+            self._note("keepalive_counts_unsaved", None, type(error).__name__)
+
+    def _clear_keepalive(self, route_id: str) -> None:
+        try:
+            (self._route_dir(route_id) / KEEPALIVE_MARKER).unlink(missing_ok=True)
+        except Exception as error:  # noqa: BLE001 - diagnostics only
             self._note("keepalive_counts_unsaved", None, type(error).__name__)
 
     def _with_keepalive(self, route_id: str, receipt: dict[str, Any]) -> dict[str, Any]:
@@ -1155,6 +1278,7 @@ class SaladCampaignExecutor:
         config_path, receipts, timeout, signals = prepared
         watch = self.stage_watch
         keepalive = self._child_keepalive(attempt)
+        self._clear_keepalive(item["route_id"])  # a marker here is an earlier run's, not this one's
         try:
             with watch.ticking() if signals is not None else nullcontext(), keepalive:
                 receipt = self.route_runner(config_path, receipts, timeout)
@@ -1178,7 +1302,8 @@ class SaladCampaignExecutor:
             self.no_receipt.add(attempt)
             self._report_no_receipt(item)
             return
-        self._finish(item, self._with_keepalive(item["route_id"], receipt))
+        with self._kept_alive(attempt):
+            self._finish(item, self._with_keepalive(item["route_id"], receipt))
 
     def _prepare_route(
         self,
@@ -1212,6 +1337,10 @@ class SaladCampaignExecutor:
             return None
         if admit is not None and not admit(attempt):
             return None
+        if not self._lease_covers_window(item, derived.resources.max_seconds):
+            return None
+        if not self._guardian_has_room(item, attempt):
+            return None
         try:
             self.control.mark_executing(attempt)
         except Exception as error:
@@ -1227,6 +1356,58 @@ class SaladCampaignExecutor:
         )
         timeout = derived.resources.max_seconds + SUBPROCESS_GRACE_SECONDS
         return config_path, receipts, timeout, signals
+
+    def _lease_covers_window(self, item: dict[str, Any], window: int) -> bool:
+        """False (deferred, nothing marked) when the attempt's lease can no longer cover the
+        route window after waiting before the route (``window_shortfall``, with
+        ``EXECUTOR_WINDOW_MARGIN_SECONDS`` so the executor defers before control requeues). The
+        attempt stays ``route_started``; control unwinds it at 0 and requeues it with a fresh
+        lease. An unreadable lease defers too; a control port without the read checks nothing."""
+        read = getattr(self.control, "lease_bounds", None)
+        attempt = item["attempt_id"]
+        lease = self._lease_for(item)
+        if read is None or lease is None:
+            return True
+        try:
+            issued, hard = read(lease[0])
+            short = window_shortfall(
+                issued,
+                hard,
+                self.wall_clock(),
+                window,
+                margin=EXECUTOR_WINDOW_MARGIN_SECONDS,
+            )
+        except Exception as error:  # noqa: BLE001 - unreadable: defer, never launch
+            self._note("route_deferred", attempt, f"lease_unreadable:{type(error).__name__}")
+            return False
+        if short is not None:
+            self._note("route_deferred", attempt, f"lease_window_short:{short}s")
+            return False
+        return True
+
+    def _guardian_has_room(self, item: dict[str, Any], attempt: str) -> bool:
+        """False (deferred, nothing marked) unless the guardian's own read-only capacity answer
+        shows an open-frame slot: ``max_open_billable_frames`` is checked before the attempt is
+        committed, so a full fence (an orphan frame still closing) is a wait, never a refused
+        reserve that spends a retry. Unreadable defers too. A control port that cannot ask
+        (no guardian composed) checks nothing, as before."""
+        read = getattr(self.control, "guardian_capacity", None)
+        if read is None:
+            return True
+        try:
+            answer = read(item["route_id"])
+        except Exception as error:  # noqa: BLE001 - unreadable guardian: defer, never launch
+            self._note(
+                "route_deferred", attempt, f"guardian_capacity_unreadable:{type(error).__name__}"
+            )
+            return False
+        if answer is None:
+            return True
+        count, limit = answer
+        if count >= limit:
+            self._note("route_deferred", attempt, f"guardian_frame_limit:{count}/{limit}")
+            return False
+        return True
 
     # -- concurrent mode (``max_concurrent_paid_routes`` above 1) ---------------------------
 
@@ -1316,7 +1497,8 @@ class SaladCampaignExecutor:
             del self._in_flight[attempt]
             try:
                 self._step = "execute"
-                self._complete(run)
+                with self._kept_alive(attempt):
+                    self._complete(run)
             except Exception as error:
                 self._note("error", attempt, type(error).__name__)
                 self._refused[attempt] = self._step
@@ -1393,7 +1575,8 @@ class SaladCampaignExecutor:
         receipts = self._route_dir(item["route_id"]) / "receipts"
         receipt = read_receipt(receipts) if receipts.is_dir() else None
         if receipt is not None:
-            self._finish(item, self._with_keepalive(item["route_id"], receipt))
+            with self._kept_alive(item["attempt_id"]):
+                self._finish(item, self._with_keepalive(item["route_id"], receipt))
             return
         if item["attempt_id"] in self.no_receipt:
             self._report_no_receipt(item)
@@ -1827,6 +2010,7 @@ class StoreControl:
         state_dir: Path | str,
         worker: dict[str, Any],
         guardian_status: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        guardian_open_frames: Callable[[dict[str, Any]], tuple[int, int]] | None = None,
     ) -> None:
         from .campaign_store import CampaignStore
         from .execution import ExecutionStore
@@ -1838,6 +2022,7 @@ class StoreControl:
 
         self.state_dir, self.worker = Path(state_dir), worker
         self.guardian_status = guardian_status
+        self.guardian_open_frames = guardian_open_frames
         self.campaigns = CampaignStore(self.state_dir)
         self.grants = WorkerGrantStore(self.state_dir)
         self.executions = ExecutionStore(self.state_dir)
@@ -2039,6 +2224,26 @@ class StoreControl:
             return None
         return {key: status.get(key) for key in ("status", "reason", "provider_id")}
 
+    def guardian_capacity(self, route_id):
+        """``(open frames, max_open_billable_frames)`` from the guardian's read-only answer, or
+        None when no guardian client is composed. A failed or malformed read raises."""
+        if self.guardian_open_frames is None:
+            return None
+        return self.guardian_open_frames(self.routes.get(self.worker, route_id))
+
+    def lease_bounds(self, lease_id):
+        """``(issued_at, hard_expires_at)`` of this worker's own lease (a read)."""
+        from .store import _parse_utc
+
+        rows = self._read(
+            "SELECT issued_at, hard_expires_at FROM execution_leases "
+            "WHERE id = ? AND worker_principal_id = ?",
+            (lease_id, self.worker["id"]),
+        )
+        if not rows:
+            raise LookupError("lease unavailable")
+        return _parse_utc(rows[0]["issued_at"]), _parse_utc(rows[0]["hard_expires_at"])
+
     def guardian_frame_limit(self, route_id):
         """The guardian's own ``max_open_billable_frames`` from the route's status, else None.
 
@@ -2205,6 +2410,22 @@ def project_guardian_final(
     events = closed_record(status.get("start_events"))
     if events is not None:
         projected["start_events"] = events
+    from .salad_guardian import RECONCILE_PROVIDER
+
+    if (
+        status.get("status") == "reconciled"
+        and status.get("reason") == RECONCILE_PROVIDER
+        and status.get("allocation_uncertain") is True
+        and status.get("output_retained") is True
+    ):
+        # Additive: the run retained its output first, then the provider's allocation changed
+        # while the group was stopping, so the guardian could only close the frame by the
+        # provider-confirmed reconcile (custody unsealed, outputs never accepted).
+        projected["retained_before_move"] = True
+    if status.get("stop_cause") in SAFETY_STOP_CAUSES:
+        # Additive: the guardian's first stop cause, only when the Salad safety plane stopped the
+        # route for its own health (closed table); control classifies from this record alone.
+        projected["safety_stop_cause"] = status["stop_cause"]
     try:
         _GuardianFinal.model_validate(projected)
     except ValidationError:
@@ -2312,6 +2533,11 @@ def build_executor(config: ExecutorConfig) -> SaladCampaignExecutor:
 
         return SaladSafetyHTTPSClient(**config.custody.client_fields()).status(state)
 
+    def guardian_open_frames(state):
+        from .salad_server import SaladSafetyHTTPSClient
+
+        return SaladSafetyHTTPSClient(**config.custody.client_fields()).open_frames(state)
+
     stage_watch = None
     watcher_block = effective_stage_watcher(config.stage_watcher, state_dir)
     if watcher_block is not None:
@@ -2328,7 +2554,7 @@ def build_executor(config: ExecutorConfig) -> SaladCampaignExecutor:
     return SaladCampaignExecutor(
         config,
         profiles,
-        StoreControl(state_dir, worker, guardian_status),
+        StoreControl(state_dir, worker, guardian_status, guardian_open_frames),
         worker_principal_id=worker["id"],
         importer=trusted_importer(config, worker, state_dir),
         stage_watch=stage_watch,

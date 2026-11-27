@@ -16,7 +16,10 @@ own transaction: the grant reconciled at zero (hold released), the attempt
 ``failed_transient`` / ``not_started`` settled ``unclaimed_zero``, the stage re-queued under
 its own caps (no scientific retry), and a ``blocked`` campaign with no other unknown attempt
 back to ``running``. Nothing is settled here; no termination, charge or provider fact is
-inferred; any refusal names the closed reason and writes nothing. A repeat is a no-op.
+inferred; any refusal names the closed reason and writes nothing. A replay with the same
+idempotency key returns the recorded response; a new request while the runner has not acted yet
+finds the attempts ``requested`` and writes nothing new; once the runner has acted no unknown
+attempt is left, so a new request is refused (409) like any request with nothing to reconcile.
 """
 
 from __future__ import annotations

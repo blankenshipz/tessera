@@ -769,7 +769,7 @@ def test_build_executor_wires_the_guardian_status_through_the_custody_client(tmp
     monkeypatch.setattr(
         module,
         "StoreControl",
-        lambda state_dir, worker, status: captured.setdefault("status", status),
+        lambda state_dir, worker, status, *rest: captured.setdefault("status", status),
     )
     config = h.config.model_copy(update={"custody": h.config.custody})
     module.build_executor(config)
@@ -984,7 +984,7 @@ def test_the_profile_custody_host_is_compared_with_the_workload_name(
     monkeypatch.setattr(live, "_private_bytes", lambda path, cap: b"token")
     monkeypatch.setattr(module, "load_profiles", lambda path: FakeProfiles())
     monkeypatch.setattr(module, "trusted_importer", lambda *a: None)
-    monkeypatch.setattr(module, "StoreControl", lambda state_dir, worker, status: status)
+    monkeypatch.setattr(module, "StoreControl", lambda state_dir, worker, status, *rest: status)
     fields = {"host": host, **({"workload_host": workload_host} if workload_host else {})}
     custody_config = h.config.custody.model_copy(update=fields)
     config = h.config.model_copy(update={"custody": custody_config})

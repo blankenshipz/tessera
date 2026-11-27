@@ -151,6 +151,25 @@ class _GuardianFinal(BaseModel):
     # Present only for a group stopped as a suspected start-failure loop / after an events read.
     start_failure: _StartFailure | None = None
     start_events: _StartEvents | None = None
+    # Present (True) only for a run whose first stop decision was retaining its output, then
+    # closed by the provider-confirmed reconcile after an allocation change while stopping.
+    retained_before_move: Literal[True] | None = None
+    # Present only when the guardian's first recorded stop cause is one the Salad safety plane
+    # made for its own health (``campaign_infra_retry.SAFETY_STOP_CAUSES``, the same closed set).
+    safety_stop_cause: (
+        Literal[
+            "heartbeat_silence",
+            "control_disconnect",
+            "missed_poll",
+            "clock_uncertain",
+            "guardian_restart",
+            "loop_frame_failed",
+            "rate_unknown",
+            "provider_unknown",
+            "provider_unavailable",
+        ]
+        | None
+    ) = None
 
 
 def _final_dump(final: _GuardianFinal) -> dict:
@@ -492,7 +511,7 @@ class SaladWorkerCommands:
                         key: value
                         for key, value in _final_dump(body.guardian_final).items()
                         # Absent unless used, so the stored shape (and its digest) of every
-                        # run without an allocation timeout or a pre-start re-bind is unchanged.
+                        # run without one of these additive records is unchanged.
                         if key
                         not in (
                             "allocation_timeout",
@@ -500,6 +519,8 @@ class SaladWorkerCommands:
                             "route_deadline",
                             "start_failure",
                             "start_events",
+                            "safety_stop_cause",
+                            "retained_before_move",
                         )
                         or value is not None
                     },

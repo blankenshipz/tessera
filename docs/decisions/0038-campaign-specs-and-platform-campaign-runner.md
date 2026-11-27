@@ -578,7 +578,12 @@ failed intent and settled 20 stages `failed_permanent` / `step_refused`.
    amendment and the reduce-only cancel of ADR 0205's never-sent amendment. A refused step inside
    the hook (for example a sticky failed `cancel_route` or `revoke_grant` intent in an unwind)
    fails that attempt through the stage loop's attempt-failure path and the hook goes on to the
-   next attempt; a refusal that still escapes a hook ends that hook only, never the pass.
+   next attempt; a refusal that still escapes a hook ends that hook only, never the pass, and is
+   recorded once per (campaign, provider, step, class) as `campaign.evidence_pass_failed`. One
+   transition follows from this: a late-imported `unknown` attempt whose verified receipt shows the
+   create was never sent is unwound (`_abandon`, `CREATE_NOT_SENT`); if a reduce-only step of that
+   unwind is a sticky refusal, the attempt goes from `unknown` to `failed_permanent` /
+   `step_refused`. Nothing was sent, and the grant keeps the hold until it is reconciled.
 5. **Unblocking does not manufacture unknowns.** `_drive_blocked` records `campaign.unblocked`
    with the runner's clock (`at`); the Salad silent-executor clock restarts at the latest
    `campaign.unblocked` or `campaign.approved` (ADR 0160 amendment). With points 1 and 4, the first

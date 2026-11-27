@@ -268,7 +268,8 @@ class ResearchStore(Store):
         campaign_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """One page of the project's studies; ``campaign_id`` narrows it to the studies that
-        campaign's stages run under (a campaign of many stages fits one page)."""
+        campaign's Salad stages run under (``campaign_salad_stages``: only a Salad stage creates
+        a study for its run; a campaign of many stages fits one page)."""
         if type(offset) is not int or type(limit) is not int or offset < 0 or not 1 <= limit <= 200:
             raise StoreError("Invalid study pagination.")
         connection = sqlite3.connect(self.database_path)

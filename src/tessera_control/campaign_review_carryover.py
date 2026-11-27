@@ -15,7 +15,13 @@ approval of the same review on the immediately preceding attempt covers it exact
 * its review of the same kind is ``approved`` and the reviewer is the same principal;
 * both scopes bind this stage (``_bound``), and their cores, the scope without the ids minted at
   run time, digest identically (never approve more than was reviewed);
-* the stage runs on the same provider, and the earlier review's own expiry has not passed.
+* the stage runs on the same provider, and the person's approval is still valid: traced back
+  through any chain of carryovers to the root decision a person resolved (the reviewer), it was
+  given before that review's pending deadline and is less than ``APPROVAL_HOURS`` past its
+  proposal. The earliest end along the chain governs, so a carryover never extends the window.
+  The pending deadline itself (``expires_at``, which the campaign grant may shorten and which
+  can fall exactly at the lease's lapse) bounds when the person may answer, not how long the
+  answer holds.
 
 Anything else leaves the new review pending for a person. The check runs twice: on the runner
 (whether to try) and again inside the resolving transaction (``authorize``), which records
@@ -27,11 +33,12 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .campaign_salad_lease_lapse import (
     LEASE_LAPSED_BEFORE_ROUTE,
+    LEASE_WINDOW_SHORT_BEFORE_ROUTE,
     REQUEUE_EVENT,
     WORKER_UNAVAILABLE_BEFORE_ROUTE,
 )
@@ -39,7 +46,9 @@ from .store import Forbidden, _parse_utc
 
 CARRYOVER_EVENT = "campaign.review_approval_carried_over"
 DECLINED_EVENT = "campaign.review_carryover_declined"
-LAPSE_REASONS = frozenset({LEASE_LAPSED_BEFORE_ROUTE, WORKER_UNAVAILABLE_BEFORE_ROUTE})
+LAPSE_REASONS = frozenset(
+    {LEASE_LAPSED_BEFORE_ROUTE, WORKER_UNAVAILABLE_BEFORE_ROUTE, LEASE_WINDOW_SHORT_BEFORE_ROUTE}
+)
 _COLUMNS = {"plan": "plan_decision_id", "source_use": "source_decision_id"}
 
 NOT_PENDING = "review_not_pending"
@@ -51,6 +60,10 @@ OTHER_PROVIDER = "other_provider"
 UNBOUND = "unbound_scope"
 DIGEST_MISMATCH = "digest_mismatch"
 EXPIRED = "prior_review_expired"
+OTHER_RESOLVER = "other_resolver"
+BROKEN_CHAIN = "carryover_chain_broken"
+APPROVAL_HOURS = 23  # a person's approval holds this long past the proposal (DECISION_HOURS)
+MAX_CHAIN = 16
 _DENIED = "Campaign review carryover does not authorize this review."
 
 
@@ -61,6 +74,7 @@ class Carryover:
     prior_attempt: int | None = None
     attempt: int | None = None
     digest: str | None = None
+    root_decision_id: str | None = None
 
 
 def _scope(row: sqlite3.Row) -> dict[str, Any] | None:
@@ -69,6 +83,44 @@ def _scope(row: sqlite3.Row) -> dict[str, Any] | None:
     except (TypeError, ValueError):
         return None
     return scope if isinstance(scope, dict) else None
+
+
+def _root_approval(
+    connection: sqlite3.Connection, decision_id: str, now: datetime
+) -> tuple[sqlite3.Row | None, str | None]:
+    """Follow carryover events back to the decision a person resolved; (root, None) when every
+    link was approved inside its pending deadline and is within the approval window, else
+    (None, reason). Fail closed on a missing, cyclic or over-long chain."""
+    seen: set[str] = set()
+    current = decision_id
+    while True:
+        if current in seen or len(seen) >= MAX_CHAIN:
+            return None, BROKEN_CHAIN
+        seen.add(current)
+        row = connection.execute(
+            "SELECT * FROM decision_requests WHERE id=?", (current,)
+        ).fetchone()
+        if row is None or row["status"] != "approved":
+            return None, PRIOR_NOT_APPROVED
+        try:
+            resolved = _parse_utc(row["resolved_at"])
+            if resolved >= _parse_utc(row["expires_at"]) or now >= _parse_utc(
+                row["created_at"]
+            ) + timedelta(hours=APPROVAL_HOURS):
+                return None, EXPIRED
+        except (TypeError, ValueError):
+            return None, EXPIRED
+        link = connection.execute(
+            """SELECT json_extract(payload_json,'$.carried_from_decision_id') AS source
+            FROM events WHERE event_type=?
+            AND json_extract(payload_json,'$.decision_id')=? LIMIT 1""",
+            (CARRYOVER_EVENT, current),
+        ).fetchone()
+        if link is None:
+            return row, None
+        if not link["source"]:
+            return None, BROKEN_CHAIN
+        current = link["source"]
 
 
 def evaluate(
@@ -135,11 +187,15 @@ def evaluate(
         return Carryover(OTHER_REVIEWER, base.prior_decision_id, base.prior_attempt)
     if prior["provider_id"] != current["provider_id"]:
         return Carryover(OTHER_PROVIDER, base.prior_decision_id, base.prior_attempt)
-    try:
-        if (now or datetime.now(UTC)) >= _parse_utc(approved["expires_at"]):
-            return Carryover(EXPIRED, base.prior_decision_id, base.prior_attempt)
-    except (TypeError, ValueError):
-        return Carryover(EXPIRED, base.prior_decision_id, base.prior_attempt)
+    root, problem = _root_approval(connection, prior["decision_id"], now or datetime.now(UTC))
+    if root is None:
+        return Carryover(problem or EXPIRED, base.prior_decision_id, base.prior_attempt)
+    if (
+        root["resolved_by_principal_id"] != decision["reviewer_principal_id"]
+        or root["kind"] != decision["kind"]
+        or root["project_id"] != decision["project_id"]
+    ):
+        return Carryover(OTHER_RESOLVER, base.prior_decision_id, base.prior_attempt)
     salad = connection.execute(
         "SELECT * FROM campaign_salad_stages WHERE campaign_id=? AND stage_key=?",
         (campaign_id, stage_key),
@@ -158,7 +214,12 @@ def evaluate(
     digest = review_core_digest(new_scope)
     if digest != review_core_digest(old_scope):
         return Carryover(DIGEST_MISMATCH, base.prior_decision_id, base.prior_attempt)
-    return Carryover(None, base.prior_decision_id, base.prior_attempt, base.attempt, digest)
+    root_scope = _scope(root)
+    if root_scope is None or review_core_digest(root_scope) != digest:
+        return Carryover(DIGEST_MISMATCH, base.prior_decision_id, base.prior_attempt)
+    return Carryover(
+        None, base.prior_decision_id, base.prior_attempt, base.attempt, digest, root["id"]
+    )
 
 
 def available(
@@ -235,6 +296,7 @@ def authorize(
             "carried_from_decision_id": prior_id,
             "carried_from_attempt": verdict.prior_attempt,
             "review_digest": verdict.digest,
+            "root_decision_id": verdict.root_decision_id,
         },
     )
 
@@ -260,6 +322,7 @@ def summary(connection: sqlite3.Connection, campaign_id: str) -> list[dict[str, 
                     "carried_from_decision_id",
                     "carried_from_attempt",
                     "review_digest",
+                    "root_decision_id",
                 )
             }
         )

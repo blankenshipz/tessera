@@ -107,6 +107,14 @@ is **not** reconciled: it stays `unknown`, the stage `blocked_unknown` and the c
 before. Alternating classes are bounded only by the five attempt numbers; the same applies
 when attempt numbers are exhausted.
 
+Two pre-route Salad releases use this bound differently, on purpose: ADR 0205's never-sent
+release (`executor_silent_never_sent`) and this ADR's lease-lapse amendment below. Their attempt
+was already released at 0 on the store's own proof that nothing was sent, so there is no unknown
+left for a person to reconcile. Past the bound the release stands and the attempt is closed
+`t1_salad_unclaimed` instead of `not_started`, so the stage's own scientific retry bound ends it.
+The repeat count is of trailing consecutive tagged attempts, so a `t1_salad_unclaimed` resets it;
+the five attempt numbers still cap the stage overall.
+
 ### 5. Where it runs
 
 The campaign runner applies it on every tick, so it runs at service startup (the first tick

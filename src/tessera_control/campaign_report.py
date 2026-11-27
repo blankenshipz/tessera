@@ -47,9 +47,14 @@ _FAILURES = {
     "was retried",
     "infra_salad_provisioning_overrun": "the cloud machine was still starting when the time ran "
     "out, so it was retried",
+    "infra_salad_guardian_unavailable": "the cloud safety service was briefly unavailable "
+    "before the run started, so it was retried",
     "infra_salad_reallocated": "the cloud provider moved the run to another machine, so it "
     "was retried",
+    "infra_salad_safety_stop": "the cloud safety service stopped the run for its own health "
+    "(not because of the stage), so it was retried",
     "start_failure_suspected": "the container failed to start on several cloud machines",
+    "salad_container_exited_nonzero": "the container process exited with a failing code",
     "salad_interrupted": "the cloud provider interrupted the run after it had started",
     "not_started": "it was never started",
     "exit_confirmed_unresolved": "the program was confirmed to have exited but its result could "

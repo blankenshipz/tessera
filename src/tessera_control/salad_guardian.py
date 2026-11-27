@@ -39,6 +39,7 @@ SERVICE_STOP_CAUSES = frozenset(
         "cost_cap",  # the frame's worst-case exposure passed its approved cost cap
         "total_cap",  # the aggregate cap over every frame was breached
         "loop_frame_failed",  # the frame's loop pass raised and it was failed closed
+        "container_exited_nonzero",  # the container process exited non-zero (salad_exit_watch)
         GUARDIAN_RESTART_CAUSE,
         CONTROL_CANCEL_CAUSE,
         STOP_ONLY_RECOVERY_CAUSE,
@@ -585,6 +586,13 @@ class SaladGuardian:
             # Additive: present only when the workload reported its own failure.
             code = exit_event[0][len(WORKLOAD_EXIT_PREFIX) :]
             result["workload_exit_code"] = None if code == "None" else int(code)
+        if self.db.execute(
+            "SELECT 1 FROM events WHERE operation=? AND kind=? LIMIT 1",
+            (operation, OUTPUT_RETAINED_MARK),
+        ).fetchone():
+            # Additive: the operation's first stop decision was the retention of its output
+            # (``complete``), never a failure, a cap or a deadline.
+            result["output_retained"] = True
         failure = self._event_json(operation, START_FAILURE_PREFIX)
         if failure is not None and type(failure.get("machines")) is int:
             # Additive: present only for a group stopped as a suspected start-failure loop.

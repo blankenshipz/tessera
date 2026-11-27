@@ -34,6 +34,7 @@ from .campaign_infra_retry import (
     SALAD_INTERRUPTED,
     infra_attempts,
     provisioning_overrun,
+    safety_stop_cause,
 )
 from .campaign_models import (
     SALAD_TARGET,
@@ -67,6 +68,7 @@ from .salad_campaign_profiles import (
     stage_data_policy,
     target_policy,
 )
+from .salad_guardian import RECONCILE_PROVIDER
 from .salad_precreate import sent_launch_effects
 from .salad_termination import (
     UNCONFIRMED_CODE,
@@ -80,6 +82,11 @@ from .store import Conflict, _parse_utc, canonical_digest
 # Failure detail of an attempt whose live receipt shows the run ended before any create was
 # sent (ADR 0205); it is unwound as unclaimed (``t1_salad_unclaimed``).
 CREATE_NOT_SENT = "live_check_create_not_sent"
+# A create never sent because the guardian's open-frame fence was full at the reserve
+# (``single_operation_orphan_exposure``, the race the executor's pre-launch capacity read cannot
+# close): a wait for capacity, requeued as not started within ADR 0046's repeat bound.
+FRAME_FENCE_BEFORE_CREATE = "guardian_frame_fence_before_create"
+FRAME_FENCE_REFUSAL = "single_operation_orphan_exposure"
 
 if TYPE_CHECKING:
     from .campaign_runner import CampaignRunner, _Ctx
@@ -407,6 +414,48 @@ def _was_interrupted(attempt: dict[str, Any]) -> bool:
     recorded the class) the detail the verdict step wrote."""
     detail = str(attempt.get("failure_detail") or "").removeprefix("salad:")
     return attempt.get("failure_class") == SALAD_INTERRUPTED or detail.startswith(SALAD_INTERRUPTED)
+
+
+# Classes of a move the provider itself made, its stop confirmed by its own read and an exited
+# worker, whose custody could not be placed after the move (``infra_salad_reallocated``) or was
+# the guardian's pre-custody word (``provider_reallocated_before_custody``). The guardian closes
+# such a frame by the provider-confirmed reconcile, so its final reads ``reconciled`` with
+# ``allocation_uncertain`` set, never ``stopped``.
+PROVIDER_MOVED_CLASSES = (INFRA_SALAD_REALLOCATED, REALLOCATED_PRECUSTODY)
+
+
+def _provider_moved(attempt: dict[str, Any]) -> bool:
+    """The attempt ended on a provider-confirmed move (``PROVIDER_MOVED_CLASSES``): its class or,
+    before the runner has recorded it, the detail control's own verify step wrote from the
+    route's provider read (never a receipt reason)."""
+    detail = str(attempt.get("failure_detail") or "").removeprefix("salad:")
+    return attempt.get("failure_class") in PROVIDER_MOVED_CLASSES or detail.startswith(
+        PROVIDER_MOVED_CLASSES
+    )
+
+
+def _recorded_final(row: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        found = json.loads(row.get("guardian_final_json") or "null")
+    except ValueError:
+        return None
+    return found if type(found) is dict else None
+
+
+def _retained_before_move(row: dict[str, Any]) -> bool:
+    """The executor's recorded guardian final says the run retained its output first and the
+    frame was then closed by the provider-confirmed reconcile after an allocation change while
+    stopping (custody unsealed): a provider-confirmed move, settled like one."""
+    final = _recorded_final(row)
+    return final is not None and final.get("retained_before_move") is True
+
+
+def _safety_stopped(row: dict[str, Any]) -> bool:
+    """The executor's recorded guardian final names a safety-plane stop cause (closed table)."""
+    try:
+        return safety_stop_cause(json.loads(row.get("guardian_final_json") or "null")) is not None
+    except ValueError:
+        return False
 
 
 class SaladStageDriver:
@@ -1931,6 +1980,12 @@ class SaladStageDriver:
             # An honest receipt of a run that ended before any create was sent (a pre-create
             # read timeout, a refused reserve): nothing was allocated or spent, so it takes
             # the same unclaimed unwind as a run with no receipt, with no person (ADR 0205).
+            receipt = json.loads(row["live_receipt_json"] or "{}")
+            if (
+                type(receipt) is dict
+                and receipt.get("create_preflight_refusal") == FRAME_FENCE_REFUSAL
+            ):
+                return self._abandon(ctx, stage, spec_stage, attempt, FRAME_FENCE_BEFORE_CREATE)
             return self._abandon(ctx, stage, spec_stage, attempt, CREATE_NOT_SENT)
         verdict, detail, evidence = self.verify_outcome(ctx, attempt, row)
         if verdict == "unknown" and detail in (UNCONFIRMED_CODE, UNCONFIRMED_NEW_ALLOCATION_CODE):
@@ -2318,6 +2373,24 @@ class SaladStageDriver:
         done = self.unwind(ctx, key, attempt)
         if done:
             failure_class, detail = "t1_salad_unclaimed", reason
+            if reason == FRAME_FENCE_BEFORE_CREATE:
+                # The guardian's open-frame fence was full when the create's reserve asked: a
+                # wait for capacity, not a failure of the attempt. Free (not started) within the
+                # repeat bound; past it, the ordinary never-sent handling below decides.
+                others = [a for a in self.runner._attempts(ctx, key) if a["id"] != attempt["id"]]
+                repeats = repeat_count(others, reason)
+                if repeats < MAX_AUTO_REQUEUES:
+                    failure_class = NOT_STARTED
+                    detail = (
+                        f"{reason}: the guardian's open-frame limit was full at the reserve; "
+                        f"nothing was sent to the provider; released at 0 ({reason})"
+                    )
+                else:
+                    reason = CREATE_NOT_SENT
+                    detail = (
+                        f"{CREATE_NOT_SENT}; not requeued as not started: "
+                        f"{FRAME_FENCE_BEFORE_CREATE} repeated {repeats + 1} times"
+                    )
             if reason == SILENT_NEVER_SENT:
                 detail = (
                     f"{reason}: the route window passed and control holds no create or start "
@@ -2352,7 +2425,7 @@ class SaladStageDriver:
                 )
                 if used < limit:
                     failure_class = INFRA_SALAD_CREATE_NOT_SENT
-                    detail = f"{reason}; infrastructure failure, retry {used + 1} of {limit}"
+                    detail = f"{detail}; infrastructure failure, retry {used + 1} of {limit}"
             self.runner._set_attempt(
                 attempt["id"],
                 status="failed_transient",
@@ -2551,14 +2624,29 @@ class SaladStageDriver:
         raise _waiting()()
 
     def _clean_guardian(
-        self, attempt: dict[str, Any], row: dict[str, Any], *, interrupted: bool = False
+        self,
+        attempt: dict[str, Any],
+        row: dict[str, Any],
+        *,
+        interrupted: bool = False,
+        provider_close: bool = False,
     ) -> Decimal | None:
         """The estimate (cents) when the guardian final is clean and the verdict is
         ``ok``/``failed``; None for anything missing, malformed or not clean.
 
         ``interrupted`` (the guardian stopped on an allocation change after custody began, the
         provider's read confirmed) tolerates exactly the ``allocation_uncertain`` flag that cause
-        sets, and only when the final's own reason is that cause."""
+        sets, when the final's own reason is that cause or the final is ``reconciled``. It also
+        accepts a ``reconciled`` final: after a confirmed interruption the guardian may only
+        reconcile the frame (a ``stop_only`` refusal of the live check's cancel), and the
+        provider's own read already confirmed the stop.
+
+        ``provider_close`` (a provider-confirmed move, or a safety-plane stop) also accepts a
+        ``reconciled`` final, but only one the guardian reached by the safety service's own
+        provider-confirmed close (reason ``RECONCILE_PROVIDER``: a fresh exact read of the group
+        stopped with zero instances); an operator's attested reconcile never qualifies. That close
+        is reached only from an uncertain allocation, so it tolerates exactly that flag. Every
+        other flag still refuses."""
         if attempt.get("salad_verdict") not in ("ok", "failed"):
             return None
         if row.get("guardian_final_json") is None:
@@ -2571,8 +2659,18 @@ class SaladStageDriver:
             return None
         # Fails safe: if a real final words its reason differently, the flag is not tolerated
         # and the attempt waits for a charge (held), never under-recorded. Not checked live.
+        closed_by_provider = (
+            provider_close and final.status == "reconciled" and final.reason == RECONCILE_PROVIDER
+        )
+        stopped = (
+            final.status == "stopped"
+            or (interrupted and final.status == "reconciled")
+            or closed_by_provider
+        )
         uncertain = final.allocation_uncertain and not (
-            interrupted and final.reason == "allocation_changed"
+            (interrupted and (final.reason == "allocation_changed" or final.status == "reconciled"))
+            or (provider_close and final.reason == "allocation_changed")
+            or closed_by_provider
         )
         flags = (
             final.orphan,
@@ -2582,7 +2680,7 @@ class SaladStageDriver:
             final.rate_unknown,
         )
         if (
-            final.status != "stopped"
+            not stopped
             or any(flags)
             or not rate.is_finite()
             or rate <= 0
@@ -2615,13 +2713,28 @@ class SaladStageDriver:
             if estimate is None or hold < 1 or math.ceil(estimate) > hold:
                 return None
             return max(1, math.ceil(estimate))
-        estimate = self._clean_guardian(attempt, row)
+        if _provider_moved(attempt) or _retained_before_move(row):
+            # The provider moved the instance and its own read confirmed the stop (control's
+            # verify step; never a receipt reason). The guardian accrued only while it saw the
+            # group running and froze accrual at its provider-confirmed close, so its estimate
+            # bounds the cost: settle it rounded up and at least one cent (custody may have
+            # begun, so never zero), within the hold. Provisional like every bounded hold: a
+            # recorded charge raises or confirms it (``late_charges``).
+            estimate = self._clean_guardian(attempt, row, provider_close=True)
+            if estimate is None or hold < 1 or math.ceil(estimate) > hold:
+                return None
+            return max(1, math.ceil(estimate))
+        # A safety-plane stop settles like any failed run (the whole hold), also when the
+        # guardian could only close the frame by the provider-confirmed reconcile.
+        estimate = self._clean_guardian(attempt, row, provider_close=_safety_stopped(row))
         if estimate is None or hold < 1 or math.ceil(estimate) > hold:
             return None
         return hold
 
     def _read_verdict(self, attempt: dict[str, Any], row: dict[str, Any]) -> bool:
-        """Read the guardian's per-frame record ourselves; True only when it says ``stopped``.
+        """Read the guardian's per-frame record ourselves; True only when it says ``stopped``
+        (or, for a provider-confirmed interruption, ``reconciled``: the guardian closed the
+        frame by reconciling a stop it could not issue itself, ``stop_only``).
 
         The executor's recorded final supplies the cost estimate (``_clean_guardian``) but never
         the verdict: a bounded-hold settlement needs control's own read of the guardian record
@@ -2668,7 +2781,19 @@ class SaladStageDriver:
                     record_digest=record["record_digest"],
                     now=now,
                 )
-                if record["verdict"] != "stopped":
+                # A provider-confirmed interruption or move, or a safety-plane stop, may close
+                # only by the guardian's reconcile; ``_clean_guardian`` separately requires the
+                # recorded final's own shape (for a move or a safety stop, the provider-confirmed
+                # close, never an operator attestation).
+                closed = (
+                    {"stopped", "reconciled"}
+                    if _was_interrupted(attempt)
+                    or _provider_moved(attempt)
+                    or _retained_before_move(row)
+                    or _safety_stopped(row)
+                    else {"stopped"}
+                )
+                if record["verdict"] not in closed:
                     return False
                 frame = frames.get_frame(connection, frame["frame_id"], tenant)
                 if frame["guardian_verdict_digest"] is None:

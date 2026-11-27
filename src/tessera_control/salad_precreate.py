@@ -190,6 +190,12 @@ def dispatch_create(dispatch, read_state, *, clock, sleep, deadline, receipt):
                 or clock() >= deadline
             ):
                 receipt["reason"] = CREATE_NOT_ATTEMPTED
+                code = getattr(error, "code", None)
+                if code in TRANSIENT_RESERVE_REFUSALS:
+                    # The guardian's own closed refusal code of the last reserve (absent
+                    # otherwise, so every other receipt keeps its digest): control requeues a
+                    # full open-frame fence as not started instead of spending a retry.
+                    receipt["create_preflight_refusal"] = code
                 raise
             receipt["create_preflight_retries"] = receipt.get("create_preflight_retries", 0) + 1
             pause = CREATE_PREFLIGHT_BACKOFF_SECONDS[

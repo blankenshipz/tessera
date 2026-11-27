@@ -150,8 +150,10 @@ cost. The live receipt read `inconclusive` / `custody_stop_or_reconnect_unresolv
    `unclaimed_zero`. The stage is re-queued under its own caps, with no scientific retry. A `blocked` campaign
    with no other unknown attempt returns to `running`. The events carry `automatic: false` and
    `requested_by_principal_id`, and such requests do not count toward the automatic limit. A changed
-   evidence digest voids the request. A refusal names the closed reason and writes nothing, and a repeat is a
-   no-op. This route exists because `reconcile-unclaimed-salad` on its own lets the blocked pass settle the
+   evidence digest voids the request. A refusal names the closed reason and writes nothing. A replay with
+   the same idempotency key returns the recorded response; a new request before the runner acts finds the
+   attempts `requested` and writes nothing new; after the runner acted, nothing is left to reconcile and a
+   new request is refused (409). This route exists because `reconcile-unclaimed-salad` on its own lets the blocked pass settle the
    attempt `failed_permanent`. It never infers a termination and never charges.
 
 6. **A refusal from a build before the record (q-2704 follow-up).** Builds before v0.103.0 (v0.102.0) ran
@@ -219,7 +221,9 @@ block were permanent.
    stage is requeued under its own caps (an attempt number, no scientific retry). The detail carries
    the `(executor_silent_never_sent)` tag, so ADR 0046's identical-repeat bound (`MAX_AUTO_REQUEUES`)
    applies: past it, the release at 0 stands but the attempt keeps `t1_salad_unclaimed` and the stage's
-   scientific retry bound ends it (`campaign.autoreconcile_stopped`).
+   scientific retry bound ends it (`campaign.autoreconcile_stopped`). This deliberately differs from ADR
+   0046's main path (`unknown`, the stage `blocked_unknown`, and a person): the release at 0 already
+   stands on the store's proof, so nothing is left unknown (see ADR 0046, "Repeats of the same reason").
 2. **Already-unknown attempts in that shape.** For an attempt already `unknown` as `executor silent past
    the route window` whose route still wants to run and was provably never sent, the evidence pass (ADR
    0038 amendment, 2026-11-26) issues the reduce-only `cancel_route` when the only unclaimed refusal is

@@ -66,6 +66,61 @@ INFRA_SALAD_REALLOCATED = "infra_salad_reallocated"
 INFRA_SALAD_PROVISIONING_OVERRUN = "infra_salad_provisioning_overrun"
 PROVISIONING_OVERRUN_RUNNING_SECONDS = 60
 
+# The guardian's IPC was unavailable (a restart) while the trusted server minted the input ticket
+# or confirmed its delivery, so the live check failed before any start effect: an outage of our
+# own infrastructure, never the stage's logic. Retried within ``retry.infra_retries``; the
+# receipt names the class and the exception type (``GuardianUnavailable``). Settles as the
+# receipt's failed attempt always did (never a new charge or a zeroed estimate).
+INFRA_SALAD_GUARDIAN_UNAVAILABLE = "infra_salad_guardian_unavailable"
+GUARDIAN_UNAVAILABLE_PRESTART_CLASSES = frozenset(
+    {"ticket_mint_failed", "input_delivery_unconfirmed"}
+)
+
+
+# The Salad safety plane (guardian or safety service) stopped the route for its own health, not
+# for anything the stage did: control fell silent, the service restarted, the provider or the
+# published rate could not be read, the service clock was uncertain, or the frame's own loop pass
+# failed closed. The stop is correct and fail-closed; it is not evidence about the stage. Only the
+# guardian's FIRST recorded stop cause, carried on the executor's recorded guardian final
+# (``safety_stop_cause``) and validated against this closed table, selects the class; a cause
+# only on the live receipt never does. Retried within ``retry.infra_retries`` (then the
+# class/profile fallback). Settlement is unchanged: the whole bounded hold on a clean final, or a
+# recorded charge. Never in this table: ``cost_cap``, ``total_cap``, ``deadline``,
+# ``control_cancel``, ``workload_failed:*``, ``start_failure_suspected``, ``allocation_changed``
+# or ``allocation_timeout`` (each has its own class or is the stage's own).
+INFRA_SALAD_SAFETY_STOP = "infra_salad_safety_stop"
+SAFETY_STOP_CAUSES = frozenset(
+    {
+        "heartbeat_silence",
+        "control_disconnect",
+        "missed_poll",
+        "clock_uncertain",
+        "guardian_restart",
+        "loop_frame_failed",
+        "rate_unknown",
+        "provider_unknown",
+        "provider_unavailable",
+    }
+)
+
+# Transient Salad infrastructure classes the runner retries through ``_placement_failure``
+# (one ``retry.infra_retries`` each; with none left, the class/profile fallback decides and the
+# attempt fails permanently under the same class, never ``salad_not_passed``).
+PLACEMENT_RETRY_CLASSES = frozenset(
+    {
+        INFRA_SALAD_REALLOCATED,
+        INFRA_SALAD_PROVISIONING_OVERRUN,
+        INFRA_SALAD_GUARDIAN_UNAVAILABLE,
+        INFRA_SALAD_SAFETY_STOP,
+    }
+)
+
+
+def safety_stop_cause(final: object) -> str | None:
+    """The recorded guardian final's safety-plane stop cause when it is in the closed table."""
+    cause = final.get("safety_stop_cause") if type(final) is dict else None
+    return cause if cause in SAFETY_STOP_CAUSES else None
+
 
 def provisioning_overrun(route_deadline: object) -> bool:
     """True for the guardian's route-limit record of a run that never got going (see above)."""

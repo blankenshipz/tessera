@@ -173,7 +173,8 @@ def list_studies(
     campaign_id: str | None = Query(default=None, min_length=1, max_length=200),
 ) -> dict[str, Any]:
     """A page of the project's studies (page with ``offset`` until a short page); with
-    ``campaign_id``, only the studies that campaign's stages run under."""
+    ``campaign_id``, only the studies that campaign's Salad stages run under (the only stages
+    that create one)."""
     return {"studies": store.list_studies(actor, project_id, offset, limit, campaign_id)}
 
 

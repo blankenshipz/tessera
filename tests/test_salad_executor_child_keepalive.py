@@ -89,9 +89,10 @@ def test_other_leases_and_the_registry_stay_alive_while_a_serial_child_runs(tmp_
     log = harness.executor.run_once()
 
     assert seen["done"] is True
-    # The running route's own lease is its child's to renew, never the keepalive's: every
-    # renewal of ``lease_1`` is the pass's own (once, before launch).
-    assert control.count("renew", "lease_1") == 1
+    # The running route's own lease is renewed by the pass before launch and, since v0.108.0,
+    # by the keepalive too (its child sends no renewal in its tail, nor while the route is
+    # finished): more than the one pre-launch renewal.
+    assert control.count("renew", "lease_1") >= 2
     assert "att_review" not in harness.executor.fenced
     assert not [a for a in log if a["action"] in {"lease_renewal_refused", "heartbeat_failed"}]
     # The keepalive stopped with the child: no call arrives after the pass returned.

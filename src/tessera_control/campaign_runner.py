@@ -71,8 +71,7 @@ from .campaign_infra_retry import (
     INFRA_ALLOCATION_TIMEOUT,
     INFRA_CONTAINER_KILLED,
     INFRA_RESOURCE_LIMIT,
-    INFRA_SALAD_PROVISIONING_OVERRUN,
-    INFRA_SALAD_REALLOCATED,
+    PLACEMENT_RETRY_CLASSES,
     REALLOCATED_PRECUSTODY,
     RESOURCE_LIMIT_CLASSES,
     SALAD_INTERRUPTED,
@@ -185,6 +184,8 @@ MAX_UNCLAIMED_AUTORECONCILE_LIMIT = 10
 MAX_STAGE_LOOPS = 12
 # The attempt-number range of campaign_stage_attempts.
 MAX_ATTEMPT_NUMBERS = 5
+# One per (campaign, provider, step, class): a refusal that escaped a provider evidence hook.
+EVIDENCE_PASS_FAILED_EVENT = "campaign.evidence_pass_failed"
 # Step slot of a snapshot release renewed before its grant is issued (ADR 0048).
 RELEASE_RENEWAL_ORDINAL = 2
 RELEASE_SLACK_SECONDS = 120
@@ -1703,7 +1704,47 @@ class CampaignRunner:
                 # A hook routes its own per-attempt refusals to the attempt-failure path; one
                 # that still escapes ends that hook only, never the pass (the stage loop runs).
                 self._actions.append(f"evidence_failed:{ctx.campaign['id']}:{error.error_class}")
+                self._note_evidence_failed(ctx, provider, error)
                 continue
+
+    def _note_evidence_failed(self, ctx: _Ctx, provider: Any, error: StepFailed) -> None:
+        """One ``campaign.evidence_pass_failed`` event per (campaign, provider, step, class), so a
+        refusal that escaped an evidence hook is visible on the campaign, not only as a runner
+        action. Descriptive only: it changes no state, and a failure to record it never stops
+        the pass."""
+        descriptor = getattr(provider, "descriptor", None)
+        provider_id = str(getattr(descriptor, "provider_id", "") or "")[:80]
+        payload = {
+            "provider": provider_id,
+            "step": str(error.step)[:80],
+            "error_class": str(error.error_class)[:80],
+        }
+        try:
+            with self.store.runner_connection() as connection:
+                # Review F1: a runner that lost the lease writes nothing (as in
+                # ``_record_blocked_settlements``).
+                self._hold_lease(connection)
+                seen = connection.execute(
+                    """SELECT 1 FROM events WHERE project_id=? AND event_type=?
+                    AND json_extract(payload_json,'$.campaign_id')=?
+                    AND json_extract(payload_json,'$.provider')=?
+                    AND json_extract(payload_json,'$.step')=?
+                    AND json_extract(payload_json,'$.error_class')=? LIMIT 1""",
+                    (
+                        ctx.campaign["project_id"],
+                        EVIDENCE_PASS_FAILED_EVENT,
+                        ctx.campaign["id"],
+                        payload["provider"],
+                        payload["step"],
+                        payload["error_class"],
+                    ),
+                ).fetchone()
+                if seen is None:
+                    self.store.record_runner_event(
+                        connection, ctx.campaign, EVIDENCE_PASS_FAILED_EVENT, payload
+                    )
+        except (sqlite3.Error, _LeaseLost):  # descriptive only: the pass goes on
+            return
 
     def _still_forward_legal(self, ctx: _Ctx) -> bool:
         """The campaign, re-read now, still admits forward steps (``running``/``stopping``)."""
@@ -4761,13 +4802,11 @@ class CampaignRunner:
             status, detail = self._placement_failure(
                 ctx, stage["stage_key"], spec_stage, attempt, detail
             )
-        elif (
-            failure_class in {INFRA_SALAD_REALLOCATED, INFRA_SALAD_PROVISIONING_OVERRUN}
-            and status == "failed_transient"
-        ):
-            # The provider's own move without a custody word, or a placed machine that never got
-            # going before the route limit: spends one infra retry; with none left the attempt
-            # (and so the stage) fails permanently under the same class.
+        elif failure_class in PLACEMENT_RETRY_CLASSES and status == "failed_transient":
+            # The provider's own move without a custody word, a placed machine that never got
+            # going before the route limit, or a stop the Salad safety plane made for its own
+            # health (``infra_salad_safety_stop``): spends one infra retry; with none left the
+            # attempt (and so the stage) fails permanently under the same class.
             status, detail = self._placement_failure(
                 ctx, stage["stage_key"], spec_stage, attempt, detail
             )

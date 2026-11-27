@@ -474,7 +474,9 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
   `blocked` campaign with no other unknown attempt returns to `running`. The events carry
   `automatic: false` and `requested_by_principal_id`. If the evidence changes, the request no
   longer applies. A request that finds nothing reconcilable refuses with each attempt's reason
-  and writes nothing, and a repeat does nothing. Do not use `reconcile-unclaimed-salad` on its
+  and writes nothing. A same-key replay returns the recorded response; a new request before the
+  runner acts finds the attempts `requested` and writes nothing new; after the runner acted it is
+  refused (409), since nothing is left to reconcile. Do not use `reconcile-unclaimed-salad` on its
   own for such an attempt: it releases the hold, but the runner's blocked pass then settles the
   attempt `failed_permanent`, which ends the stage. Never record an invented termination or a
   token charge to unblock it.

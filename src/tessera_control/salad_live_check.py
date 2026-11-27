@@ -21,6 +21,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from .salad_events import closed_record
+from .salad_exit_watch import container_exit_receipt
 from .salad_guardian import START_FAILURE_REASON
 from .salad_running_latch import RunningLatch
 from .salad_workload_contract import WORKLOAD_FAILED_CAUSE_PREFIX, WORKLOAD_FAILURE_REASONS
@@ -56,6 +57,13 @@ PRESTART_FAILURE_CLASSES = frozenset(
     }
 )
 
+
+# Pre-start input delivery while the guardian does not answer (a busy guardian after a
+# restart): retried after these pauses, at most DELIVERY_RETRY_ATTEMPTS times and within
+# DELIVERY_RETRY_SECONDS of the first failure, staying inside the guardian's 30 s beat bound.
+DELIVERY_RETRY_ATTEMPTS = 3
+DELIVERY_RETRY_BACKOFF_SECONDS = (2, 4, 8)
+DELIVERY_RETRY_SECONDS = 20
 
 PRESTART_STEPS = (
     "create",
@@ -1213,6 +1221,11 @@ def _note_start_evidence(receipt, evidence):
     for key in ("start_failure", "start_events"):
         if evidence.get(key) is not None:
             receipt["guardian_" + key] = evidence[key]
+    exited = container_exit_receipt(evidence.get("start_events"))
+    if exited is not None:
+        # A non-zero process exit: its code(s), and a closed token that no stderr tail was
+        # available (the trusted read is system events, which carry no process output).
+        receipt["guardian_container_exit"] = exited
 
 
 def _cause(value):
@@ -2457,6 +2470,51 @@ def _drive(
         }
         return transient
 
+    def deliver_inputs_retrying():
+        """``session.deliver_inputs`` with a bounded retry while the guardian is unavailable.
+
+        The group is created but stopped (unbilled) and nothing has started. A guardian that
+        does not answer (``GuardianUnavailable``: busy after a restart, socket not up yet) is
+        not a refusal, so delivery is tried again, re-minting the ticket (a reissue revokes the
+        earlier one), after a short pause and a guardian beat, at most
+        DELIVERY_RETRY_ATTEMPTS times and within DELIVERY_RETRY_SECONDS of the first failure,
+        never past the run deadline. Each retry is recorded on the receipt
+        (``prestart_delivery_retries``, only when one happened). A refusal, a timeout or any
+        other failure propagates at once, as before."""
+        from .salad_server import GuardianUnavailable
+
+        first = None
+        for attempt in range(DELIVERY_RETRY_ATTEMPTS + 1):
+            try:
+                session.deliver_inputs(route_id)
+                return
+            except PrestartStepError as error:
+                if not isinstance(error.__cause__, GuardianUnavailable):
+                    raise
+                now = clock()
+                first = now if first is None else first
+                pause = DELIVERY_RETRY_BACKOFF_SECONDS[
+                    min(attempt, len(DELIVERY_RETRY_BACKOFF_SECONDS) - 1)
+                ]
+                if (
+                    attempt >= DELIVERY_RETRY_ATTEMPTS
+                    or now - first + pause > DELIVERY_RETRY_SECONDS
+                    or now + pause >= deadline
+                ):
+                    raise
+                receipt.setdefault("prestart_delivery_retries", []).append(
+                    {
+                        "step": _closed_token(error.failure_class),
+                        "exception": "GuardianUnavailable",
+                        "pause_seconds": pause,
+                    }
+                )
+            sleep(pause)
+            try:
+                heartbeat()
+            except Exception:  # noqa: BLE001 - the next delivery decides
+                receipt["prestart_delivery_retries"][-1]["beat_failed"] = True
+
     def settle_beat():
         """heartbeat() during the settle wait; a failure that escapes it is recorded."""
         try:
@@ -2612,7 +2670,7 @@ def _drive(
                 # before start; a failure here never starts it and falls through to the
                 # exact cancel/stop below.
                 step["name"] = "prestart_unclassified"
-                session.deliver_inputs(route_id)
+                deliver_inputs_retrying()
                 receipt["input_delivered"] = True
                 stamp("deliver_inputs")
             step["name"] = "start_failed"

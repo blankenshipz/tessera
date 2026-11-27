@@ -611,8 +611,49 @@ A route the provider itself moved (the route's reallocation flag, the provider's
 group stopped and a confirmed exited worker) whose receipt carries neither guardian custody word
 (another stop cause, or custody unknown) is the transient `infra_salad_reallocated`: never the
 workload's failure, its outputs never accepted, retried within `retry.infra_retries` (then the
-class/profile fallback decides), settled like any failed attempt
-([ADR 0206](decisions/0206-salad-provisioning-not-run-time.md)).
+class/profile fallback decides) ([ADR 0206](decisions/0206-salad-provisioning-not-run-time.md)).
+Since [ADR 0207](decisions/0207-salad-runtime-retry-and-lease-window.md) it settles at the
+guardian's accrued estimate (rounded up, at least one cent, within the hold, provisional) when the
+recorded final is `stopped` or the safety service's provider-confirmed reconcile
+(`provider_confirmed_exact_group_stopped`, only `allocation_uncertain` set) and control's own read
+of the frame record agrees, so its retry needs no person's charge. An operator-attested reconcile
+or any other flag still waits for a charge. A run whose first stop was retaining its output and
+whose allocation then changed while it was stopping (custody unsealed) carries
+`retained_before_move` on its final and is the same retryable move.
+
+## Safety-plane stops are infrastructure
+
+The guardian's first stop cause is carried on the executor's recorded final as
+`safety_stop_cause` only when it is one the safety plane made for its own health:
+`heartbeat_silence`, `control_disconnect`, `missed_poll`, `clock_uncertain`, `guardian_restart`,
+`loop_frame_failed`, `rate_unknown`, `provider_unknown` or `provider_unavailable`. Control then
+records the transient `infra_salad_safety_stop` (retried within `retry.infra_retries`, then the
+class/profile fallback) instead of `salad_not_passed`; a cause seen only on the live receipt never
+selects it. Settlement is unchanged.
+
+## Open-frame capacity before launch
+
+The admin request `{"operation": "open_frames", "reservation": <route reservation digest>}` is a
+read: it returns `open_billable_frames` (counted as the reserve counts them) and
+`max_open_billable_frames`, and writes nothing. The executor asks it before `mark_executing` and
+defers the launch while the limit is full or the answer is unreadable
+([ADR 0207](decisions/0207-salad-runtime-retry-and-lease-window.md)).
+
+## Container exited non-zero
+
+A one-shot container whose process exits with a non-zero code is restarted by Salad and later
+moved to another machine, which used to surface only as an `allocation_changed` stop and a
+`salad_interrupted` (or, since ADR 0206, `infra_salad_reallocated`) retry. While a frame is armed, seen running and has no retained output, the
+service reads the group's system events at most every 30 s (at most 20 reads per frame). When they
+name `instance_exited` with a non-zero code (137 and 143, a kill or platform stop, are excluded),
+it records the start events, sets the stop cause `container_exited_nonzero`, closes the custody
+writers and stops the exact group through the ordinary stop-only path; the provider's own read
+still confirms the stop. Control classifies the attempt `failed_permanent` /
+`salad_container_exited_nonzero` with the exit code in its detail, whatever stop cause the guardian
+recorded, so it never spends `retry.infra_retries`. The receipt carries `guardian_container_exit`
+with the exit codes and `stderr_tail: {"outcome": "unavailable", "reason":
+"no_trusted_log_source"}`: the trusted events read carries no process output. A group whose
+guardian already stopped (a reported workload failure included) is not watched.
 
 ## Allocation change after custody began
 
@@ -621,7 +662,12 @@ true) and the provider's own read confirms the stop, control records the attempt
 `failed_transient` with failure class `salad_interrupted`
 ([ADR 0197](decisions/0197-salad-post-start-interruption-retry.md)). It spends one
 `retry.infra_retries`, settles at the guardian's accrued estimate (provisional, like the bounded
-hold), and its other outputs are never accepted. A checkpoint that custody already holds as the
+hold), and its other outputs are never accepted. The estimate settles (rounded up, at least one
+cent, within the hold) when the guardian's final is `stopped` or, for this case only,
+`reconciled` (the guardian refused the live check's cancel `stop_only` and closed the frame by
+reconciliation), and control's own read of the guardian's frame record says the same. A missing
+estimate, any other flag (orphan, escalation, budget fence, unknown rate, a billed cost) or an
+estimate above the hold still waits for a person's charge. A checkpoint that custody already holds as the
 reserved `checkpoint.bin` output reaches control through a partial manifest (the executor
 imports the sealed, incomplete custody and lists only the hash-verified files that arrived; the
 diagnostic is not required, and such a manifest never verifies as a pass). It is recorded by digest and size and listed in the campaign receipt.

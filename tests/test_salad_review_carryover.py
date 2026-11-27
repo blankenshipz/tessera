@@ -320,3 +320,100 @@ def test_a_registry_row_of_another_credential_is_not_read(tmp_path):
         connection.close()
 
     assert worker_problem(world.driver, _grant(world), datetime.now(UTC)) is None
+
+
+def _iso(delta: timedelta) -> str:
+    return (datetime.now(UTC) + delta).isoformat()
+
+
+def test_an_approval_given_before_a_grant_bound_deadline_still_carries(tmp_path):
+    # The lease lapsed exactly when the pending decision's deadline (the grant) passed: the
+    # person had answered in time, so the approval is still good inside its 23 h window.
+    world = SaladWorld(tmp_path)
+    _requeued_after_approval(world)
+    first = world.salad(attempt=1)
+    for column in ("plan_decision_id", "source_decision_id"):
+        row = _decision(world, first[column])
+        assert datetime.fromisoformat(row["resolved_at"]) < datetime.now(UTC)
+        world.env.execute(
+            "UPDATE decision_requests SET expires_at=? WHERE id=?",
+            _iso(timedelta(seconds=-1)),
+            first[column],
+        )
+        world.env.execute(
+            "UPDATE decision_requests SET resolved_at=? WHERE id=?",
+            _iso(timedelta(seconds=-30)),
+            first[column],
+        )
+
+    _to_review_of_attempt_two(world)
+    world.tick_until(lambda: world.salad(attempt=2)["phase"] == "route_started", limit=30)
+    assert _review_stops(world, 2) == []
+    assert {e["root_decision_id"] for e in world.events(carryover.CARRYOVER_EVENT)} == {
+        first["plan_decision_id"],
+        first["source_decision_id"],
+    }
+
+
+def test_an_approval_older_than_its_window_is_not_carried(tmp_path):
+    world = SaladWorld(tmp_path)
+    _requeued_after_approval(world)
+    first = world.salad(attempt=1)
+    world.env.execute(
+        "UPDATE decision_requests SET created_at=? WHERE id IN (?,?)",
+        _iso(timedelta(hours=-(carryover.APPROVAL_HOURS + 1))),
+        first["plan_decision_id"],
+        first["source_decision_id"],
+    )
+    _to_review_of_attempt_two(world)
+    world.tick(4)
+    assert world.events(carryover.CARRYOVER_EVENT) == []
+    assert {e["reason"] for e in world.events(carryover.DECLINED_EVENT)} == {carryover.EXPIRED}
+
+
+def test_a_chained_carryover_traces_to_the_root_and_never_extends_its_window(tmp_path):
+    world = SaladWorld(tmp_path)
+    _requeued_after_approval(world)
+    first = world.salad(attempt=1)
+    _to_review_of_attempt_two(world)
+    world.tick_until(lambda: world.salad(attempt=2)["phase"] == "route_started", limit=30)
+    second = world.salad(attempt=2)
+    now = datetime.now(UTC)
+    with world.runner.store.runner_connection() as connection:
+        # Attempt 2's decision was resolved by the runner (carried); its root is attempt 1's.
+        root, problem = carryover._root_approval(connection, second["plan_decision_id"], now)
+        assert problem is None and root["id"] == first["plan_decision_id"]
+        assert root["resolved_by_principal_id"] == world.human["id"]
+        # The root's window governs even though attempt 2's own decision is fresh.
+        late = now + timedelta(hours=carryover.APPROVAL_HOURS, minutes=1)
+        assert carryover._root_approval(connection, second["plan_decision_id"], late) == (
+            None,
+            carryover.EXPIRED,
+        )
+        # A broken chain (event names a decision that is gone) fails closed.
+        assert carryover._root_approval(connection, "missing", now) == (
+            None,
+            carryover.PRIOR_NOT_APPROVED,
+        )
+    events = [e for e in world.events(carryover.CARRYOVER_EVENT) if e["kind"] == "plan"]
+    assert events[0]["root_decision_id"] == first["plan_decision_id"]
+
+
+def test_the_root_resolver_must_be_the_reviewer(tmp_path):
+    world = SaladWorld(tmp_path)
+    _requeued_after_approval(world)
+    first = world.salad(attempt=1)
+    other = world.row("SELECT id FROM principals WHERE id<>? LIMIT 1", world.human["id"])
+    assert other is not None
+    world.env.execute(
+        "UPDATE decision_requests SET resolved_by_principal_id=? WHERE id IN (?,?)",
+        other["id"],
+        first["plan_decision_id"],
+        first["source_decision_id"],
+    )
+    _to_review_of_attempt_two(world)
+    world.tick(4)
+    assert world.events(carryover.CARRYOVER_EVENT) == []
+    assert {e["reason"] for e in world.events(carryover.DECLINED_EVENT)} == {
+        carryover.OTHER_RESOLVER
+    }
