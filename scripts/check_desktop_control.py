@@ -426,7 +426,7 @@ def main() -> None:
             assert len(ui_created_projects) == 1
             authored = [
                 study
-                for study in research.list_studies(owner, project["id"])
+                for study in research.list_all_studies(owner, project["id"])
                 if study["purpose"] == "Synthetic authored study"
             ]
             assert len(authored) == 1

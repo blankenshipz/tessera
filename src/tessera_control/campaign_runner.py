@@ -1697,6 +1697,11 @@ class CampaignRunner:
                 hook(self, ctx)
             except _Waiting:
                 continue
+            except StepFailed as error:
+                # A hook routes its own per-attempt refusals to the attempt-failure path; one
+                # that still escapes ends that hook only, never the pass (the stage loop runs).
+                self._actions.append(f"evidence_failed:{ctx.campaign['id']}:{error.error_class}")
+                continue
 
     def _still_forward_legal(self, ctx: _Ctx) -> bool:
         """The campaign, re-read now, still admits forward steps (``running``/``stopping``)."""

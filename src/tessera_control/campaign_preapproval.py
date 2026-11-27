@@ -324,6 +324,69 @@ def _profile_plan_digest(
     return bound.get(running)
 
 
+def late_bound_plan_basis(
+    connection: sqlite3.Connection,
+    campaign: Any,
+    stage_key: str,
+    provider_id: str,
+    scope: dict[str, Any],
+) -> dict[str, Any]:
+    """The plan scope on the basis its pre-approval digest was derived on.
+
+    A stage that reads another stage's output (a late-bound input) is previewed, at approve
+    time and at a delegation's first review stop alike, with its reviewed contract's late-bind
+    key as the data digest and the unbound contract as the code identity: the bytes do not
+    exist yet. The plan the runner proposes names the composed snapshot instead (``data_digest``
+    and the bound contract's ``code_digest``), so its core can never equal the bound digest.
+
+    This maps exactly those two identity values back to the key form, and only when the
+    composed snapshot is provably the binding of that key for this stage: the stage row
+    records it as the stage's input snapshot, the driver recorded its late-bind check for that
+    snapshot (resolved upstream outputs, routing, bytes and the reviewed cap,
+    ``campaign_salad._late_bound_refusal``), and both values are exactly what binding the
+    reviewed contract to it gives. Any other scope is returned unchanged, so it is digested
+    as proposed and a difference stays a ``digest_mismatch`` (fail closed)."""
+    from .campaign_delegation import _normal_spec
+    from .campaign_models import stage_on_candidate
+    from .campaign_salad import LATE_BOUND_EVENT, salad_config
+    from .campaign_salad_adapter import bind_workload, is_late_bound
+
+    try:
+        stage = _normal_spec(campaign).stage(stage_key)
+        if provider_id != stage.provider:
+            stage = stage_on_candidate(stage, provider_id)
+        salad = salad_config(stage)
+        contract = salad.workload
+        if not salad.adapted or not is_late_bound(stage, contract):
+            return scope
+        identity = scope["evaluation_protocol"]["identity"]
+        row = connection.execute(
+            "SELECT input_snapshot_digest FROM campaign_stages WHERE campaign_id=? AND stage_key=?",
+            (campaign["id"], stage_key),
+        ).fetchone()
+        composed = None if row is None else row["input_snapshot_digest"]
+        if not composed or identity.get("data_digest") != composed:
+            return scope
+        checked = connection.execute(
+            """SELECT 1 FROM events WHERE event_type=? AND project_id=?
+            AND json_extract(payload_json, '$.campaign_id')=?
+            AND json_extract(payload_json, '$.stage_key')=?
+            AND json_extract(payload_json, '$.snapshot_digest')=? LIMIT 1""",
+            (LATE_BOUND_EVENT, campaign["project_id"], campaign["id"], stage_key, composed),
+        ).fetchone()
+        bound = canonical_digest(bind_workload(contract, composed).model_dump(mode="json"))
+        if checked is None or identity.get("code_digest") != bound:
+            return scope
+        key = contract.input.snapshot_digest
+        # The digests the preview derives (``derived_digests`` over ``stage_workload``).
+        unbound = canonical_digest(bind_workload(contract, key).model_dump(mode="json"))
+    except Exception:  # noqa: BLE001 - no projection: the scope is digested as proposed
+        return scope
+    projected = copy.deepcopy(scope)
+    projected["evaluation_protocol"]["identity"].update(data_digest=key, code_digest=unbound)
+    return projected
+
+
 def _bound(scope: dict[str, Any], kind: str, salad: Any) -> bool:
     """The volatile ids the core drops must still be this stage's own."""
     if scope.get("type") != "research_program" or scope.get("study_id") != salad["study_id"]:
@@ -422,6 +485,10 @@ def evaluate(
         return Verdict(UNBOUND_SCOPE, pre)
     if not _bound(scope, kind, salad):
         return Verdict(UNBOUND_SCOPE, pre)
+    if kind == KIND_PLAN:
+        scope = late_bound_plan_basis(
+            connection, campaign, stage_key, attempt["provider_id"] or own, scope
+        )
     digest = review_core_digest(scope)
     expected = plan_digest if kind == KIND_PLAN else pre["source_use_digest"]
     if digest != expected:

@@ -598,6 +598,59 @@ class _RouteRun:
             self.error = error
 
 
+# While a route's child runs, the executor's own pass is blocked (serial mode): a keepalive
+# thread sends the registry heartbeat and renews the leases the pass keeps alive, well inside
+# the store's 150 s lease and its 60 s registry liveness bound.
+KEEPALIVE_SECONDS = 20
+# Phases whose lease a pass keeps alive besides the running route (``_keepalive``/``_resume``).
+KEPT_ALIVE_PHASES = LEASE_HELD_PHASES | {"route_started", "executing"}
+
+
+class _Keepalive:
+    """Registry heartbeat and lease renewal on its own thread while a route's child runs.
+
+    It holds a private copy of the leases to renew and writes only its own record; the pass
+    reads that record after ``stop`` (joined) and applies it (``self.fenced``) on its own
+    thread. A refused renewal is recorded once and never retried past the fence; the running
+    route's own lease is renewed by its child, never here."""
+
+    def __init__(
+        self, control: Any, leases: Mapping[str, tuple[str, int]], interval: float
+    ) -> None:
+        self.control, self.interval = control, interval
+        self.leases = dict(leases)
+        self.refused: dict[str, str] = {}
+        self.beats = 0
+        self.heartbeat_failures: list[str] = []
+        self._stop = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="salad-keepalive", daemon=True)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            self.beat()
+
+    def beat(self) -> None:
+        try:
+            self.control.heartbeat()
+            self.beats += 1
+        except Exception as error:  # noqa: BLE001 - recorded, retried next interval
+            self.heartbeat_failures.append(type(error).__name__)
+        for attempt, lease in list(self.leases.items()):
+            try:
+                self.control.renew(*lease)
+            except Exception as error:  # noqa: BLE001 - recorded as the pass's fence
+                self.refused[attempt] = type(error).__name__
+                del self.leases[attempt]
+
+    def __enter__(self) -> _Keepalive:
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._stop.set()
+        self.thread.join()
+
+
 def _key(step: str, attempt_id: str) -> str:
     return f"salad-exec-{step}-{hashlib.sha256(attempt_id.encode()).hexdigest()[:40]}"
 
@@ -616,8 +669,13 @@ class SaladCampaignExecutor:
         stage_watch: Any = None,
         clock: Callable[[], float] = time.monotonic,
         observer: Callable[[str, SaladCampaignProfile], None] | None = None,
+        keepalive_seconds: float = KEEPALIVE_SECONDS,
     ) -> None:
         self.sleep = sleep
+        self.keepalive_seconds = keepalive_seconds
+        # This pass's listed work (the keepalive thread renews its held leases while a child
+        # runs); read and written by the pass's own thread only.
+        self._pass_items: list[dict[str, Any]] = []
         self.clock = clock
         # ADR 0149: one provider read of a route's group (the trusted composition in
         # ``build_executor``); without it the control port's ``observe_termination`` is used.
@@ -647,6 +705,8 @@ class SaladCampaignExecutor:
         self._no_receipt_resumed: set[str] = set()
         # Whether this pass already sent its pre-lease registry heartbeat.
         self._heartbeat_sent = False
+        # Whether a lease keepalive in this pass already heartbeated the registration.
+        self._renewal_heartbeat = False
         # ADR 0160: failed group-stop reports per attempt; bounded, in memory only.
         self._group_stop_failures: dict[str, int] = {}
         self._group_stop_given_up: set[str] = set()
@@ -679,6 +739,7 @@ class SaladCampaignExecutor:
     def run_once(self) -> list[dict[str, Any]]:
         start = len(self.log)
         self._heartbeat_sent = False
+        self._renewal_heartbeat = False
         concurrent = self.concurrent
         if concurrent:
             self._harvest()
@@ -686,7 +747,19 @@ class SaladCampaignExecutor:
             items = self.control.work()
         except Exception as error:
             self._note("work_unavailable", None, type(error).__name__)
+            self._heartbeat_once(None)
             return self.log[start:]
+        try:
+            self._pass(items, concurrent)
+        finally:
+            # Liveness never rides on leases: a healthy executor heartbeats its registration
+            # every pass, also when it holds no lease, only fenced ones or is idle (a pass that
+            # already heartbeated for a lease or a renewal sends no second one).
+            if not self._renewal_heartbeat:
+                self._heartbeat_once(None)
+        return self.log[start:]
+
+    def _pass(self, items: list[dict[str, Any]], concurrent: bool) -> None:
         if concurrent:
             self._pass_frame_limit = _UNREAD
             self._executing_elsewhere = {
@@ -695,6 +768,7 @@ class SaladCampaignExecutor:
                 if entry.get("phase") == "executing" and entry["attempt_id"] not in self._in_flight
             }
         pending: set[str] | None = None
+        self._pass_items = items
         listed = {item["attempt_id"] for item in items}
         for attempt in sorted(set(self._refused) - listed - set(self._in_flight)):
             # Control refused this attempt's last call and no longer lists it: say so once,
@@ -703,8 +777,9 @@ class SaladCampaignExecutor:
         for item in items:
             attempt = item["attempt_id"]
             if concurrent and attempt in self._in_flight:
-                # Its child owns the route (and renews the lease) until it returns, exactly as
-                # in the serial executor; it is finished by ``_harvest`` only, never resumed.
+                # Its child owns the route (and renews the lease and registry heartbeat) until
+                # a cancel fences the lease's epoch or the child returns, exactly as in the
+                # serial executor; it is finished by ``_harvest`` only, never resumed.
                 continue
             try:
                 self._step = "grant_poll"
@@ -739,7 +814,6 @@ class SaladCampaignExecutor:
                 self._note("error", attempt, type(error).__name__)
                 self._refused[attempt] = self._step
                 self._record_rejection(attempt, error)
-        return self.log[start:]
 
     def _record_rejection(self, attempt_id: str, error: BaseException) -> None:
         """Make a control refusal visible on the stage (a short code); never alters the pass."""
@@ -797,13 +871,16 @@ class SaladCampaignExecutor:
         self._note("packaged", attempt, package["operation_id"])
 
     def _heartbeat_before_lease(self, attempt_id: str) -> None:
-        """At most one registry heartbeat per pass, sent only right before asking for a lease.
+        """At most one registry heartbeat per pass, sent right before asking for a lease.
 
-        The store gives lease authority only to a worker seen within its heartbeat window, and
-        ``_keepalive`` heartbeats only for attempts already leased, so a fresh or long-idle
-        executor would otherwise be refused every pass. A failure is noted (class name only) and
-        is not fatal: the lease request still goes out and the store decides.
+        The store gives lease authority only to a worker seen within its heartbeat window, so
+        the heartbeat goes out before the lease request. A failure is noted (class name only)
+        and is not fatal: the lease request still goes out and the store decides.
         """
+        self._heartbeat_once(attempt_id)
+
+    def _heartbeat_once(self, attempt_id: str | None) -> None:
+        """The pass's registry heartbeat, unless one was already sent in this pass."""
         if self._heartbeat_sent:
             return
         self._heartbeat_sent = True
@@ -829,11 +906,44 @@ class SaladCampaignExecutor:
         if lease is None:
             return
         try:
+            self._renewal_heartbeat = True
             self.control.heartbeat()
             self.control.renew(*lease)
         except Exception as error:
             self.fenced[attempt] = type(error).__name__
             self._note("lease_renewal_refused", attempt, type(error).__name__)
+
+    def _child_keepalive(self, running: str) -> _Keepalive:
+        """The keepalive for one serial child: every other listed attempt whose lease this
+        pass keeps alive (not fenced), plus the registry heartbeat."""
+        leases: dict[str, tuple[str, int]] = {}
+        for item in self._pass_items:
+            attempt = item["attempt_id"]
+            if attempt == running or attempt in self.fenced:
+                continue
+            if item.get("phase") not in KEPT_ALIVE_PHASES:
+                continue
+            try:
+                lease = self._lease_for(item)
+            except Exception as error:  # noqa: BLE001 - that attempt is renewed next pass
+                self._note("keepalive_lease_unread", attempt, type(error).__name__)
+                continue
+            if lease is not None:
+                leases[attempt] = lease
+        return _Keepalive(self.control, leases, self.keepalive_seconds)
+
+    def _apply_keepalive(self, keepalive: _Keepalive) -> None:
+        """Record, on the pass's thread, what the stopped keepalive thread saw."""
+        for attempt, name in sorted(keepalive.refused.items()):
+            if attempt not in self.fenced:
+                self.fenced[attempt] = name
+                self._note("lease_renewal_refused", attempt, name)
+        if keepalive.heartbeat_failures:
+            self._note(
+                "heartbeat_failed",
+                None,
+                f"{keepalive.heartbeat_failures[-1]} x{len(keepalive.heartbeat_failures)}",
+            )
 
     # -- steps 4 to 6: run a started route --------------------------------------------------
 
@@ -947,8 +1057,9 @@ class SaladCampaignExecutor:
         attempt = item["attempt_id"]
         config_path, receipts, timeout, signals = prepared
         watch = self.stage_watch
+        keepalive = self._child_keepalive(attempt)
         try:
-            with watch.ticking() if signals is not None else nullcontext():
+            with watch.ticking() if signals is not None else nullcontext(), keepalive:
                 receipt = self.route_runner(config_path, receipts, timeout)
         except RouteTimeout:
             self._note("route_timeout", attempt)
@@ -964,6 +1075,7 @@ class SaladCampaignExecutor:
             config_path.unlink(missing_ok=True)
             if signals is not None:
                 watch.end(item["operation_id"])
+            self._apply_keepalive(keepalive)
         if receipt is None:
             self._note("no_receipt", attempt)
             self.no_receipt.add(attempt)

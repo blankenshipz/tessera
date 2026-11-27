@@ -142,3 +142,31 @@ gate-evidence columns left empty. `tests/test_worker_launch_error.py`: adapter
 classification, no claim on a lost reply, no start after a launch error, the supervisor
 result, the journal column and a refused launch reported by the worker and recovered by the
 runner.
+
+## Amendment: worker authority that lapses before a Salad route starts
+
+A Salad attempt holds its execution lease from packaging through its plan and source-use
+review. The lease's hard expiry is fixed when the lease is issued, and a soft lease that lapsed
+is renewed only inside a running live check. So a review wait longer than that bound leaves the
+attempt with authority that can no longer route, and control then refuses the route (lease
+fenced, or the worker shown as disconnected). Nothing was sent to the provider before
+`start_route`.
+
+Such an attempt is now unwound through the existing unclaimed path (cancel any proposed route,
+revoke the grant, reconcile at 0 on the store's own no-claim proof). It closes as
+`failed_transient` / `not_started`, so it uses an attempt number but no scientific retry, and the
+stage gets a fresh grant and lease. Two reasons apply: `lease_lapsed_before_route`, read from the
+lease row before the reviewed, capability or route phases run, and
+`worker_unavailable_before_route`, used when a pre-route step was refused and the registry shows
+the worker not ready or not seen within its heartbeat window. Both are read from the store and
+never parsed from a refusal message. While the review is still pending the attempt is left alone,
+so a person who is away does not get a new review stop for every lapse.
+
+The identical-repeat bound above still holds. Once a reason has repeated `MAX_AUTO_REQUEUES`
+times, the attempt keeps `t1_salad_unclaimed` and the stage's own retry bound decides. A
+completed `start_route`, a claimed provider effect, and every refusal that is not about worker
+authority (review, policy, capability or configuration) stay exactly as before.
+
+The Salad executor also heartbeats its worker registration on every pass, whether it is idle,
+holding only fenced attempts, or unable to list its work. Worker liveness no longer depends on
+lease renewals. Tests: `tests/test_salad_review_wait_lease.py`.

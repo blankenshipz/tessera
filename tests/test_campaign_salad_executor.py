@@ -345,7 +345,8 @@ def test_no_lease_when_grant_is_not_pending_or_plan_budget_exceeds_profile(tmp_p
     )
     h.control.items = [item("awaiting_lease")]
     assert [a["detail"] for a in h.executor.run_once()] == ["plan_budget_above_profile"]
-    assert h.control.calls == []
+    # No lease or package call; only the pass's own registry heartbeat (liveness is not leases).
+    assert h.control.calls == [("heartbeat",)]
 
 
 def test_happy_path_runs_imports_uploads_observes_and_records(tmp_path):
@@ -881,7 +882,7 @@ def test_work_for_a_profile_the_executor_does_not_serve_is_refused(tmp_path):
     assert [(a["action"], a["detail"]) for a in h.executor.run_once()] == [
         ("refused_profile", "different_profile")
     ]
-    assert h.control.calls == []
+    assert h.control.calls == [("heartbeat",)]
     h.control.items = [item("awaiting_lease", route_id=None, operation_id=None, profile="cpu-main")]
     assert [a["action"] for a in h.executor.run_once()] == ["packaged"]
 

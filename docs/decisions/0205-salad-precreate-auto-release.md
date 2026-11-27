@@ -216,7 +216,10 @@ block were permanent.
    driver takes the existing `_abandon` unwind instead of `unknown`: `cancel_route`, `revoke_grant`, then
    `reconcile_unclaimed_salad` on the store's own proof. The attempt becomes `failed_transient` /
    `not_started` with detail `executor_silent_never_sent: ...`, settled 0¢ (`unclaimed_zero`), and the
-   stage is requeued under its own caps (an attempt number, no scientific retry).
+   stage is requeued under its own caps (an attempt number, no scientific retry). The detail carries
+   the `(executor_silent_never_sent)` tag, so ADR 0046's identical-repeat bound (`MAX_AUTO_REQUEUES`)
+   applies: past it, the release at 0 stands but the attempt keeps `t1_salad_unclaimed` and the stage's
+   scientific retry bound ends it (`campaign.autoreconcile_stopped`).
 2. **Already-unknown attempts in that shape.** For an attempt already `unknown` as `executor silent past
    the route window` whose route still wants to run and was provably never sent, the evidence pass (ADR
    0038 amendment, 2026-11-26) issues the reduce-only `cancel_route` when the only unclaimed refusal is

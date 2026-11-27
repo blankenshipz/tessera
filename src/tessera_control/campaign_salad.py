@@ -22,9 +22,10 @@ from typing import TYPE_CHECKING, Any
 from pydantic import ValidationError
 
 from . import campaign_preapproval, operator_config_freshness, provider_trust
+from . import campaign_salad_lease_lapse as lease_lapse
 from . import execution_frames as frames
 from .artifact_manifests import grant_manifest_is_partial
-from .campaign_autoreconcile import NOT_STARTED
+from .campaign_autoreconcile import MAX_AUTO_REQUEUES, NOT_STARTED, repeat_count
 from .campaign_infra_retry import (
     INFRA_SALAD_CREATE_NOT_SENT,
     REALLOCATED_PRECUSTODY,
@@ -898,6 +899,11 @@ class SaladStageDriver:
             if expired:
                 return self.runner._do_observe(ctx, stage, spec_stage, attempt)
             raise _waiting()()
+        lapsed = lease_lapse.before_handler(self, ctx, attempt, row)
+        if lapsed is not None:
+            # Worker authority lapsed before the route (a long review wait): requeued as not
+            # started within ADR 0046's repeat bound, never a permanent stage failure.
+            return lease_lapse.requeue(self, ctx, attempt, lapsed)
         if phase in PRE_ROUTE_PHASES and (expired or grant["status"] != "active"):
             return self._abandon(ctx, stage, spec_stage, attempt, "grant_expired_before_route")
         handler = {
@@ -912,7 +918,15 @@ class SaladStageDriver:
         }.get(phase)
         if handler is None:
             raise _waiting()()
-        return handler(ctx, stage, spec_stage, attempt, row)
+        try:
+            return handler(ctx, stage, spec_stage, attempt, row)
+        except StepFailed:
+            # A pre-route refusal of the worker's own authority (disconnected worker, lapsed
+            # lease), read from the store: nothing was sent, so it is requeued, not permanent.
+            lapsed = lease_lapse.after_refusal(self, ctx, attempt, row)
+            if lapsed is None:
+                raise
+            return lease_lapse.requeue(self, ctx, attempt, lapsed)
 
     # decisions ----------------------------------------------------------------------
 
@@ -1674,12 +1688,43 @@ class SaladStageDriver:
                     ctx,
                     IMPORT_AWAITED_EVENT,
                     {"attempt_id": attempt["id"]},
-                    {"stage_key": attempt["stage_key"], "route_id": row["route_id"]},
+                    {
+                        "stage_key": attempt["stage_key"],
+                        "route_id": row["route_id"],
+                        "at": self._stamp(),
+                    },
                 )
-                raise _waiting()()
+                awaited = self._import_awaited_at(ctx, attempt)
+                if awaited is not None and self.runner.now() <= awaited + timedelta(
+                    seconds=window + SILENT_EXECUTOR_GRACE_SECONDS
+                ):
+                    raise _waiting()()
+                # The wait is bounded (one more route window plus grace): an executor whose
+                # receipt directory is gone never imports, and the attempt must not stay
+                # ``running`` on its hold forever. It goes unknown for the silent reason (an
+                # unreadable wait mark does too), so a person is asked and the sanctioned late
+                # import still applies.
             self._unknown(attempt, SILENT_EXECUTOR)
             return True
         raise _waiting()()
+
+    def _import_awaited_at(self, ctx: _Ctx, attempt: dict[str, Any]) -> datetime | None:
+        """When the runner first waited for this attempt's import (its ``at``, or the event's
+        own time for one recorded before it carried one); None when unreadable."""
+        event = self.runner._one(
+            """SELECT created_at, json_extract(payload_json,'$.at') AS at FROM events
+            WHERE project_id=? AND event_type=?
+            AND json_extract(payload_json,'$.campaign_id')=?
+            AND json_extract(payload_json,'$.attempt_id')=?
+            ORDER BY created_at LIMIT 1""",
+            (ctx.campaign["project_id"], IMPORT_AWAITED_EVENT, ctx.campaign["id"], attempt["id"]),
+        )
+        if event is None:
+            return None
+        try:
+            return _parse_utc(event["at"] or event["created_at"])
+        except (TypeError, ValueError):
+            return None
 
     def _silent_clock_start(self, ctx: _Ctx, row: dict[str, Any]) -> datetime:
         """When the silent-executor clock starts: the Salad row's last move, or the campaign's
@@ -1851,12 +1896,21 @@ class SaladStageDriver:
             except KeyError:
                 continue
             row = self.row(attempt["id"])
-            if row["phase"] == "outcome_recorded":
-                if attempt["status"] == "unknown" and not self._late_imported(attempt):
-                    continue
-                self._verify(ctx, self.runner._stage_row(ctx, key), spec_stage, attempt, row)
-            else:
-                self._cancel_never_sent(ctx, key, attempt, row)
+            try:
+                if row["phase"] == "outcome_recorded":
+                    if attempt["status"] == "unknown" and not self._late_imported(attempt):
+                        continue
+                    self._verify(ctx, self.runner._stage_row(ctx, key), spec_stage, attempt, row)
+                else:
+                    self._cancel_never_sent(ctx, key, attempt, row)
+            except StepFailed as error:
+                # A refused reduce-only step inside verification (``_abandon``'s unwind: a
+                # sticky failed ``cancel_route`` or ``revoke_grant`` intent) fails this attempt
+                # exactly as the stage loop would, and the rest of the pass goes on; it never
+                # escapes to the tick and wedges every later pass.
+                self.runner._attempt_failed(ctx, key, attempt, error.error_class, error.detail)
+            except _waiting():
+                continue
 
     def _late_imported(self, attempt: dict[str, Any]) -> bool:
         """An unknown attempt's outcome is verified only after the sanctioned late import: the
@@ -2134,12 +2188,32 @@ class SaladStageDriver:
         if done:
             failure_class, detail = "t1_salad_unclaimed", reason
             if reason == SILENT_NEVER_SENT:
-                # Queued, never sent: an attempt number, not a scientific retry (ADR 0046).
-                failure_class = NOT_STARTED
                 detail = (
                     f"{reason}: the route window passed and control holds no create or start "
-                    "claim, sent route effect or provider reference; released at 0"
+                    f"claim, sent route effect or provider reference; released at 0 ({reason})"
                 )
+                others = [a for a in self.runner._attempts(ctx, key) if a["id"] != attempt["id"]]
+                repeats = repeat_count(others, reason)
+                if repeats < MAX_AUTO_REQUEUES:
+                    # Queued, never sent: an attempt number, not a scientific retry (ADR 0046).
+                    failure_class = NOT_STARTED
+                else:
+                    # ADR 0046's identical-repeat bound: the release at 0 stands (nothing was
+                    # sent), but the stage is no longer requeued for free; the attempt keeps the
+                    # unclaimed class, so the stage's own scientific retry bound ends it.
+                    detail = (
+                        f"{detail}; not requeued as not started: {reason} repeated "
+                        f"{repeats + 1} times"
+                    )
+                    self._emit_once(
+                        ctx,
+                        "campaign.autoreconcile_stopped",
+                        {"stage_key": key, "attempt": attempt["attempt"]},
+                        {
+                            "reason": f"not auto-requeued: {reason} repeated {repeats + 1} times",
+                            "not_started_reason": reason,
+                        },
+                    )
             if reason == CREATE_NOT_SENT:
                 limit = spec_stage.retry.infra_retries
                 used = infra_attempts(

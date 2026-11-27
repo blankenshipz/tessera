@@ -105,6 +105,7 @@ CONTROL_CALLS = frozenset(
         "WorkerRegistryStore.heartbeat",
         "TrustedSaladServer.heartbeat",
         "RemoteDispatcher.dispatch",
+        "Store.execution_authority",
     }
 )
 
@@ -597,6 +598,44 @@ class SaladLiveSession:
             raise ControlStall(beat_delivered=False) from stalled
         if stalled is not None:
             raise ControlStall(beat_delivered=True) from stalled
+
+    def execution_authority(self, route):
+        """Control's own record of whether it still wants this route run (a read, no write).
+
+        Returns ``{"grant_status", "operation_desired", "epoch_current"}`` read in one snapshot
+        from the route's exact operation, its execution grant and its lease: a grant that is no
+        longer ``active`` (a cancel sets ``cancel_requested`` and bumps the epoch), an operation
+        whose desired state is no longer ``admitted``, or a grant/lease epoch other than the
+        proposal's (fenced) is control's decision to stop the route. Any failure (a lock, a
+        bounded call that ran out, a refused or missing read) raises: it is never a cancel."""
+        from contextlib import closing
+
+        from .store import _connect, _read_snapshot, bounded_lock_wait
+
+        proposal = self.state(route)["proposal"]
+        store = self.server.store
+        with (
+            bounded_lock_wait(KEEPALIVE_LOCK_WAIT_SECONDS),
+            _calling("Store.execution_authority"),
+            _wall_bound(5),
+            closing(_connect(store.database_path)) as db,
+            _read_snapshot(db),
+        ):
+            live = store._live_principal(db, self.server.worker, audience="worker")
+            op, _ = store._operation(db, live, proposal)
+            grant = db.execute(
+                "SELECT status, epoch FROM execution_grants WHERE id=?", (op["grant_id"],)
+            ).fetchone()
+            lease = db.execute(
+                "SELECT epoch FROM execution_leases WHERE id=?", (op["lease_id"],)
+            ).fetchone()
+            if grant is None or lease is None:
+                raise ValueError("execution authority unreadable")
+            return {
+                "grant_status": grant["status"],
+                "operation_desired": op["desired_state"],
+                "epoch_current": grant["epoch"] == proposal["epoch"] == lease["epoch"],
+            }
 
     def _note_beat(self, route, *, last_verified):
         """Record a beat the guardian took: the monotonic gap since the previous one."""
@@ -1423,12 +1462,25 @@ CANCEL_CAUSE_CLASSES = frozenset(
         "control_stall",  # control writes stalled past their bound before the route ran
         "observe_timeout",  # the observe read failed past its bound
         "control_refused",  # control refused (use-time authority, lease, route revision)
+        # control's own record says it decided to stop the route: its execution grant is no
+        # longer active (cancel_requested), its operation no longer admitted, or its grant /
+        # lease epoch moved past the proposal's (fenced); see SaladLiveSession.execution_authority
+        "control_cancel_requested",
         "prestart",  # a pre-start step failed (see prestart_failure)
         "poll_bound",  # the poll bound ran out with no output
         "output_unavailable",  # the loop ended with no retained output
         "error",  # anything else (see cancel_cause["error"] for the sanitized detail)
     }
 )
+
+
+class ControlCancelRequested(Exception):
+    """Control's own authoritative record says it decided to stop this route (a grant that is
+    no longer active, an operation no longer admitted, or a fenced epoch). A genuine terminal
+    cause even on a running route: the driver ends its loop, cancels and stops the exact group."""
+
+    def __init__(self):
+        super().__init__("control cancel requested")
 
 
 class ControlStall(Exception):
@@ -1649,12 +1701,13 @@ def _refusal(error):
 # --- a running route is never cancelled on an unexpected or transient error -------------------
 # While the last post-start observe read the group running and the guardian has recorded no stop
 # cause, only a genuine terminal cause ends the run and sends this driver's cancel: the run
-# deadline, a budget refusal, an explicit operator cancel or revocation (a verified authority-gone
-# refusal from a ready control, or a control Conflict other than a route-revision race), the
-# guardian's own decision (its recorded stop cause, or a terminal refusal code it returned) or a
-# verified execution_complete. Anything else raised inside the post-start loop (a ValueError, a
-# malformed or partial provider or guardian reply, a read timeout, a control stall, an
-# OperationalError, any new class) is recorded on the receipt (``running_errors_held`` and
+# deadline, a budget refusal, control's own recorded cancel (its grant no longer active or its
+# epoch fenced: ``control_check``), an explicit operator cancel or revocation (a verified
+# authority-gone refusal from a ready control, or a control Conflict other than a route-revision
+# race), the guardian's own decision (its recorded stop cause, or a terminal refusal code it
+# returned) or a verified execution_complete. Anything else raised inside the post-start loop
+# (a ValueError, a malformed or partial provider or guardian reply, a read timeout, a control
+# stall, an OperationalError, any new class) is recorded on the receipt (``running_errors_held`` and
 # ``last_held_error``, sanitized) and the pass is retried at the next interval; the guardian keeps
 # its own deadline, budget and silence authority meanwhile and stops the group itself.
 # Guardian heartbeat codes that are not a guardian decision: it did not answer, its loop or
@@ -2024,6 +2077,51 @@ def _drive(
         receipt.setdefault("control_refusals_skipped", 0)
         return evidence
 
+    def control_check():
+        """Raise ControlCancelRequested when control's own authoritative record (a fresh read of
+        the route's grant, operation and lease; ``SaladLiveSession.execution_authority``) says
+        it decided to stop the route. Asked once per poll interval, before the heartbeat, so a
+        cancel ends the run even when nothing else refuses. A read that fails is never a cancel:
+        it is counted (``control_authority_read_failures``, ``last_control_authority_read_failure``,
+        sanitized) and the existing stall / hold handling applies. A session without the read
+        (isolated fakes) is not asked. If the guardian already retained the output, the pass
+        goes on so the run completes (the next evidence read decides) instead of cancelling."""
+        reader = getattr(session, "execution_authority", None)
+        if not callable(reader):
+            return
+        try:
+            facts = reader(route_id)
+            status, desired, current = (
+                facts["grant_status"],
+                facts["operation_desired"],
+                facts["epoch_current"],
+            )
+            if type(status) is not str or type(desired) is not str or type(current) is not bool:
+                raise ValueError("execution authority malformed")
+        except Exception as error:
+            try:
+                receipt["control_authority_read_failures"] = (
+                    receipt.get("control_authority_read_failures", 0) + 1
+                )
+                receipt["last_control_authority_read_failure"] = _error_detail(error)
+            except Exception:
+                pass
+            return
+        if status == "active" and desired == "admitted" and current:
+            return
+        receipt["control_cancel"] = {
+            "grant_status": _closed_token(status),
+            "operation_desired": _closed_token(desired),
+            "epoch_current": current,
+        }
+        try:
+            retained = session.evidence(route_id)["output_retained"] is True
+        except Exception:
+            retained = False  # unread: control's decision stands (fail closed)
+        receipt["control_cancel"]["output_retained"] = retained
+        if not retained:
+            raise ControlCancelRequested()
+
     def refusal_stall(evidence):
         """True when a refusal on a running route is a transient control stall, not a cancel:
         a Forbidden/401/403 without a verified revocation, or any while control is unready."""
@@ -2057,6 +2155,8 @@ def _drive(
             kind = "deadline"
         elif _budget_code(code):
             kind = "budget"
+        elif isinstance(error, ControlCancelRequested):
+            kind = "control_cancel_requested"
         elif ended["class"] is not None:
             kind = ended["class"]
         elif code == "unavailable":
@@ -2093,6 +2193,8 @@ def _drive(
         """True when ``error`` is a genuine terminal cause even on a running route: a guardian
         refusal that is its own decision (budget included), or an explicit control decision
         (a verified revocation from a ready control, a Conflict other than a revision race)."""
+        if isinstance(error, ControlCancelRequested):
+            return True  # control's own recorded decision (control_check), never a stall
         code = _guardian_code(error)
         if code is not None:
             return code not in HELD_GUARDIAN_CODES
@@ -2440,6 +2542,7 @@ def _drive(
             settle_started = clock()
             settle_retried = False
             for _ in range(max_polls):
+                control_check()
                 settle_beat()
                 try:
                     state = settle_read()
@@ -2501,6 +2604,7 @@ def _drive(
             # held (``hold``): recorded sanitized, retried next interval, never a cancel.
             where = {"step": "keepalive"}
             try:
+                control_check()
                 if launched:
                     heartbeat()
                 began = clock()
@@ -2584,6 +2688,7 @@ def _drive(
                     waited = interval
                     where["step"] = "keepalive"
                     while waited < PRESTART_POLL_INTERVAL_SECONDS and clock() < deadline:
+                        control_check()
                         if launched:
                             heartbeat()
                         slice_seconds = min(interval, PRESTART_POLL_INTERVAL_SECONDS - waited)

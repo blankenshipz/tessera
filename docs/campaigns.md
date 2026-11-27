@@ -1062,7 +1062,9 @@ amendments of 2026-11-26).**
   last move and the campaign's latest `campaign.unblocked` or `campaign.approved`, so blocked or
   paused time is never counted and an unblock does not call a healthy route silent. A route
   whose provider receipts already confirm termination waits for the import
-  (`campaign.salad_import_awaited`) instead of going `unknown`.
+  (`campaign.salad_import_awaited`) instead of going `unknown`. That wait is bounded: one more
+  route window plus 600 s after the first wait, the attempt goes `unknown` for the silent reason
+  (so a person is asked) and stays late-importable as below.
 - *Late import of a silent-unknown attempt.* An attempt that is `unknown` with detail exactly
   `executor silent past the route window`, unsettled, and whose grant is still `active` or
   `cancel_requested` stays in the executor's work list. If its receipt is still in the
@@ -1079,11 +1081,22 @@ amendments of 2026-11-26).**
   claim, no manifest and no passing receipt is no longer made `unknown` when its window passes.
   The runner cancels the route, revokes the grant and reconciles it at 0 on the store's own proof.
   The attempt becomes `failed_transient` / `not_started` (`executor_silent_never_sent`) with its
-  hold released, and the stage is requeued without a scientific retry. An attempt already
+  hold released, and the stage is requeued without a scientific retry. ADR 0046's
+  identical-repeat bound applies: past `MAX_AUTO_REQUEUES` identical never-sent releases the
+  release at 0 still stands, but the attempt keeps `t1_salad_unclaimed`
+  (`campaign.autoreconcile_stopped`), so the stage's own retry bound ends it. An attempt already
   `unknown` for the silent reason in that shape, which `reconcile-unclaimed-attempts --dry-run`
   refuses only as `route_wants_run`, gets the reduce-only route cancel on the next runner pass,
   even while blocked, and is then reconciled the same way. A route whose lease the executor keeps
   renewing while it waits is not silent. Anything with a claim or sent effect still waits.
+- *Liveness and cancel while a route runs.* While a live check runs, the executor's keepalive
+  thread sends the worker registry heartbeat and renews every other lease it keeps alive (a
+  pre-route `awaiting_review` attempt included) every 20 s; the running route's lease is its
+  child's. The child reads control's own record of its grant, operation and lease once per poll
+  interval: once the grant is `cancel_requested` (or not active), the operation no longer
+  `admitted`, or the epoch fenced, it ends the run, cancels and stops the exact group, and records
+  `cancel_cause.class` `control_cancel_requested` with `control_cancel` on the receipt. A failed
+  read is never a cancel.
 - *Do not restart the executor while a route runs.* `tessera deploy-upgrade` refuses while any
   Salad attempt is `executing` ([deploy upgrade](deploy-upgrade.md#salad-routes-in-flight)).
   Restarts while stages are only reserved, preparing or queued are safe.

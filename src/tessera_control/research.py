@@ -260,8 +260,15 @@ class ResearchStore(Store):
         return command(connection, actor)
 
     def list_studies(
-        self, principal: dict[str, Any], project_id: str, offset: int = 0, limit: int = 100
+        self,
+        principal: dict[str, Any],
+        project_id: str,
+        offset: int = 0,
+        limit: int = 100,
+        campaign_id: str | None = None,
     ) -> list[dict[str, Any]]:
+        """One page of the project's studies; ``campaign_id`` narrows it to the studies that
+        campaign's stages run under (a campaign of many stages fits one page)."""
         if type(offset) is not int or type(limit) is not int or offset < 0 or not 1 <= limit <= 200:
             raise StoreError("Invalid study pagination.")
         connection = sqlite3.connect(self.database_path)
@@ -269,14 +276,50 @@ class ResearchStore(Store):
         try:
             actor = self._live_principal(connection, principal)
             self._project(connection, actor, project_id)
-            rows = connection.execute(
-                """SELECT * FROM research_studies WHERE project_id = ?
-                ORDER BY created_at, id LIMIT ? OFFSET ?""",
-                (project_id, limit, offset),
-            ).fetchall()
+            if campaign_id is None:
+                rows = connection.execute(
+                    """SELECT * FROM research_studies WHERE project_id = ?
+                    ORDER BY created_at, id LIMIT ? OFFSET ?""",
+                    (project_id, limit, offset),
+                ).fetchall()
+            elif not connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='campaign_salad_stages'"
+            ).fetchone():
+                rows = []  # no campaign has run here: no campaign studies
+            else:
+                rows = connection.execute(
+                    """SELECT * FROM research_studies WHERE project_id = ? AND id IN (
+                    SELECT study_id FROM campaign_salad_stages WHERE campaign_id = ?
+                    AND study_id IS NOT NULL)
+                    ORDER BY created_at, id LIMIT ? OFFSET ?""",
+                    (project_id, campaign_id, limit, offset),
+                ).fetchall()
             return [dict(row) for row in rows]
         finally:
             connection.close()
+
+    def list_all_studies(
+        self,
+        principal: dict[str, Any],
+        project_id: str,
+        page_size: int = 200,
+        max_pages: int = 1000,
+        campaign_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return every study of a project by paging until a short page.
+
+        ``list_studies`` caps each call at 200 rows; callers that need the
+        complete set (for example one study per campaign stage) use this.
+        """
+        studies: list[dict[str, Any]] = []
+        for page in range(max_pages):
+            rows = self.list_studies(
+                principal, project_id, page * page_size, page_size, campaign_id
+            )
+            studies.extend(rows)
+            if len(rows) < page_size:
+                return studies
+        raise StoreError("Study listing exceeded the page bound.")
 
     def get_study(self, principal: dict[str, Any], study_id: str) -> dict[str, Any]:
         """Return the bounded full ledger detail view."""

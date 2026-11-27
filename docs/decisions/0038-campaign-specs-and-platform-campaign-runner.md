@@ -575,7 +575,10 @@ failed intent and settled 20 stages `failed_permanent` / `step_refused`.
    the start of every running pass before the stage loop. The Salad hook verifies an
    `outcome_recorded` attempt with the unchanged `verify_outcome` and settles it through the
    ordinary collect, resolve and charge path; it also covers the late import of ADR 0160's
-   amendment and the reduce-only cancel of ADR 0205's never-sent amendment.
+   amendment and the reduce-only cancel of ADR 0205's never-sent amendment. A refused step inside
+   the hook (for example a sticky failed `cancel_route` or `revoke_grant` intent in an unwind)
+   fails that attempt through the stage loop's attempt-failure path and the hook goes on to the
+   next attempt; a refusal that still escapes a hook ends that hook only, never the pass.
 5. **Unblocking does not manufacture unknowns.** `_drive_blocked` records `campaign.unblocked`
    with the runner's clock (`at`); the Salad silent-executor clock restarts at the latest
    `campaign.unblocked` or `campaign.approved` (ADR 0160 amendment). With points 1 and 4, the first

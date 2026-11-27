@@ -170,8 +170,11 @@ def list_studies(
     store: Ledger,
     offset: int = Query(default=0, ge=0, le=2**63 - 1),
     limit: int = Query(default=100, ge=1, le=200),
+    campaign_id: str | None = Query(default=None, min_length=1, max_length=200),
 ) -> dict[str, Any]:
-    return {"studies": store.list_studies(actor, project_id, offset, limit)}
+    """A page of the project's studies (page with ``offset`` until a short page); with
+    ``campaign_id``, only the studies that campaign's stages run under."""
+    return {"studies": store.list_studies(actor, project_id, offset, limit, campaign_id)}
 
 
 @router.get("/studies/{study_id}")
