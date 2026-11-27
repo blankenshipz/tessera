@@ -795,6 +795,9 @@ class SaladSafetyService(ContainerExitWatch):
         self.next_absence = {}
         self._absence_reads_left = LOST_CREATE_READS_PER_PASS
         self._pass_count = 0
+        # Bound frames whose guardian stopped or reconciled them, already closed by one loop
+        # pass of this process: later passes skip them (in memory; a restart re-reads each once).
+        self._closed_frames = set()
 
     def close(self):
         self.guardian.close()
@@ -1154,6 +1157,11 @@ class SaladSafetyService(ContainerExitWatch):
             elapsed = max(0, now - max(last, started))
             estimate += Decimal(row["rate"]) * Decimal(str(elapsed)) * 100 / 3600
         escalation = row["cost_cap"] is not None and estimate > row["cost_cap"]
+        if stopped and row["provider_id"] and not force and escalation <= bool(row["escalation"]):
+            # A bound frame the guardian stopped or reconciled (final: never re-armed, never
+            # force-frozen again) accrues nothing more and keeps its escalation: nothing changes,
+            # so nothing is written. Its frozen estimate still counts in the total.
+            return
         with self.db:
             self.db.execute(
                 "UPDATE reservations SET accrued_cents=?,accounted_at=?,"
@@ -2798,7 +2806,11 @@ class SaladSafetyService(ContainerExitWatch):
                     self.jwt.refresh()
             except Exception:
                 pass
-        frames = [r for (r,) in self.db.execute("SELECT reservation FROM reservations").fetchall()]
+        frames = [
+            r
+            for (r,) in self.db.execute("SELECT reservation FROM reservations").fetchall()
+            if r not in self._closed_frames
+        ]
         if frames:
             # Start each pass one frame later, so the per-pass absence read slot goes round
             # every frame instead of always to the first ones listed.
@@ -2917,6 +2929,9 @@ class SaladSafetyService(ContainerExitWatch):
                     if self.inputs:
                         self.inputs.drop(row["operation"])
                     self.next_close_check.pop(reservation, None)
+                    # Closed for good (stopped and reconciled are final): its close duties are
+                    # done, so later passes of this process skip it (``_loop_pass``).
+                    self._closed_frames.add(reservation)
                     return
             except ValueError:
                 pass

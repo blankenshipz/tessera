@@ -157,13 +157,89 @@ def late_bind_key(stage: Any, upstream: UpstreamOutputs | None = None) -> str | 
     return hashlib.sha256(raw).hexdigest()
 
 
+# A re-run (ADR 0069/0209) replaces a ``stage`` input of a retried stage by a pin of the earlier
+# campaign's recorded output (``artifact`` / ``artifact_folder``), but the stage keeps its
+# reviewed adapted contract, which declared its input by the original late-bind key. The re-run
+# plan rebinds that one key to the pinned-input key below (a digest of exactly what the stage now
+# pins: names, producing campaign and stage, outputs, paths, sha256), and only when the contract
+# declared exactly the original key. The runner still composes the snapshot and the driver still
+# binds its digest at start, so the late-bound checks apply to a re-run unchanged.
+PINNED_BIND_SCHEMA = "tessera.salad.pinned-late-bound-input.v1"
+
+
+def _pinned_files(source: Any) -> list[list[str]]:
+    rows = []
+    for item in getattr(source, "files", None) or ():
+        if isinstance(item, (tuple, list)):
+            output, path, sha256 = item
+        else:
+            output, path, sha256 = item.output, item.path, item.sha256
+        rows.append([str(output), str(path), str(sha256)])
+    return sorted(rows)
+
+
+def pinned_bind_key(stage: Any) -> str | None:
+    """The key a re-run gives a stage whose ``stage`` inputs became pins (else None).
+
+    Defined for a stage with at least one ``artifact`` / ``artifact_folder`` input; computed from
+    the normal form, so the re-run plan and the runner derive the same digest. A ``stage`` input
+    the re-run kept (its upstream runs again) is a row of its stage and resolved paths, as in
+    ``late_bind_key``, so a mixed stage's key names every pin and every late-bound input in full
+    (``late_bind_key`` records a pin only by its name and kind)."""
+    rows: list[list[Any]] = []
+    pinned = False
+    for source in _custody(stage):
+        kind = getattr(source, "kind", None)
+        if kind == "stage":
+            paths = list(getattr(source, "paths", None) or ())
+            if not paths:
+                return None
+            rows.append([source.name, kind, source.stage, sorted(paths)])
+        elif kind == "snapshot":
+            rows.append([source.name, kind, source.digest, []])
+        elif kind == "artifact":
+            pinned = True
+            rows.append(
+                [
+                    source.name,
+                    kind,
+                    f"{source.campaign_id}/{source.stage}",
+                    [[source.output, source.sha256]],
+                ]
+            )
+        elif kind == "artifact_folder":
+            pinned = True
+            rows.append(
+                [
+                    source.name,
+                    kind,
+                    f"{source.campaign_id}/{source.stage}",
+                    _pinned_files(source),
+                ]
+            )
+        else:
+            rows.append([source.name, str(kind), "", []])
+    if not pinned:
+        return None
+    body = {"schema": PINNED_BIND_SCHEMA, "inputs": sorted(rows)}
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def rebound_key(stage: Any) -> str | None:
+    """The key a re-run rebinds ``stage``'s contract to: ``pinned_bind_key`` once it pins an
+    earlier output (alone or beside a ``stage`` input the re-run kept), else ``late_bind_key``."""
+    return pinned_bind_key(stage) or late_bind_key(stage)
+
+
 def is_late_bound(stage: Any, contract: Any) -> bool:
-    """Whether ``contract`` declares the stage's input by its late-bind key (ADR 0076 note)."""
+    """Whether ``contract`` declares the stage's input by its late-bind key (ADR 0076 note),
+    or by the pinned-input key a re-run rebinds it to."""
     declared = getattr(contract, "input", None)
     if declared is None:
         return False
-    key = late_bind_key(stage)
-    return key is not None and declared.snapshot_digest == key
+    keys = {late_bind_key(stage), pinned_bind_key(stage)} - {None}
+    return declared.snapshot_digest in keys
 
 
 def bind_workload(contract: WorkloadContractV1, snapshot_digest: str) -> WorkloadContractV1:

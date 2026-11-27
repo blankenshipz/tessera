@@ -267,6 +267,10 @@ LATE_BIND_CODES = frozenset(
 )
 
 
+# A reviewed workload contract (or the operator profile) cannot form a valid route selection.
+SELECTION_INVALID = "salad_workload_contract_invalid"
+
+
 def stage_workload(stage: dict[str, Any], spec_stage: Any) -> Any:
     """The workload contract the stage's route carries.
 
@@ -680,19 +684,51 @@ class SaladStageDriver:
         return operator_config_freshness.launch_problem(name, profile)
 
     def _selection(
-        self, ctx: _Ctx, stage: dict[str, Any], spec_stage: StageSpec, row: dict[str, Any]
+        self,
+        ctx: _Ctx,
+        stage: dict[str, Any],
+        spec_stage: StageSpec,
+        row: dict[str, Any],
+        *,
+        closed: bool = True,
     ) -> ExecutionSelection:
-        return derive_selection(
-            self.profile(spec_stage),
-            stage_workload(stage, spec_stage),
-            operation_id=row["operation_id"],
-            epoch=row["epoch"],
-            snapshot_digest=stage_data_digest(stage, spec_stage),
-            image=spec_stage.image,
-            max_cost_cents=spec_stage.max_exposure_cents,
-            plan_max_seconds=spec_stage.max_duration_seconds,
-            data_policy=self._data_policy(stage, spec_stage),
-        )
+        """The route's selection. A reviewed contract or operator profile that cannot form a
+        valid one never will on a retry, so before the route starts (``closed``) that is a
+        closed stage failure, not a raw error the runner would retry forever."""
+        try:
+            return derive_selection(
+                self.profile(spec_stage),
+                stage_workload(stage, spec_stage),
+                operation_id=row["operation_id"],
+                epoch=row["epoch"],
+                snapshot_digest=stage_data_digest(stage, spec_stage),
+                image=spec_stage.image,
+                max_cost_cents=spec_stage.max_exposure_cents,
+                plan_max_seconds=spec_stage.max_duration_seconds,
+                data_policy=self._data_policy(stage, spec_stage),
+            )
+        except ValueError as error:  # a ValidationError is one: the contract or selection is bad
+            if not closed:
+                raise
+            raise StepFailed("salad", "step_refused", SELECTION_INVALID) from error
+
+    def _started_selection(
+        self, ctx: _Ctx, stage: dict[str, Any], spec_stage: StageSpec, row: dict[str, Any]
+    ) -> ExecutionSelection | None:
+        """The selection of a route that already started: the one it was proposed with (what
+        was approved and started), else a fresh derivation, else None. Never raises for a bad
+        contract or profile: a replay after start only finishes bookkeeping."""
+        state = self.route_state(row.get("route_id"))
+        proposed = ((state or {}).get("proposal") or {}).get("selection")
+        if isinstance(proposed, dict):
+            try:
+                return ExecutionSelection.model_validate(proposed)
+            except ValueError:
+                pass
+        try:
+            return self._selection(ctx, stage, spec_stage, row, closed=False)
+        except (ValueError, StepFailed):
+            return None
 
     def _data_policy(self, stage: dict[str, Any], spec_stage: StageSpec) -> str:
         """The route literal: public only when the declared classes and the admitted input
@@ -1067,8 +1103,13 @@ class SaladStageDriver:
         salad = salad_config(spec_stage)
         profile = self.profile(spec_stage)
         template = salad.program
-        selection = self._selection(ctx, stage, spec_stage, row)
-        digests = derived_digests(profile, stage_workload(stage, spec_stage), spec_stage.image)
+        selection = self._selection(ctx, stage, spec_stage, row, closed=not preview)
+        try:
+            digests = derived_digests(profile, stage_workload(stage, spec_stage), spec_stage.image)
+        except ValueError as error:  # a ValidationError is one: the contract is bad
+            if preview:
+                raise
+            raise StepFailed("salad", "step_refused", SELECTION_INVALID) from error
         max_seconds = selection.resources.max_seconds
         gate = template.gate
         return {
@@ -1789,10 +1830,13 @@ class SaladStageDriver:
             )
         # Only before the route started: a replay after start_route is recorded must
         # finish its bookkeeping, never fail an attempt that is already running.
-        problem = None if started is not None else self._operator_config_problem(spec_stage)
-        if problem is not None:
-            raise StepFailed("salad", "step_refused", problem)
-        selection = self._selection(ctx, stage, spec_stage, row)
+        if started is None:
+            problem = self._operator_config_problem(spec_stage)
+            if problem is not None:
+                raise StepFailed("salad", "step_refused", problem)
+            selection: ExecutionSelection | None = self._selection(ctx, stage, spec_stage, row)
+        else:
+            selection = self._started_selection(ctx, stage, spec_stage, row)
         self._command(ctx, stage, attempt, row, "approve_route", "approve", selection)
         self._command(ctx, stage, attempt, row, "start_route", "start", selection)
         self._record_started(attempt["id"], row["operation_id"])

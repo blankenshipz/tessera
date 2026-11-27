@@ -336,6 +336,7 @@ def build_retry_spec(
     if cap < needed:
         raise RerunRefused(f"The cap must cover the retried stages' exposure ({needed} cents).")
     spec["stages"] = kept
+    _rebind_adapted_contracts(campaign["spec"], spec, rerun)
     if spec.get("seals"):
         # ADR 0164: a pinned output keeps the seals it carried (on itself or by lineage).
         source_spec = normalize(parse_spec_json(json.dumps(campaign["spec"])))
@@ -356,6 +357,56 @@ def build_retry_spec(
             "tessera_validate_campaign_spec, then submit it with tessera_submit_campaign."
         ),
     }
+
+
+def _rebind_adapted_contracts(
+    source_spec: dict[str, Any], spec: dict[str, Any], rerun: set[str]
+) -> None:
+    """Carry a retried stage's reviewed adapted Salad contract across its re-pinned inputs.
+
+    An adapted contract declares a ``stage`` input by the late-bind key of the source stage's
+    inputs (or, for a re-run of a re-run, by the pinned-input key the earlier re-run gave it).
+    Once this re-run pins an input that key no longer matches, so the stage would never bind.
+    Each contract (primary or alternate candidate) that declares exactly a key the source stage
+    recorded, and no longer one of the stage's own, is given the stage's re-run key
+    (``rebound_key``: every pin and every kept ``stage`` input in full), its argv token with it;
+    the reviewed ``max_bytes`` and every other field are untouched, and a contract declaring
+    anything else is left as it is (the stage then fails closed at the route check, never by
+    guessing)."""
+    from .campaign_models import normalize, parse_spec_json
+    from .campaign_salad_adapter import late_bind_key, pinned_bind_key, rebound_key
+
+    def keys(stage: Any) -> set[str]:
+        return {key for key in (late_bind_key(stage), pinned_bind_key(stage)) if key}
+
+    try:
+        before = {s.key: s for s in normalize(parse_spec_json(json.dumps(source_spec))).stages}
+        after = {s.key: s for s in normalize(parse_spec_json(json.dumps(spec))).stages}
+    except ValueError:
+        return  # submit refuses the spec with its own reason
+    for stage in spec["stages"]:
+        old_stage, new_stage = before.get(stage["key"]), after.get(stage["key"])
+        if old_stage is None or new_stage is None:
+            continue
+        recorded, current, new_key = keys(old_stage), keys(new_stage), rebound_key(new_stage)
+        if not recorded or new_key is None:
+            continue
+        configs = [stage.get("provider_config")]
+        configs += [item.get("provider_config") for item in stage.get("alternate_providers") or []]
+        for config in configs:
+            workload = config.get("workload") if isinstance(config, dict) else None
+            declared = workload.get("input") if isinstance(workload, dict) else None
+            if not isinstance(declared, dict) or not config.get("adapted"):
+                continue
+            old_key = declared.get("snapshot_digest")
+            if old_key not in recorded or old_key in current:
+                continue  # not the source's recorded key, or it still names the inputs
+            old_token = f"input:{old_key}:{declared.get('max_bytes')}"
+            declared["snapshot_digest"] = new_key
+            workload["argv_template"] = [
+                f"input:{new_key}:{declared.get('max_bytes')}" if token == old_token else token
+                for token in workload.get("argv_template", [])
+            ]
 
 
 def _recorded_digest(

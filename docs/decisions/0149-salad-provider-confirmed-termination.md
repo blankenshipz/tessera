@@ -38,7 +38,10 @@ person reconciled the grant. Runs that hit repeated reallocations all ended this
    `termination_poll_seconds` (default 15, 5 to 60) until the reading confirms or
    `termination_confirm_seconds` pass (default 600, 0 to 3600; 0 disables the wait). A refused
    observe (fenced route, spent effect budget) ends the wait at once; three failed reads in a row
-   end it too. It never sends create, start, stop or delete.
+   end it too. It never sends create, start, stop or delete. The wait runs at most once per
+   attempt in one executor process: when the finish then waits for another pass (a deferred
+   finish), later passes re-read the route rather than wait again (a restarted executor may wait
+   once more). What confirms is unchanged.
 3. **Confirmed: the existing path.** The executor reports the exited observation once (its fixed
    idempotency key) at the confirming read's time. Control re-reads the route itself, scoped to the
    campaign's org and project, and requires both the confirmed reading and a confirmed exit before

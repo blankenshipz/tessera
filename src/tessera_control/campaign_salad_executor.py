@@ -849,6 +849,10 @@ class SaladCampaignExecutor:
         # Deferred finishes per attempt: (first deferral clock, deferrals); in memory only.
         self._finish_deferred: dict[str, tuple[float, int]] = {}
         self._final_retryable: dict[str, bool] = {}
+        # Attempts whose finish already ran the full provider termination wait in this process:
+        # a deferred finish re-reads the route on later passes instead of waiting again.
+        self._termination_waited: set[str] = set()
+        # This pass's notes only (``run_once`` returns them; the service loop journals them).
         self.log: list[dict[str, Any]] = []
         # Concurrent mode only (``max_concurrent_paid_routes`` above 1): the routes whose child
         # runs now, by attempt. Every field of the executor is read and written by the pass's own
@@ -871,7 +875,8 @@ class SaladCampaignExecutor:
         return self.config.max_concurrent_paid_routes > 1
 
     def run_once(self) -> list[dict[str, Any]]:
-        start = len(self.log)
+        # Only this pass's notes are kept: a long-running service never accumulates history.
+        self.log = []
         self._heartbeat_sent = False
         self._renewal_heartbeat = False
         concurrent = self.concurrent
@@ -882,7 +887,7 @@ class SaladCampaignExecutor:
         except Exception as error:
             self._note("work_unavailable", None, type(error).__name__)
             self._heartbeat_once(None)
-            return self.log[start:]
+            return list(self.log)
         try:
             self._pass(items, concurrent)
         finally:
@@ -891,7 +896,7 @@ class SaladCampaignExecutor:
             # already heartbeated for a lease or a renewal sends no second one).
             if not self._renewal_heartbeat:
                 self._heartbeat_once(None)
-        return self.log[start:]
+        return list(self.log)
 
     def _pass(self, items: list[dict[str, Any]], concurrent: bool) -> None:
         if concurrent:
@@ -911,6 +916,7 @@ class SaladCampaignExecutor:
         for attempt in set(self._renewal_streak) - listed:
             # An attempt control no longer lists has ended: its renewal streak goes with it.
             del self._renewal_streak[attempt]
+        self._prune_ended(listed)
         for item in items:
             attempt = item["attempt_id"]
             if concurrent and attempt in self._in_flight:
@@ -954,6 +960,21 @@ class SaladCampaignExecutor:
                 self._note("error", attempt, type(error).__name__)
                 self._refused[attempt] = self._step
                 self._record_rejection(attempt, error)
+
+    def _prune_ended(self, listed: set[str]) -> None:
+        """Drop per-attempt finish state of attempts that have definitely ended: control no
+        longer lists them, no child runs them and no finish of theirs is deferred.
+
+        Only state that never guards a forward step is dropped here. ``_leases`` (an
+        ``awaiting_lease`` attempt of a blocked campaign is unlisted until it resumes, and its
+        cached lease is the only one it has), ``fenced`` (never launched or renewed past a
+        refusal) and ``_no_receipt_resumed`` (a no-receipt marker is reported once) are kept."""
+        keep = listed | set(self._in_flight) | set(self._finish_deferred)
+        for attempt in set(self._final_retryable) - keep:
+            del self._final_retryable[attempt]
+        self._termination_waited &= keep
+        # A no-receipt report is only ever re-sent for a listed ``executing`` attempt.
+        self.no_receipt &= keep
 
     def _record_rejection(self, attempt_id: str, error: BaseException) -> None:
         """Make a control refusal visible on the stage (a short code); never alters the pass."""
@@ -1753,7 +1774,14 @@ class SaladCampaignExecutor:
         provider_id = state.get("provider_id")
         lease = self._lease_for(item)
         waiting = provider_termination(state)
-        if waiting.status == "unconfirmed" and waiting.reason != "no_stop_requested":
+        if (
+            waiting.status == "unconfirmed"
+            and waiting.reason != "no_stop_requested"
+            and attempt not in self._termination_waited
+        ):
+            # The full wait runs once per attempt in this process; a deferred finish's later
+            # passes use the route just read (its confirmation, if any, came in since).
+            self._termination_waited.add(attempt)
             state = self._confirm_termination(attempt, route_id, self._profile_for(item))
         if not passed and self._unconfirmed_stop_held(item, receipt, state):
             return
@@ -1856,6 +1884,8 @@ class SaladCampaignExecutor:
             ),
         )
         self._finish_deferred.pop(attempt, None)
+        self._termination_waited.discard(attempt)
+        self._final_retryable.pop(attempt, None)
         self._note("outcome_recorded", attempt, "manifest" if manifest_id else "no_manifest")
 
     @staticmethod

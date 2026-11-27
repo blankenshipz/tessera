@@ -987,7 +987,8 @@ group but never confirms that stop itself. The executor then reads the group thr
 (one `observe` every `termination_poll_seconds`, default 15) until the provider's own read shows
 the group stopped with no instance, for at most `termination_confirm_seconds` (executor config,
 default 600, at most 3600, 0 disables the wait). Only that recorded provider read confirms; the
-guardian's status or a worker report never does.
+guardian's status or a worker report never does. The wait runs once per attempt in one executor
+process; a finish deferred to a later pass re-reads the route instead of waiting again.
 
 - Confirmed: the executor reports the exit once, control checks the route itself, and the attempt
   ends `failed` (outputs are never accepted after a reallocation) and settles through the usual
