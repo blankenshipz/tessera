@@ -393,6 +393,8 @@ class SaladLiveSession:
 
         self.config_file = Path(config_file)
         self._seen_output = None
+        # The route's fixed proposal, read once by ``execution_authority`` (bounded).
+        self._authority_proposal = None
         try:
             self.config, policy, self.config_digest = _config(self.config_file)
             auth = Store(Path(self.config["state_dir"]))
@@ -612,30 +614,39 @@ class SaladLiveSession:
 
         from .store import _connect, _read_snapshot, bounded_lock_wait
 
-        proposal = self.state(route)["proposal"]
         store = self.server.store
         with (
             bounded_lock_wait(KEEPALIVE_LOCK_WAIT_SECONDS),
             _calling("Store.execution_authority"),
             _wall_bound(5),
-            closing(_connect(store.database_path)) as db,
-            _read_snapshot(db),
         ):
-            live = store._live_principal(db, self.server.worker, audience="worker")
-            op, _ = store._operation(db, live, proposal)
-            grant = db.execute(
-                "SELECT status, epoch FROM execution_grants WHERE id=?", (op["grant_id"],)
-            ).fetchone()
-            lease = db.execute(
-                "SELECT epoch FROM execution_leases WHERE id=?", (op["lease_id"],)
-            ).fetchone()
-            if grant is None or lease is None:
-                raise ValueError("execution authority unreadable")
-            return {
-                "grant_status": grant["status"],
-                "operation_desired": op["desired_state"],
-                "epoch_current": grant["epoch"] == proposal["epoch"] == lease["epoch"],
-            }
+            # The route's proposal is fixed (its digest is pinned by the config), so it is read
+            # once, and that read sits inside the same lock and wall bounds as the authority
+            # read: a held write lock can never stretch it past the guardian's beat bound.
+            proposal = getattr(self, "_authority_proposal", None)
+            if proposal is None:
+                proposal = self.state(route)["proposal"]
+                self._authority_proposal = proposal
+            with closing(_connect(store.database_path)) as db, _read_snapshot(db):
+                return self._authority_facts(store, db, proposal)
+
+    def _authority_facts(self, store, db, proposal):
+        """``execution_authority``'s one-snapshot read of the operation, grant and lease."""
+        live = store._live_principal(db, self.server.worker, audience="worker")
+        op, _ = store._operation(db, live, proposal)
+        grant = db.execute(
+            "SELECT status, epoch FROM execution_grants WHERE id=?", (op["grant_id"],)
+        ).fetchone()
+        lease = db.execute(
+            "SELECT epoch FROM execution_leases WHERE id=?", (op["lease_id"],)
+        ).fetchone()
+        if grant is None or lease is None:
+            raise ValueError("execution authority unreadable")
+        return {
+            "grant_status": grant["status"],
+            "operation_desired": op["desired_state"],
+            "epoch_current": grant["epoch"] == proposal["epoch"] == lease["epoch"],
+        }
 
     def _note_beat(self, route, *, last_verified):
         """Record a beat the guardian took: the monotonic gap since the previous one."""
@@ -2080,7 +2091,7 @@ def _drive(
     def control_check():
         """Raise ControlCancelRequested when control's own authoritative record (a fresh read of
         the route's grant, operation and lease; ``SaladLiveSession.execution_authority``) says
-        it decided to stop the route. Asked once per poll interval, before the heartbeat, so a
+        it decided to stop the route. Asked once per poll interval, after the heartbeat, so a
         cancel ends the run even when nothing else refuses. A read that fails is never a cancel:
         it is counted (``control_authority_read_failures``, ``last_control_authority_read_failure``,
         sanitized) and the existing stall / hold handling applies. A session without the read
@@ -2121,6 +2132,19 @@ def _drive(
         receipt["control_cancel"]["output_retained"] = retained
         if not retained:
             raise ControlCancelRequested()
+
+    def beat_then_check(launched):
+        """The guardian beat (once launched), then control's authority check, so a held write
+        lock on the authority read never pushes the beat past its staleness bound. When the
+        beat itself fails, control's record is still read first: a cancel explains that
+        refusal and ends the run as control's cancel; otherwise the beat's failure stands."""
+        if launched:
+            try:
+                heartbeat()
+            except Exception:
+                control_check()
+                raise
+        control_check()
 
     def refusal_stall(evidence):
         """True when a refusal on a running route is a transient control stall, not a cancel:
@@ -2542,8 +2566,9 @@ def _drive(
             settle_started = clock()
             settle_retried = False
             for _ in range(max_polls):
-                control_check()
+                # The guardian beat first: the authority read never delays it.
                 settle_beat()
+                control_check()
                 try:
                     state = settle_read()
                 except Exception as error:
@@ -2604,9 +2629,7 @@ def _drive(
             # held (``hold``): recorded sanitized, retried next interval, never a cancel.
             where = {"step": "keepalive"}
             try:
-                control_check()
-                if launched:
-                    heartbeat()
+                beat_then_check(launched)
                 began = clock()
                 where["step"] = "observe"
                 observed = observe()
@@ -2688,9 +2711,7 @@ def _drive(
                     waited = interval
                     where["step"] = "keepalive"
                     while waited < PRESTART_POLL_INTERVAL_SECONDS and clock() < deadline:
-                        control_check()
-                        if launched:
-                            heartbeat()
+                        beat_then_check(launched)
                         slice_seconds = min(interval, PRESTART_POLL_INTERVAL_SECONDS - waited)
                         sleep(min(slice_seconds, max(0, deadline - clock())))
                         waited += slice_seconds

@@ -155,18 +155,60 @@ fenced, or the worker shown as disconnected). Nothing was sent to the provider b
 Such an attempt is now unwound through the existing unclaimed path (cancel any proposed route,
 revoke the grant, reconcile at 0 on the store's own no-claim proof). It closes as
 `failed_transient` / `not_started`, so it uses an attempt number but no scientific retry, and the
-stage gets a fresh grant and lease. Two reasons apply: `lease_lapsed_before_route`, read from the
-lease row before the reviewed, capability or route phases run, and
-`worker_unavailable_before_route`, used when a pre-route step was refused and the registry shows
-the worker not ready or not seen within its heartbeat window. Both are read from the store and
-never parsed from a refusal message. While the review is still pending the attempt is left alone,
-so a person who is away does not get a new review stop for every lapse.
+stage gets a fresh grant and lease. Two reasons apply:
+
+- `lease_lapsed_before_route`, read from the lease row before the `leased`, `reviewed`,
+  `capability_ready` or `route_proposed` phase runs;
+- `worker_unavailable_before_route`, used only when control itself refused a pre-route step with
+  its authority class (a `Conflict`), and the store then shows that authority lapsed. That means
+  the attempt's lease, or its worker read exactly as `require_ready_worker` reads it: the
+  registry row of the worker's own credential in the project's org and project, not ready, with
+  invalid liveness, or not seen within its heartbeat window.
+
+The refusal decides, then the store confirms; nothing is parsed from a refusal message. A refusal
+the runner raised itself (`step_refused`: operator configuration, capability declaration, an
+intent that no longer matches), a `Forbidden` (including "not registered": a missing registry row
+is a configuration problem), or any other class stays a permanent step refusal, whatever the
+store shows. While the review is still pending the attempt is left alone.
+
+**Grant expiry before the route is reclassified.** The lease check runs before the
+`grant_expired_before_route` abandon. A grant that expired before the route in `leased`,
+`reviewed`, `capability_ready` or `route_proposed` also has a lapsed lease (the lease's hard
+expiry is bounded by the grant), so it now closes as `not_started` /
+`lease_lapsed_before_route` within the repeat bound, instead of `t1_salad_unclaimed` /
+`grant_expired_before_route`. Nothing was sent in those phases, so no scientific retry is spent;
+`grant_expired_before_route` still applies where the lease check does not (no recorded lease).
+
+**The approved review is carried over (no second review stop).** The plan and source-use
+reviews bind the attempt's run-minted study and source ids, so they are proposed after packaging,
+under the lease. The lease's hard expiry is fixed at issue, so a review slower than that bound
+always lapses it, and the requeue happens after a person approved. Deferring the lease until the
+review is resolved would mean proposing reviews before packaging and reordering the pre-route
+phases, so the approval is carried instead (`campaign_review_carryover`). The requeued attempt's
+pending review of the same kind is resolved by the runner, as the campaign's delegated actor, only
+when the immediately preceding attempt:
+
+- was taken off its route for one of the two lapse reasons above and closed `failed_transient`;
+- has a review of the same kind that is `approved`, by the same reviewer in the same project,
+  whose own expiry has not passed;
+- ran on the same provider;
+- has a review whose scope binds this stage (`_bound`) and whose core (the scope without the
+  run-minted ids, ADR 0044) digests exactly like the new one.
+
+It never approves more than was reviewed: any other core, reviewer, provider or an expired
+approval leaves the review pending, records `campaign.review_carryover_declined` with the reason,
+and asks the person (`campaign.stage_awaiting_human`). The `resolve_decision` intent names the
+carried approval (`carryover_decision_id`, owned by the campaign; exactly one of it or a
+`preapproval_id` is allowed). Control re-checks the whole carryover inside the resolving
+transaction and records `campaign.review_approval_carried_over` there. The campaign receipt lists
+every carryover under `review_carryovers`.
 
 The identical-repeat bound above still holds. Once a reason has repeated `MAX_AUTO_REQUEUES`
 times, the attempt keeps `t1_salad_unclaimed` and the stage's own retry bound decides. A
 completed `start_route`, a claimed provider effect, and every refusal that is not about worker
-authority (review, policy, capability or configuration) stay exactly as before.
+authority stay exactly as before.
 
 The Salad executor also heartbeats its worker registration on every pass, whether it is idle,
 holding only fenced attempts, or unable to list its work. Worker liveness no longer depends on
-lease renewals. Tests: `tests/test_salad_review_wait_lease.py`.
+lease renewals. Tests: `tests/test_salad_review_wait_lease.py`,
+`tests/test_salad_review_carryover.py`.

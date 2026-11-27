@@ -500,7 +500,7 @@ def test_corrupt_import_is_not_uploaded(tmp_path):
 
 def test_renewal_refusal_stops_keepalive_and_blocks_the_run(tmp_path):
     h = Harness(tmp_path)
-    h.control.renew_error = RuntimeError("fenced")
+    h.control.renew_error = Conflict("Execution lease is no longer current.")
     h.control.items = [item("route_started")]
     actions = [a["action"] for a in h.executor.run_once()]
     assert actions == ["lease_renewal_refused", "fenced_no_run"]

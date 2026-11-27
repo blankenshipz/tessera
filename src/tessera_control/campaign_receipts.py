@@ -1036,6 +1036,9 @@ def build_receipt(
     from .campaign_preapproval import preapproval_summary
 
     delegated = preapproval_summary(connection, campaign_id)
+    from .campaign_review_carryover import summary as carryover_summary
+
+    carried = carryover_summary(connection, campaign_id)
     rerun = lineage_of(connection, campaign_id, current["project_id"])
     return _finish(
         {
@@ -1092,6 +1095,9 @@ def build_receipt(
             # Reviews resolved by delegation, citing the approval (ADR 0044); absent when
             # none was recorded, so existing receipts keep their shape.
             **({"preapprovals": delegated} if delegated else {}),
+            # Reviews of a requeued Salad attempt resolved on the preceding attempt's approval
+            # of the same review core; absent when none was carried over.
+            **({"review_carryovers": carried} if carried else {}),
             # The campaign this one re-runs, the stages it re-runs and the outputs it reuses by
             # digest (ADR 0069); absent for a campaign that is not a re-run.
             **({"rerun": rerun} if rerun else {}),

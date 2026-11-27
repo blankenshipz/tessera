@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import ValidationError
 
 from . import campaign_preapproval, operator_config_freshness, provider_trust
+from . import campaign_review_carryover as review_carryover
 from . import campaign_salad_lease_lapse as lease_lapse
 from . import execution_frames as frames
 from .artifact_manifests import grant_manifest_is_partial
@@ -99,6 +100,9 @@ PRE_ROUTE_PHASES = ("leased", "awaiting_review", "reviewed", "capability_ready",
 DECISION_HOURS = 23
 CAPABILITY_HOURS = 23
 SILENT_EXECUTOR_GRACE_SECONDS = 600
+# ``resolve_decision`` slots of a carried-over review (plan, source use): apart from the
+# pre-approval's 0 and 1, so a refused carryover never replays into the pre-approval path.
+CARRYOVER_ORDINAL = 10
 # v0.104.0: the silent window passed for a route control can prove was never sent anything;
 # it takes the existing unclaimed unwind and is requeued as not started (ADR 0046), never
 # ``unknown``.
@@ -287,6 +291,26 @@ def _resolve_build(decision_id: str, revision: int, kind: str, digest: str, pre_
                 "decision": "approve",
                 "rationale": (
                     f"Delegated under review pre-approval {pre_id} (exact {kind} digest {digest})"
+                ),
+            },
+        )
+
+    return build
+
+
+def _carryover_build(
+    decision_id: str, revision: int, kind: str, prior_id: str, prior_attempt: int | None
+):
+    def build() -> tuple[dict[str, str], dict[str, Any]]:
+        return (
+            {"decision_id": decision_id, "carryover_decision_id": prior_id},
+            {
+                "decision_id": decision_id,
+                "expected_revision": revision,
+                "decision": "approve",
+                "rationale": (
+                    f"Carried over from approved {kind} review {prior_id} of attempt "
+                    f"{prior_attempt}, requeued before its route for a lapse (exact review core)"
                 ),
             },
         )
@@ -920,10 +944,11 @@ class SaladStageDriver:
             raise _waiting()()
         try:
             return handler(ctx, stage, spec_stage, attempt, row)
-        except StepFailed:
+        except StepFailed as error:
             # A pre-route refusal of the worker's own authority (disconnected worker, lapsed
-            # lease), read from the store: nothing was sent, so it is requeued, not permanent.
-            lapsed = lease_lapse.after_refusal(self, ctx, attempt, row)
+            # lease): control's own Conflict, confirmed from the store; nothing was sent, so it
+            # is requeued, not permanent.
+            lapsed = lease_lapse.after_refusal(self, ctx, attempt, row, error)
             if lapsed is None:
                 raise
             return lease_lapse.requeue(self, ctx, attempt, lapsed)
@@ -1155,7 +1180,11 @@ class SaladStageDriver:
             self._move(attempt["id"], source_decision_id=result.response["id"])
             return True
         self._move(attempt["id"], phase="awaiting_review")
-        if self._preapproval(ctx, key) is None:
+        with self.runner.store.runner_connection() as connection:
+            carried = review_carryover.available(
+                connection, ctx.campaign["id"], key, attempt["attempt"]
+            )
+        if self._preapproval(ctx, key) is None and not carried:
             self._awaiting_human(
                 ctx,
                 key,
@@ -1332,6 +1361,7 @@ class SaladStageDriver:
     ) -> None:
         """Approve this attempt's plan and source-use reviews under a pre-approval; any
         decline leaves the review pending for a human."""
+        self._carry_reviews(ctx, key, attempt, row)
         pre = self._preapproval(ctx, key)
         if pre is None:
             return
@@ -1376,6 +1406,72 @@ class SaladStageDriver:
                     ctx, key, attempt["attempt"], kind, decision_id, f"step_{error.error_class}"
                 )
 
+    def _carry_reviews(
+        self, ctx: _Ctx, key: str, attempt: dict[str, Any], row: dict[str, Any]
+    ) -> None:
+        """Resolve this attempt's pending reviews on the preceding attempt's approval when it
+        was requeued for a pre-route lapse and the review is exactly the one approved
+        (``campaign_review_carryover``); anything else stays pending for a person."""
+        for ordinal, (kind, column) in enumerate(
+            (("plan", "plan_decision_id"), ("source_use", "source_decision_id")),
+            start=CARRYOVER_ORDINAL,
+        ):
+            decision_id = row[column]
+            with self.runner.store.runner_connection() as connection:
+                current = connection.execute(
+                    "SELECT status, revision FROM decision_requests WHERE id=?", (decision_id,)
+                ).fetchone()
+                if current is None or current["status"] != "pending":
+                    continue
+                verdict = review_carryover.evaluate(
+                    connection,
+                    campaign_id=ctx.campaign["id"],
+                    stage_key=key,
+                    kind=kind,
+                    subject_id=decision_id,
+                )
+            if verdict.reason in (
+                review_carryover.NO_PRIOR,
+                review_carryover.PRIOR_NOT_LAPSED,
+                review_carryover.NOT_PENDING,
+            ):
+                continue  # not a requeued attempt's review: nothing to carry
+            if verdict.reason is not None or verdict.prior_decision_id is None:
+                self._carryover_declined(
+                    ctx, key, attempt["attempt"], kind, decision_id, str(verdict.reason)
+                )
+                continue
+            try:
+                self.runner._step(
+                    ctx,
+                    key,
+                    attempt["attempt"],
+                    "resolve_decision",
+                    ordinal,
+                    _carryover_build(
+                        decision_id,
+                        current["revision"],
+                        kind,
+                        verdict.prior_decision_id,
+                        verdict.prior_attempt,
+                    ),
+                )
+            except StepFailed as error:
+                # Refused at use time: the review waits for a person, as before.
+                self._carryover_declined(
+                    ctx, key, attempt["attempt"], kind, decision_id, f"step_{error.error_class}"
+                )
+
+    def _carryover_declined(
+        self, ctx: _Ctx, key: str, attempt: int | None, kind: str, subject: str, reason: str
+    ) -> None:
+        self._emit_once(
+            ctx,
+            review_carryover.DECLINED_EVENT,
+            {"stage_key": key, "attempt": attempt, "kind": kind, "subject_id": subject},
+            {"reason": reason},
+        )
+
     def _await_review(
         self,
         ctx: _Ctx,
@@ -1405,7 +1501,13 @@ class SaladStageDriver:
                 return self._abandon(ctx, stage, spec_stage, attempt, "review_basis_stale")
             states.append(decision["status"] == "approved" and review["is_effective_review"])
         if not all(states):
-            if self._preapproval(ctx, stage["stage_key"]) is not None:
+            with self.runner.store.runner_connection() as connection:
+                carried = review_carryover.available(
+                    connection, ctx.campaign["id"], stage["stage_key"], attempt["attempt"]
+                )
+            # Whoever skipped the review notice at proposal (a pre-approval, an offered
+            # carryover) and did not resolve both reviews now hands them to a person.
+            if self._preapproval(ctx, stage["stage_key"]) is not None or carried:
                 self._awaiting_human(
                     ctx,
                     stage["stage_key"],

@@ -742,6 +742,22 @@ def authorize_delegated(
         "SELECT * FROM campaign_step_intents WHERE id=?", (delegated["intent_id"],)
     ).fetchone()
     resources = json.loads(intent["resources_json"]) if intent else {}
+    carried = resources.get("carryover_decision_id")
+    if intent is not None and carried and not resources.get("preapproval_id"):
+        if (
+            step != "resolve_decision"
+            or intent["step"] != "resolve_decision"
+            or intent["campaign_id"] != delegated["campaign_id"]
+            or intent["approval_id"] != delegated["approval_id"]
+            or not approve
+        ):
+            raise Forbidden(_DENIED)
+        from .campaign_review_carryover import authorize
+
+        # The preceding attempt's approval of the same review (exact core digest), re-checked
+        # and recorded in this transaction.
+        authorize(connection, live, intent, kind=kind, subject_id=subject_id, prior_id=carried)
+        return
     pre = connection.execute(
         "SELECT * FROM campaign_review_preapprovals WHERE id=?", (resources.get("preapproval_id"),)
     ).fetchone()

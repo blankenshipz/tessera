@@ -114,6 +114,9 @@ _ROUTE_COMMANDS = {"approve_route": "approve", "start_route": "start", "cancel_r
 # Resources a step may declare beyond its path placeholders and the common extras.
 _STEP_EXTRAS = {
     "propose_decision": frozenset({"project_id", "study_id", "decision_action"}),
+    # A requeued Salad attempt's review resolved on the preceding attempt's approval
+    # (``campaign_review_carryover``), named by that approved decision.
+    "resolve_decision": frozenset({"carryover_decision_id"}),
     **{step: frozenset({"command"}) for step in _ROUTE_COMMANDS},
 }
 _DECISION_ACTIONS = frozenset({"plan", "source_use"})
@@ -211,7 +214,12 @@ def _check_resources(step: str, path_values: dict[str, str], resources: Mapping[
         raise Forbidden(_DENIED)
     if step == "release_snapshot" and resources.get("classification") not in _CLASSIFICATIONS:
         raise Forbidden(_DENIED)
-    if step in {"assess_source", "resolve_decision"} and not resources.get("preapproval_id"):
+    if step == "assess_source" and not resources.get("preapproval_id"):
+        raise Forbidden(_DENIED)
+    if step == "resolve_decision" and (
+        bool(resources.get("preapproval_id")) == bool(resources.get("carryover_decision_id"))
+    ):
+        # Exactly one basis: an exact-digest pre-approval, or a carried-over approval.
         raise Forbidden(_DENIED)
 
 
@@ -495,7 +503,9 @@ def _resource_owned(
             ).fetchone()
             is not None
         )
-    if name == "decision_id":
+    if name in {"decision_id", "carryover_decision_id"}:
+        # A review of one of this campaign's own Salad attempts (the carried-over approval
+        # included; ``campaign_review_carryover`` decides whether it covers the new one).
         return (
             connection.execute(
                 """SELECT 1 FROM campaign_salad_attempts sa JOIN campaign_stage_attempts a

@@ -233,3 +233,28 @@ def test_real_authority_read_under_a_write_lock_is_a_stall_not_a_cancel(real_rou
     finally:
         holder.execute("ROLLBACK")
         holder.close()
+
+
+def test_the_real_state_read_is_bounded_under_a_write_lock(real_route):
+    # No stub: the route's state is read through the real store, before anything was cached,
+    # while another writer holds the database. The read sits inside the authority read's lock
+    # bound, so it stalls for seconds (a stall, never a cancel), not the 45 s busy timeout that
+    # would push the guardian beat past its 30 s bound.
+    import time
+
+    h, route, database, session = real_route
+    holder = sqlite3.connect(database, isolation_level=None)
+    holder.execute("BEGIN EXCLUSIVE")
+    started = time.monotonic()
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            session.execution_authority(route)
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert time.monotonic() - started < 10
+    # Once the lock is gone the same session reads control's record (and caches the proposal).
+    facts = session.execution_authority(route)
+    assert facts["grant_status"] == "active" and facts["epoch_current"] is True
+    session.state = lambda r: (_ for _ in ()).throw(AssertionError("proposal re-read"))
+    assert session.execution_authority(route)["operation_desired"] == "admitted"

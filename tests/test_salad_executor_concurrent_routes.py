@@ -28,6 +28,7 @@ from tessera_control.campaign_salad_executor import (
     load_config,
 )
 from tessera_control.salad_live_check import installed_source_pin
+from tessera_control.store import Conflict
 
 WAIT = 5.0
 
@@ -332,11 +333,11 @@ def test_a_lease_refused_while_another_route_runs_fences_only_that_attempt(tmp_p
     executor = executor_for(tmp_path, control, runner, routes=2)
     control.renew_error = None
     executor.run_once()
-    control.renew_error = RuntimeError("fenced")
+    control.renew_error = Conflict("Execution lease is no longer current.")
     log = executor.run_once()
     # The in-flight route's child renews its own lease: the pass never renews it, so a refused
     # renewal fences only the attempt it was sent for.
-    assert actions(log, "att_9") == [("lease_renewal_refused", "RuntimeError")]
+    assert actions(log, "att_9") == [("lease_renewal_refused", "Conflict")]
     assert "att_1" not in executor.fenced
     control.renew_error = None
     runner.finish(executor, "route_1")

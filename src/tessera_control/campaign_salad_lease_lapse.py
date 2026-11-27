@@ -82,14 +82,28 @@ def lease_problem(driver: SaladStageDriver, row: dict[str, Any], now: datetime) 
 
 
 def worker_problem(driver: SaladStageDriver, grant: dict[str, Any], now: datetime) -> str | None:
-    """Why control would refuse the grant's worker new lease authority, or None."""
+    """Why control's ``require_ready_worker`` would refuse the grant's worker with a Conflict
+    (not ready, invalid liveness, not seen within its heartbeat window), or None.
+
+    Read the way control reads it: the registry row of the worker's own credential in the
+    grant's org and project. A missing row is control's Forbidden "not registered", a
+    configuration problem, never a transient lapse, so it is None here too."""
     worker = driver.runner._one(
-        """SELECT lifecycle_state, last_seen_at FROM worker_registry
-        WHERE worker_principal_id=? AND project_id=?
-        ORDER BY last_seen_at DESC LIMIT 1""",
-        (grant["worker_principal_id"], grant["project_id"]),
+        """SELECT registry.lifecycle_state, registry.last_seen_at FROM worker_registry registry
+        JOIN credentials ON credentials.id = registry.credential_id
+        WHERE registry.worker_principal_id=? AND credentials.principal_id=?
+        AND registry.project_id=?
+        AND registry.org_id=(SELECT org_id FROM projects WHERE id=?)""",
+        (
+            grant["worker_principal_id"],
+            grant["worker_principal_id"],
+            grant["project_id"],
+            grant["project_id"],
+        ),
     )
-    if worker is None or worker["lifecycle_state"] != "ready":
+    if worker is None:
+        return None
+    if worker["lifecycle_state"] != "ready":
         return WORKER_UNAVAILABLE_BEFORE_ROUTE
     try:
         seen = _parse_utc(worker["last_seen_at"])
@@ -183,14 +197,29 @@ def before_handler(
     return lease_problem(driver, row, _control_now())
 
 
+# The refusal classes control itself raises when a step's worker authority is not current
+# (``require_ready_worker``'s Conflict; a lapsed or fenced lease's Conflict). A refusal the
+# runner raised locally (``step_refused``: operator configuration, capability declaration,
+# an intent that no longer matches) or any other class is never a lapse.
+CONTROL_AUTHORITY_REFUSALS = frozenset({"Conflict"})
+
+
 def after_refusal(
     driver: SaladStageDriver,
     ctx: _Ctx,
     attempt: dict[str, Any],
     row: dict[str, Any],
+    error: Any,
 ) -> str | None:
-    """A pre-route step was refused: the reason to requeue when the store shows the worker's
-    authority itself lapsed (never a review, policy or configuration refusal), else None."""
+    """A pre-route step was refused: the reason to requeue, or None.
+
+    Only a refusal control itself returned with the authority class (a Conflict, not a local
+    ``step_refused``, a Forbidden or a replay of some other failure), and only when the store
+    then shows that very authority lapsed: the attempt's lease, or its worker as
+    ``require_ready_worker`` reads it. Review, policy and configuration refusals stay
+    fail-closed."""
+    if getattr(error, "error_class", None) not in CONTROL_AUTHORITY_REFUSALS:
+        return None
     if row["phase"] not in PRE_ROUTE or _started(driver, ctx, attempt):
         return None
     now = _control_now()

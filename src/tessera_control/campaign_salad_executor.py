@@ -606,13 +606,31 @@ KEEPALIVE_SECONDS = 20
 KEPT_ALIVE_PHASES = LEASE_HELD_PHASES | {"route_started", "executing"}
 
 
+def _renewal_refused(error: BaseException) -> bool:
+    """A renewal control refused (the lease is fenced, foreign or gone): final for this process.
+    Anything else (a held write lock, a timeout, a connection error, an unclassified failure) is
+    a transient failure: counted and retried at the next renewal. A lease that really lapses
+    behind repeated transient failures is refused by control at the next renewal that gets
+    through, so retrying never extends authority past its bounds."""
+    from .store import Conflict, Forbidden, NotFound
+
+    return isinstance(error, (Conflict, Forbidden, NotFound))
+
+
+# How long the pass waits for the keepalive thread to stop after a child returns. A beat stuck
+# in a lock wait finishes on its own; the pass goes on without it (and records that).
+KEEPALIVE_JOIN_SECONDS = 5.0
+KEEPALIVE_MARKER = "keepalive.json"
+
+
 class _Keepalive:
     """Registry heartbeat and lease renewal on its own thread while a route's child runs.
 
-    It holds a private copy of the leases to renew and writes only its own record; the pass
-    reads that record after ``stop`` (joined) and applies it (``self.fenced``) on its own
-    thread. A refused renewal is recorded once and never retried past the fence; the running
-    route's own lease is renewed by its child, never here."""
+    It holds a private copy of the leases to renew and writes only its own record, under its
+    lock; the pass reads a snapshot of that record after ``stop`` and applies it
+    (``self.fenced``) on its own thread. A refused renewal is recorded once and never retried
+    past the fence; a transient failure is counted and retried at the next interval. The
+    running route's own lease is renewed by its child, never here."""
 
     def __init__(
         self, control: Any, leases: Mapping[str, tuple[str, int]], interval: float
@@ -620,8 +638,12 @@ class _Keepalive:
         self.control, self.interval = control, interval
         self.leases = dict(leases)
         self.refused: dict[str, str] = {}
+        self.transient: dict[str, int] = {}
+        self.last_transient: dict[str, str] = {}
         self.beats = 0
         self.heartbeat_failures: list[str] = []
+        self.join_timed_out = False
+        self._lock = threading.Lock()
         self._stop = threading.Event()
         self.thread = threading.Thread(target=self._run, name="salad-keepalive", daemon=True)
 
@@ -632,15 +654,36 @@ class _Keepalive:
     def beat(self) -> None:
         try:
             self.control.heartbeat()
-            self.beats += 1
+            with self._lock:
+                self.beats += 1
         except Exception as error:  # noqa: BLE001 - recorded, retried next interval
-            self.heartbeat_failures.append(type(error).__name__)
+            with self._lock:
+                self.heartbeat_failures.append(type(error).__name__)
         for attempt, lease in list(self.leases.items()):
+            if self._stop.is_set():
+                return  # stopping: the pass renews what is left itself
             try:
                 self.control.renew(*lease)
-            except Exception as error:  # noqa: BLE001 - recorded as the pass's fence
-                self.refused[attempt] = type(error).__name__
-                del self.leases[attempt]
+            except Exception as error:  # noqa: BLE001 - classified below
+                with self._lock:
+                    if _renewal_refused(error):
+                        self.refused[attempt] = type(error).__name__
+                        del self.leases[attempt]
+                    else:
+                        self.transient[attempt] = self.transient.get(attempt, 0) + 1
+                        self.last_transient[attempt] = type(error).__name__
+
+    def snapshot(self) -> dict[str, Any]:
+        """A consistent copy of the record (the thread may still be finishing a beat)."""
+        with self._lock:
+            return {
+                "refused": dict(self.refused),
+                "transient": dict(self.transient),
+                "last_transient": dict(self.last_transient),
+                "beats": self.beats,
+                "heartbeat_failures": list(self.heartbeat_failures),
+                "join_timed_out": self.join_timed_out,
+            }
 
     def __enter__(self) -> _Keepalive:
         self.thread.start()
@@ -648,7 +691,26 @@ class _Keepalive:
 
     def __exit__(self, *exc: Any) -> None:
         self._stop.set()
-        self.thread.join()
+        self.thread.join(KEEPALIVE_JOIN_SECONDS)
+        if self.thread.is_alive():
+            with self._lock:
+                self.join_timed_out = True
+
+
+def keepalive_counts(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The receipt's ``executor_keepalive`` block: counts only (closed names, no identifiers
+    beyond the attempts' own), or None when the keepalive saw nothing to report."""
+    transient = sum(record["transient"].values())
+    failures = record["heartbeat_failures"]
+    if not (transient or failures or record["refused"] or record["join_timed_out"]):
+        return None
+    return {
+        "beats": record["beats"],
+        "heartbeat_failures": len(failures),
+        "renewal_transient_failures": transient,
+        "renewals_refused": len(record["refused"]),
+        "join_timed_out": record["join_timed_out"],
+    }
 
 
 def _key(step: str, attempt_id: str) -> str:
@@ -906,10 +968,18 @@ class SaladCampaignExecutor:
         if lease is None:
             return
         try:
-            self._renewal_heartbeat = True
             self.control.heartbeat()
+            # Only a heartbeat that went through spares the pass-end fallback (F-5).
+            self._renewal_heartbeat = True
+        except Exception as error:  # noqa: BLE001 - liveness is retried next pass, never a fence
+            self._note("heartbeat_failed", attempt, type(error).__name__)
+        try:
             self.control.renew(*lease)
         except Exception as error:
+            if not _renewal_refused(error):
+                # A held write lock or a timeout: retried next pass, never a fence.
+                self._note("lease_renewal_transient", attempt, type(error).__name__)
+                return
             self.fenced[attempt] = type(error).__name__
             self._note("lease_renewal_refused", attempt, type(error).__name__)
 
@@ -932,18 +1002,45 @@ class SaladCampaignExecutor:
                 leases[attempt] = lease
         return _Keepalive(self.control, leases, self.keepalive_seconds)
 
-    def _apply_keepalive(self, keepalive: _Keepalive) -> None:
-        """Record, on the pass's thread, what the stopped keepalive thread saw."""
-        for attempt, name in sorted(keepalive.refused.items()):
+    def _apply_keepalive(self, keepalive: _Keepalive) -> dict[str, Any]:
+        """Record, on the pass's thread, what the stopped keepalive thread saw; returns the
+        snapshot it applied."""
+        record = keepalive.snapshot()
+        for attempt, name in sorted(record["refused"].items()):
             if attempt not in self.fenced:
                 self.fenced[attempt] = name
                 self._note("lease_renewal_refused", attempt, name)
-        if keepalive.heartbeat_failures:
+        for attempt, count in sorted(record["transient"].items()):
+            self._note(
+                "lease_renewal_transient", attempt, f"{record['last_transient'][attempt]} x{count}"
+            )
+        if record["heartbeat_failures"]:
             self._note(
                 "heartbeat_failed",
                 None,
-                f"{keepalive.heartbeat_failures[-1]} x{len(keepalive.heartbeat_failures)}",
+                f"{record['heartbeat_failures'][-1]} x{len(record['heartbeat_failures'])}",
             )
+        if record["join_timed_out"]:
+            self._note("keepalive_join_timeout", None)
+        return record
+
+    def _save_keepalive(self, route_id: str, record: Mapping[str, Any]) -> None:
+        """Keep the child's keepalive counts beside its receipt, so every finish of it (now or
+        resumed from disk) records the same receipt."""
+        counts = keepalive_counts(record)
+        if counts is None:
+            return
+        try:
+            _write_private_json(self._route_dir(route_id) / KEEPALIVE_MARKER, counts)
+        except Exception as error:  # noqa: BLE001 - counts are diagnostics only
+            self._note("keepalive_counts_unsaved", None, type(error).__name__)
+
+    def _with_keepalive(self, route_id: str, receipt: dict[str, Any]) -> dict[str, Any]:
+        """The receipt with the executor's keepalive counts for its run, when there were any."""
+        counts = _read_private_json(self._route_dir(route_id) / KEEPALIVE_MARKER)
+        if not counts or "executor_keepalive" in receipt:
+            return receipt
+        return {**receipt, "executor_keepalive": counts}
 
     # -- steps 4 to 6: run a started route --------------------------------------------------
 
@@ -1075,13 +1172,13 @@ class SaladCampaignExecutor:
             config_path.unlink(missing_ok=True)
             if signals is not None:
                 watch.end(item["operation_id"])
-            self._apply_keepalive(keepalive)
+            self._save_keepalive(item["route_id"], self._apply_keepalive(keepalive))
         if receipt is None:
             self._note("no_receipt", attempt)
             self.no_receipt.add(attempt)
             self._report_no_receipt(item)
             return
-        self._finish(item, receipt)
+        self._finish(item, self._with_keepalive(item["route_id"], receipt))
 
     def _prepare_route(
         self,
@@ -1296,7 +1393,7 @@ class SaladCampaignExecutor:
         receipts = self._route_dir(item["route_id"]) / "receipts"
         receipt = read_receipt(receipts) if receipts.is_dir() else None
         if receipt is not None:
-            self._finish(item, receipt)
+            self._finish(item, self._with_keepalive(item["route_id"], receipt))
             return
         if item["attempt_id"] in self.no_receipt:
             self._report_no_receipt(item)
@@ -1323,7 +1420,7 @@ class SaladCampaignExecutor:
                 self._note("late_import_no_receipt", attempt)
             return
         self._note("late_import", attempt)
-        self._finish(item, receipt)
+        self._finish(item, self._with_keepalive(item["route_id"], receipt))
 
     def _never_launched(self, item: dict[str, Any]) -> bool:
         """True when the route has no create or start effect and names no provider group (a
