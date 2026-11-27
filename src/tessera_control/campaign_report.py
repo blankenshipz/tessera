@@ -43,16 +43,14 @@ _FAILURES = {
     "infra_container_killed": "the infrastructure killed the container",
     "infra_resource_limit": "the container hit a resource limit",
     "infra_allocation_timeout": "no cloud instance was allocated in time",
-    "infra_salad_create_not_sent": "the cloud create was refused before it was sent, so it "
-    "was retried",
+    "infra_salad_create_not_sent": "the cloud create was refused before it was sent",
     "infra_salad_provisioning_overrun": "the cloud machine was still starting when the time ran "
-    "out, so it was retried",
+    "out",
     "infra_salad_guardian_unavailable": "the cloud safety service was briefly unavailable "
-    "before the run started, so it was retried",
-    "infra_salad_reallocated": "the cloud provider moved the run to another machine, so it "
-    "was retried",
+    "before the run started",
+    "infra_salad_reallocated": "the cloud provider moved the run to another machine",
     "infra_salad_safety_stop": "the cloud safety service stopped the run for its own health "
-    "(not because of the stage), so it was retried",
+    "(not because of the stage)",
     "start_failure_suspected": "the container failed to start on several cloud machines",
     "salad_container_exited_nonzero": "the container process exited with a failing code",
     "salad_interrupted": "the cloud provider interrupted the run after it had started",
@@ -68,6 +66,24 @@ _FAILURES = {
     "egress_violation": "it transferred data outside the stage's egress allowlist",
     "prestart_no_spend": "it never started on that machine class and cost nothing, so the next "
     "class was tried",
+}
+
+# Classes whose words end with what happened next. That ending is chosen from the records, never
+# assumed: "so it was retried" only when a later attempt of the stage exists (AGENTS.md, keep
+# evidence honest).
+_RETRY_ENDED = frozenset(
+    {
+        "infra_salad_create_not_sent",
+        "infra_salad_provisioning_overrun",
+        "infra_salad_guardian_unavailable",
+        "infra_salad_reallocated",
+        "infra_salad_safety_stop",
+    }
+)
+_RETRY_WORDS = {
+    "retried": ", so it was retried",
+    "stopping": ", but it was not retried because the campaign was already stopping",
+    "used_up": ", but its retries were used up",
 }
 
 _STATUS_WORDS = {
@@ -162,8 +178,14 @@ def _plain(value: str) -> str:
     return value.replace("_", " ")
 
 
-def _failure_words(failure_class: str | None, exit_code: int | None = None) -> str:
+def _failure_words(
+    failure_class: str | None, exit_code: int | None = None, retry: str | None = None
+) -> str:
+    """``retry`` is what the records say followed the attempt: ``retried`` (a later attempt of
+    the stage exists), ``stopping`` or ``used_up`` (none exists); see ``_retry_disposition``."""
     text = _FAILURES.get(failure_class or "", _plain(failure_class or "an unrecorded reason"))
+    if failure_class in _RETRY_ENDED and retry in _RETRY_WORDS:
+        text += _RETRY_WORDS[retry]
     if failure_class in {"undeclared_exit_code", "t2_declared_exit_code"} and exit_code is not None:
         text += f" (exit code {exit_code})"
     return text
@@ -291,8 +313,21 @@ def _egress(attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
     return result
 
 
+def _retry_disposition(stage_key: str, stop_reason: str | None) -> str:
+    """Why the last attempt of a failed stage has no later attempt, from the records: a stop
+    reason that does not name this stage was set before the stage failed (a stage failure sets
+    the reason only when none is set), so the campaign was already stopping; otherwise the
+    stage's own bounds ended it."""
+    if stop_reason and not stop_reason.startswith(f"stage_failed:{stage_key}:"):
+        return "stopping"
+    return "used_up"
+
+
 def _stage_outcome(
-    stage: dict[str, Any], attempts: list[dict[str, Any]], finished: bool
+    stage: dict[str, Any],
+    attempts: list[dict[str, Any]],
+    finished: bool,
+    stop_reason: str | None = None,
 ) -> tuple[str, str]:
     """(short state, plain outcome sentence fragment)."""
     status = stage["status"]
@@ -301,7 +336,9 @@ def _stage_outcome(
         return "succeeded", "succeeded"
     if status == "failed":
         return "failed", "failed because " + _failure_words(
-            last.get("failure_class"), last.get("exit_code")
+            last.get("failure_class"),
+            last.get("exit_code"),
+            _retry_disposition(stage["stage_key"], stop_reason),
         )
     if status == "refused_budget":
         return "not_started", "was not started because the remaining budget was too small"
@@ -325,14 +362,16 @@ def _stage_report(
     attempt_rows: dict[int, sqlite3.Row],
     finished: bool,
     detail: bool,
+    stop_reason: str | None = None,
 ) -> dict[str, Any]:
     attempts = stage["attempts"]
-    state, outcome = _stage_outcome(stage, attempts, finished)
+    state, outcome = _stage_outcome(stage, attempts, finished, stop_reason)
     notes: list[str] = []
     reasons = []
     for attempt in attempts[:-1]:
         if attempt.get("failure_class"):
-            words = _failure_words(attempt["failure_class"], attempt.get("exit_code"))
+            # Every attempt but the last has a later attempt of the stage: it was retried.
+            words = _failure_words(attempt["failure_class"], attempt.get("exit_code"), "retried")
             if words not in reasons:
                 reasons.append(words)
     retried = None
@@ -545,7 +584,9 @@ def _campaign_report(
     ):
         attempt_rows.setdefault(row["stage_key"], {})[row["attempt"]] = row
     stages = [
-        _stage_report(s, attempt_rows.get(s["stage_key"], {}), finished, detail)
+        _stage_report(
+            s, attempt_rows.get(s["stage_key"], {}), finished, detail, campaign["stop_reason"]
+        )
         for s in receipt["stages"]
     ]
     starts = [r["created_at"] for rows in attempt_rows.values() for r in rows.values()]

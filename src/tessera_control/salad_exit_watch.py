@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import UTC, datetime
 from typing import Any
 
 from .salad_custody import CustodyBinding
@@ -25,33 +26,65 @@ from .salad_events import closed_record, empty_record
 NONZERO_EXIT_CAUSE = "container_exited_nonzero"
 FAILURE_CLASS = "salad_container_exited_nonzero"
 # 137 (SIGKILL, the out-of-memory / platform kill) and 143 (SIGTERM, a platform stop) keep today's
-# handling: they are not an entry failure of the workload.
+# handling when they come first: they are not an entry failure of the workload. After an earlier
+# non-zero exit they are the stop that ended the crash loop.
 PLATFORM_EXIT_CODES = frozenset({137, 143})
-# Bounded: one events read per interval, at most this many per frame (about ten minutes), so a
-# healthy long run costs a handful of log queries and a crash loop is seen before the replacement.
+# Bounded and backing off: reads start 30 s apart and the gap doubles every 4 reads (30, 60,
+# 120 s), at most 12 per frame (about 14 minutes), so a healthy long run costs a dozen log
+# queries and a crash loop (Salad replaces the machine after minutes) is seen early. A failed
+# read doubles the next gap again (capped at 240 s).
 WATCH_INTERVAL_SECONDS = 30
-WATCH_MAX_READS = 20
-# Receipt token: the events read carries no process output and no other log read is trusted.
-STDERR_UNAVAILABLE = {"outcome": "unavailable", "reason": "no_trusted_log_source"}
+WATCH_MAX_INTERVAL_SECONDS = 240
+WATCH_MAX_READS = 12
+# Every frame's watch reads together, per UTC day: Salad's log query limit is daily (a 429 lasts
+# until 00:00 UTC), and the one post-stop read that tells a failed start from a pre-custody
+# reallocation (ADR 0196) must still find quota. Past this budget the watch reads nothing more
+# that day; a rate-limited answer ends every watch read until the next UTC midnight.
+WATCH_DAILY_READ_BUDGET = 240
+# Receipt token when no container-log tail is recorded (yet) for a recorded non-zero exit: the
+# guardian's one log read has not finished or not been recorded when the receipt is built
+# (q-2716 review F4; not ``no_trusted_log_source``, since the read path exists).
+STDERR_UNAVAILABLE = {"outcome": "unavailable", "reason": "not_read"}
+
+
+def _utc_day() -> str:
+    """Salad's log limit resets at 00:00 UTC: the wall-clock UTC date, never a monotonic clock."""
+    return datetime.now(UTC).date().isoformat()
 
 
 def nonzero_exit_codes(record: Any) -> list[int]:
-    """The non-zero, non-platform exit codes of a closed start-events record that names an exit."""
+    """The non-zero, non-platform exit codes of a closed start-events record that names an exit,
+    when the earliest non-zero exit is the workload's own.
+
+    Codes are in first-seen order (``salad_events``). A crash loop the guardian stopped first
+    reads ``[1, 137]``: the entry failed (1) before the stop's kill (137), so it is the
+    workload's failure. A kill or platform stop that came first (``[137, ...]``, ``[143, ...]``)
+    keeps today's handling: it is not an entry failure."""
     closed = closed_record(record)
     if closed is None or closed["outcome"] != "read" or "instance_exited" not in closed["events"]:
         return []
-    codes = closed["exit_codes"]
-    if any(code in PLATFORM_EXIT_CODES for code in codes):
-        return []  # a kill or platform stop is in the record: not an entry failure
-    return [code for code in codes if code != 0]
+    nonzero = [code for code in closed["exit_codes"] if code != 0]
+    if not nonzero or nonzero[0] in PLATFORM_EXIT_CODES:
+        return []
+    return [code for code in nonzero if code not in PLATFORM_EXIT_CODES]
 
 
-def container_exit_receipt(record: Any) -> dict[str, Any] | None:
-    """Receipt evidence for a recorded non-zero exit, or None (every other receipt is unchanged)."""
+def container_exit_receipt(record: Any, container_log: Any = None) -> dict[str, Any] | None:
+    """Receipt evidence for a recorded non-zero exit, or None (every other receipt is unchanged).
+
+    ``stderr_tail`` is the guardian's one bounded, sanitized container-log tail
+    (``salad_container_log``: untrusted text, marked so) when it recorded one, else a closed
+    ``unavailable`` token."""
+    from .salad_container_log import closed_container_log
+
     codes = nonzero_exit_codes(record)
     if not codes:
         return None
-    return {"exit_codes": codes, "stderr_tail": dict(STDERR_UNAVAILABLE)}
+    tail = closed_container_log(container_log)
+    return {
+        "exit_codes": codes,
+        "stderr_tail": tail if tail is not None else dict(STDERR_UNAVAILABLE),
+    }
 
 
 def failure_detail(record: Any) -> str | None:
@@ -60,7 +93,8 @@ def failure_detail(record: Any) -> str | None:
         return None
     return (
         f"{FAILURE_CLASS}: the container process exited with code {codes[0]}; the group was "
-        "stopped instead of letting the provider restart it (stderr unavailable)"
+        "stopped instead of letting the provider restart it (log tail: receipt "
+        "guardian_container_exit)"
     )[:500]
 
 
@@ -69,17 +103,86 @@ class ContainerExitWatch:
 
     def _init_exit_watch(self):
         self._exit_watch = {}
+        # Watch reads per UTC day, and the UTC day until which a rate limit stops every watch.
+        self._exit_watch_day = dict(day=None, reads=0, quota_day=None)
+        # Finished container-log reads, (operation, closed value), recorded on the loop thread.
+        self._container_log_done = []
+
+    def _read_container_log(self, row):
+        """After a recorded non-zero exit: one durable-claimed ``read_logs`` of the exact group,
+        off the loop thread; the bounded, sanitized tail is recorded by a later pass
+        (``_drain_container_logs``). A failed or rate-limited read records a closed token and
+        is never repeated. Nothing here raises."""
+        from .salad_container_log import summarize_container_log, unavailable
+
+        try:
+            if not row["provider_id"] or not self.guardian.claim_container_log_read(
+                row["operation"]
+            ):
+                return
+            operation, provider_id = row["operation"], row["provider_id"]
+            done = self._container_log_done
+            if self._exit_watch_day.get("quota_day") == _utc_day():
+                done.append((operation, unavailable("log_quota_exhausted")))
+                return
+
+            def read():
+                try:
+                    observation = self._bounded_send(row, "read_logs", provider_id).observation
+                    value = observation["container_log"]
+                    if type(value) is not dict:
+                        value = summarize_container_log(None)
+                except Exception as error:
+                    limited = getattr(error, "detail", None) == "rate_limited"
+                    value = unavailable("log_quota_exhausted" if limited else "read_failed")
+                done.append((operation, value))
+
+            threading.Thread(target=read, name="container-log-read", daemon=True).start()
+        except Exception:
+            self.diagnostic_write_failures += 1
+
+    def _drain_container_logs(self):
+        """Record finished container-log reads (loop thread only). Nothing here raises."""
+        while self._container_log_done:
+            operation, value = self._container_log_done.pop(0)
+            try:
+                self.guardian.record_container_log(operation, value)
+            except Exception:
+                self.diagnostic_write_failures += 1
+
+    def _watch_budget_open(self):
+        """True while today's watch budget has room and no rate limit was seen today."""
+        today = _utc_day()
+        budget = self._exit_watch_day
+        if budget["day"] != today:
+            budget.update(day=today, reads=0)
+        if budget["quota_day"] == today:
+            return False
+        return budget["reads"] < WATCH_DAILY_READ_BUDGET
 
     def _watch_container_exit(self, reservation):
         """Nothing here raises. Loop thread only (the read itself runs on a daemon thread)."""
+        self._drain_container_logs()
         try:
             state = self._exit_watch.setdefault(
-                reservation, dict(reads=0, next=0.0, thread=None, result=None, stopped=False)
+                reservation,
+                dict(reads=0, failures=0, next=0.0, thread=None, result=None, stopped=False),
             )
             if state["stopped"]:
                 return
             if state["result"] is not None:
                 result, state["result"] = state["result"], None
+                outcome = result[1].get("outcome")
+                if outcome == "log_quota_exhausted":
+                    # Salad's daily log limit: no watch reads again until 00:00 UTC.
+                    self._exit_watch_day["quota_day"] = _utc_day()
+                if outcome in {"log_quota_exhausted", "unavailable"}:
+                    state["failures"] += 1
+                    state["next"] = max(
+                        state["next"], self.clock() + self._watch_gap(state, failed=True)
+                    )
+                    return
+                state["failures"] = 0
                 self._act_on_exit_read(reservation, state, result)
                 return
             thread = state["thread"]
@@ -99,8 +202,11 @@ class ContainerExitWatch:
             guardian = self.guardian.status(row["operation"])
             if guardian["status"] != "armed" or guardian["reason"] != "armed":
                 return  # already stopping (any cause): the one post-stop read covers it
+            if not self._watch_budget_open():
+                return
+            self._exit_watch_day["reads"] += 1
             state["reads"] += 1
-            state["next"] = now + WATCH_INTERVAL_SECONDS
+            state["next"] = now + self._watch_gap(state)
             operation, provider_id = row["operation"], row["provider_id"]
 
             def read():
@@ -112,8 +218,9 @@ class ContainerExitWatch:
                         exit_codes=observation["exit_codes"],
                         machines=observation["machines"],
                     )
-                except Exception:
-                    record = empty_record("unavailable")
+                except Exception as error:
+                    limited = getattr(error, "detail", None) == "rate_limited"
+                    record = empty_record("log_quota_exhausted" if limited else "unavailable")
                 state["result"] = (operation, record)
 
             thread = threading.Thread(target=read, name="exit-watch-read", daemon=True)
@@ -121,6 +228,14 @@ class ContainerExitWatch:
             thread.start()
         except Exception:
             self.diagnostic_write_failures += 1
+
+    @staticmethod
+    def _watch_gap(state, *, failed=False):
+        """Seconds to the next read: doubling every 4 reads, doubling again per failed read."""
+        gap = WATCH_INTERVAL_SECONDS * 2 ** (max(state["reads"] - 1, 0) // 4)
+        if failed:
+            gap *= 2 ** min(state["failures"], 4)
+        return min(gap, WATCH_MAX_INTERVAL_SECONDS)
 
     def _act_on_exit_read(self, reservation, state, result):
         operation, record = result
@@ -150,3 +265,5 @@ class ContainerExitWatch:
         finally:
             self.guardian.arm(self._assignment(self._row(reservation)), stop_only=True)
             self._cancel(operation)
+            # Why it exited: one bounded container-log tail for the receipt (after the stop).
+            self._read_container_log(row)

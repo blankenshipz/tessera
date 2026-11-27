@@ -5073,12 +5073,13 @@ class CampaignRunner:
                 "failed_transient",
                 INFRA_RESOURCE_LIMIT,
                 f"stopped on a resource limit ({stop[0]}={stop[1]:g}); "
-                f"infrastructure failure, retry {used + 1} of {limit}"[:500],
+                f"infrastructure failure, retry {used + 1} of {limit} allowed"[:500],
             )
+        allowed = f"infrastructure failure, retry {used + 1} of {limit} allowed"
         return (
             "failed_transient",
             INFRA_CONTAINER_KILLED,
-            f"exit_code:{exit_code}; infrastructure failure, retry {used + 1} of {limit}"[:500],
+            f"exit_code:{exit_code}; {allowed}"[:500],
         )
 
     def _placement_failure(
@@ -5117,9 +5118,10 @@ class CampaignRunner:
             return "failed_permanent", f"{base}; no infrastructure retry left ({used} of {limit})"[
                 :500
             ]
-        return "failed_transient", f"{base}; infrastructure failure, retry {used + 1} of {limit}"[
-            :500
-        ]
+        return (
+            "failed_transient",
+            f"{base}; infrastructure failure, retry {used + 1} of {limit} allowed"[:500],
+        )
 
     # -- lineage --------------------------------------------------------------------
 

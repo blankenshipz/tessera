@@ -436,6 +436,7 @@ class ProviderReadback(Frozen):
             "read_group",
             "read_instance",
             "read_events",
+            "read_logs",
             "create",
             "other",
         ]

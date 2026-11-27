@@ -198,7 +198,7 @@ def test_a_recheck_refused_create_ends_not_started_at_zero_and_the_stage_retries
     # An infrastructure retry, never a scientific one (max_attempts is 1).
     assert attempt["failure_class"] == "infra_salad_create_not_sent"
     assert attempt["failure_detail"] == (
-        "live_check_create_not_sent; infrastructure failure, retry 1 of 1"
+        "live_check_create_not_sent; infrastructure failure, retry 1 of 1 allowed"
     )
     assert attempt["settled_cents"] == 0
     grant = world.row("SELECT * FROM execution_grants WHERE id=?", attempt["grant_id"])

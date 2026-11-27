@@ -17,6 +17,7 @@ from decimal import Decimal
 from uuid import UUID
 
 from .remote_execution_models import ExecutionSelection
+from .salad_container_log import summarize_container_log
 from .salad_events import summarize_events
 from .salad_proxy_contract import ProxyResult
 from .salad_resources import check_salad_resources
@@ -59,6 +60,7 @@ LIST_LIMIT = 4 * 1024 * 1024
 EVENTS_PAGE_SIZE = 50
 EVENTS_WINDOW_SECONDS = 2 * 3600
 EVENTS_LIMIT = 1024 * 1024
+LOGS_PAGE_SIZE = 50
 
 
 def _group_not_found(data):
@@ -613,7 +615,7 @@ class SaladHTTPTransport:
         if method == "POST" and path.endswith("/availability/sce-gpu-availability"):
             return "availability"
         if method == "POST" and path.endswith("/log-entries"):
-            return "read_events"
+            return "read_logs" if getattr(self, "_reading_logs", False) else "read_events"
         if method == "POST" and path == self._groups:
             return "create"
         if method != "GET":
@@ -1059,8 +1061,40 @@ class SaladHTTPTransport:
             raise _Failure("malformed_response", field="items")
         return self._result(dict(provider_id=provider_id, **summarize_events(items)))
 
+    def _read_logs(self, provider_id, secret):
+        """One org-scoped ``query_log_entries`` call for this group's container logs, reduced
+        to a bounded sanitized tail (``salad_container_log``); no body text leaves unsanitized."""
+        if provider_id is None:
+            raise _Failure("identity_mismatch")
+        p = self._selection.salad
+        end = datetime.now(UTC).replace(microsecond=0)
+        body = dict(
+            start_time=(end - timedelta(seconds=EVENTS_WINDOW_SECONDS)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+            end_time=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            page_size=LOGS_PAGE_SIZE,
+            sort_order="desc",
+            query=(
+                'resource.type = "container" '
+                f'AND resource.labels.project_name = "{p.project}" '
+                f'AND resource.labels.container_group_name = "{p.group}"'
+            ),
+        )
+        self._reading_logs = True
+        _, data = self._request(
+            "POST", f"{self._org}/log-entries", secret, body, limit=EVENTS_LIMIT
+        )
+        items = data.get("items")
+        if type(items) is not list:
+            raise _Failure("malformed_response", field="items")
+        return self._result(
+            dict(provider_id=provider_id, container_log=summarize_container_log(items))
+        )
+
     def send(self, operation, selection, provider_id, secret):
-        self._post_sent = None  # None: no create POST attempted in this call
+        self._post_sent = None
+        self._reading_logs = False  # None: no create POST attempted in this call
         try:
             self._check(selection, secret)
             if provider_id is not None and not re.fullmatch(r"[a-f0-9]{32}", provider_id):
@@ -1103,6 +1137,8 @@ class SaladHTTPTransport:
                 return self._result(group)
             if operation == "read_events":
                 return self._read_events(provider_id, secret)
+            if operation == "read_logs":
+                return self._read_logs(provider_id, secret)
             if operation not in {"read_group", "read_instance", "start", "stop", "delete"}:
                 raise _Failure("admission_denied")
             if operation != "read_group" and provider_id is None:

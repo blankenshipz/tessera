@@ -644,16 +644,42 @@ defers the launch while the limit is full or the answer is unreadable
 A one-shot container whose process exits with a non-zero code is restarted by Salad and later
 moved to another machine, which used to surface only as an `allocation_changed` stop and a
 `salad_interrupted` (or, since ADR 0206, `infra_salad_reallocated`) retry. While a frame is armed, seen running and has no retained output, the
-service reads the group's system events at most every 30 s (at most 20 reads per frame). When they
-name `instance_exited` with a non-zero code (137 and 143, a kill or platform stop, are excluded),
-it records the start events, sets the stop cause `container_exited_nonzero`, closes the custody
+service reads the group's system events. The reads back off: 30 s apart at first, the gap
+doubling every 4 reads (60, 120 s) and again after a failed read (at most 240 s), at most 12 reads
+per frame. Every frame's watch reads together are bounded per UTC day, and a rate-limited answer
+(Salad's daily log query limit, which lasts until 00:00 UTC) ends every watch read until then, so
+the one post-stop read of ADR 0196 still finds quota. Exit codes are kept in first-seen order, and
+the earliest non-zero exit decides: when it is the workload's own (not 137 or 143, a kill or
+platform stop), so `[1, 137]` (a crash loop the guardian stopped first) included, the service
+records the start events, sets the stop cause `container_exited_nonzero`, closes the custody
 writers and stops the exact group through the ordinary stop-only path; the provider's own read
-still confirms the stop. Control classifies the attempt `failed_permanent` /
-`salad_container_exited_nonzero` with the exit code in its detail, whatever stop cause the guardian
-recorded, so it never spends `retry.infra_retries`. The receipt carries `guardian_container_exit`
-with the exit codes and `stderr_tail: {"outcome": "unavailable", "reason":
-"no_trusted_log_source"}`: the trusted events read carries no process output. A group whose
-guardian already stopped (a reported workload failure included) is not watched.
+still confirms the stop. A kill that came first (`[137, 1]`) keeps today's handling. Once the
+watch recorded the events, the post-stop events read is not sent again. Control classifies the
+attempt `failed_permanent` / `salad_container_exited_nonzero` with the exit code in its detail,
+whatever stop cause the guardian recorded, so it never spends `retry.infra_retries`. A group
+whose guardian already stopped (a reported workload failure included) is not watched.
+
+After a recorded non-zero exit (from the watch or the post-stop read) the service sends one
+`read_logs` query for the exact group's container logs (durably claimed once per operation, off
+the loop thread, skipped after a rate limit that day). The result is reduced on the transport
+side to a bounded, sanitized tail (`salad_container_log`): the last 20 lines, at most 1024 bytes,
+200 characters a line, printable ASCII only, with secret-shaped values, long tokens, URLs with
+credentials, e-mail and IP addresses, UUIDs and home-directory paths redacted, marked
+`"untrusted": true` with the digest of the kept lines. A secret-shaped value is redacted after an
+auth scheme (`Basic`, `Bearer`, `Token`: the scheme word is kept) and after a connecting word
+(`password is ...`), and a well-known credential prefix (`sk-`, `ghp_` and the other GitHub
+token prefixes, `xox?-`, `AKIA`/`ASIA`) is redacted at any length; the rules fail closed, so an
+ordinary word after `Basic` or `Bearer` is redacted too. The receipt's `guardian_container_exit`
+carries the exit codes and that tail as `stderr_tail`, or `{"outcome": "unavailable", "reason":
+...}` with a closed reason (`log_quota_exhausted`, `read_failed`, or `not_read` when no tail was
+recorded by the time the receipt was built; `no_trusted_log_source` stays in the closed set for
+older receipts). Treat the tail as the workload's own untrusted words: it explains a failure, it
+is never evidence of anything.
+
+`read_events` and `read_logs` are guardian-only reads. A worker's proxy request under an observe
+effect may send only the exact group and instance reads; the trusted server refuses either stream
+read as `admission_denied` before any claim, so no effect nonce is spent and no provider call is
+made.
 
 ## Allocation change after custody began
 

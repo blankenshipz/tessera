@@ -65,6 +65,7 @@ from .salad_campaign_profiles import (
     route_window_source,
 )
 from .salad_events import closed_record
+from .salad_exit_watch import nonzero_exit_codes
 from .salad_precreate import launch_effects, sent_launch_effects
 from .salad_termination import provider_termination
 from .salad_workload_contract import WorkloadContractV1
@@ -1738,6 +1739,18 @@ class SaladCampaignExecutor:
             state = self._confirm_termination(attempt, route_id, self._profile_for(item))
         if not passed and self._unconfirmed_stop_held(item, receipt, state):
             return
+        guardian_final: dict[str, Any] | None = None
+        if not passed:
+            # A failed run's final is read before any import, so a deferred pass repeats no
+            # import or upload. The guardian records the container-log tail of a non-zero exit
+            # on a later loop pass than the exit itself (salad_exit_watch): while the final names
+            # that exit and has no tail yet, the outcome waits (bounded by ``_defer_finish``,
+            # the hold stays held), then is recorded with what the guardian has.
+            guardian_final = self._read_guardian_final(attempt, route_id)
+            if _container_log_pending(guardian_final) and self._defer_finish(
+                attempt, ["guardian_final"]
+            ):
+                return
         marker_path = self._route_dir(route_id) / FINISH_MARKER
         progress = (_read_private_json(marker_path) or {}) if passed else {}
         manifest_id = (
@@ -1804,7 +1817,8 @@ class SaladCampaignExecutor:
         elif reading.status == "unconfirmed":
             self._note("termination_unconfirmed", attempt, reading.code)
         financial = receipt.get("financial")
-        guardian_final = self._read_guardian_final(attempt, route_id)
+        if passed:
+            guardian_final = self._read_guardian_final(attempt, route_id)
         if passed and self._final_retryable.pop(attempt, False):
             # The read failed, or the guardian has not reached ``stopped`` yet: read it again
             # on a later pass rather than record a stale snapshot (H11). No guardian, or a status
@@ -1981,6 +1995,17 @@ class SaladCampaignExecutor:
                 lease[0], lease[1], item["operation_id"], directory, files
             )
         return manifest["id"]
+
+
+def _container_log_pending(final: Mapping[str, Any] | None) -> bool:
+    """True when the guardian's ``stopped`` final names a workload non-zero exit but carries no
+    container-log tail (the guardian's one log read has not been recorded yet)."""
+    return (
+        final is not None
+        and final.get("status") == "stopped"
+        and bool(nonzero_exit_codes(final.get("start_events")))
+        and final.get("container_log") is None
+    )
 
 
 def _interrupted_after_custody(receipt: Mapping[str, Any]) -> bool:
@@ -2426,6 +2451,11 @@ def project_guardian_final(
         # Additive: the guardian's first stop cause, only when the Salad safety plane stopped the
         # route for its own health (closed table); control classifies from this record alone.
         projected["safety_stop_cause"] = status["stop_cause"]
+    from .salad_container_log import closed_container_log
+
+    container_log = closed_container_log(status.get("container_log"))
+    if container_log is not None:
+        projected["container_log"] = container_log
     try:
         _GuardianFinal.model_validate(projected)
     except ValidationError:

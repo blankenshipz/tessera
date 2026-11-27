@@ -21,7 +21,7 @@ from .provider_inputs import ProviderInputStore
 from .remote_execution import RemoteExecutionStore
 from .remote_execution_models import ProviderReadback, derived_salad_argv
 from .salad_http import NOT_SENT_SUMMARY, SaladHTTPTransport
-from .salad_proxy import ACTION
+from .salad_proxy import ACTION, GUARDIAN_ONLY_OPERATIONS
 from .salad_proxy_contract import ProxyPolicy, ProxyRequest, ProxyResult
 from .salad_safety_service import DISPATCH_IPC_SECONDS
 from .salad_secret_files import PrivateFileSecretResolver
@@ -852,6 +852,9 @@ class TrustedSaladServer:
     def request(self, request, *, preflight):
         try:
             request = ProxyRequest.model_validate_json(request.model_dump_json())
+            if request.operation in GUARDIAN_ONLY_OPERATIONS:
+                # Refused before any claim: no effect nonce is spent (q-2716 review F5).
+                raise ValueError("guardian-only read")
             state = self.store.get(self.worker, request.route_id)
             if ACTION.get(request.operation, "observe") != state["effects"][-1]["action"]:
                 raise ValueError("operation mismatch")

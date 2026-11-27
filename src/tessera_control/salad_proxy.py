@@ -16,6 +16,11 @@ from .salad_secrets import FakeSecretResolver
 from .store import canonical_digest, utc_now
 
 ACTION = {"create_stopped": "create", "start": "start", "stop": "stop", "delete": "delete"}
+# Reads only the guardian sends, through its own transport and its own claim (the exit watch's
+# throttled events read and the one durable-claimed container-log read after a non-zero exit).
+# A worker's ProxyRequest never sends them: an observe effect authorizes exact group/instance
+# reads, not the provider's event or log streams (q-2716 review F5).
+GUARDIAN_ONLY_OPERATIONS = frozenset({"read_events", "read_logs"})
 
 
 class SaladProxy:
@@ -107,6 +112,8 @@ class FakeSaladProxy(SaladProxy):
         # The inherited .request remains blocked, including on this test composition.
         try:
             request = ProxyRequest.model_validate_json(request.model_dump_json())
+            if request.operation in GUARDIAN_ONLY_OPERATIONS:
+                raise ValueError("guardian-only read")
             state = self._store.get(self._worker, request.route_id)
             if (
                 not state["effects"]

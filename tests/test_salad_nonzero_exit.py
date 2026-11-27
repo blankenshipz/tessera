@@ -101,7 +101,9 @@ def test_a_reallocation_without_a_nonzero_process_exit_classifies_as_before(star
     assert precustody.failure_class == REALLOCATED_PRECUSTODY
 
 
-@pytest.mark.parametrize("codes", [[137], [143], [1, 137], [137, 143]])
+# First-seen order: a kill or platform stop that came first. (A non-zero exit before the kill,
+# ``[1, 137]``, is the workload's failure: test_salad_exit_watch_followups.py.)
+@pytest.mark.parametrize("codes", [[137], [143], [137, 1], [137, 143]])
 def test_a_kill_or_platform_stop_is_unchanged(codes):
     assert nonzero_exit_codes(_events(codes)) == []
     observation = _observe({"start_events": _events(codes)}, **INTERRUPTED)
@@ -119,7 +121,7 @@ def test_the_receipt_names_the_exit_and_says_stderr_was_unavailable():
     _note_start_evidence(receipt, {"start_events": _events([1])})
     assert receipt["guardian_container_exit"] == {
         "exit_codes": [1],
-        "stderr_tail": {"outcome": "unavailable", "reason": "no_trusted_log_source"},
+        "stderr_tail": {"outcome": "unavailable", "reason": "not_read"},
     }
     # Closed tokens only: no text, no identifier, bounded.
     assert len(json.dumps(receipt)) < 2048
@@ -230,6 +232,12 @@ class _Guardian:
     def record_start_events(self, operation, record):
         self.recorded.append(record)
 
+    def claim_container_log_read(self, operation):
+        return False  # the container-log tail is covered in test_salad_exit_watch_followups.py
+
+    def record_container_log(self, operation, value):
+        pass
+
 
 def _observation(codes, names=("instance_started", "instance_exited")):
     return dict(events=list(names), exit_codes=list(codes), machines=1, empty=not names)
@@ -312,7 +320,7 @@ def test_the_watch_reads_at_most_once_per_interval_and_a_bounded_number_of_times
         service._watch_container_exit("r")
     assert service.effects.count("read") == 1
     for _ in range(WATCH_MAX_READS + 10):
-        now[0] += 31
+        now[0] += 241  # past the longest backed-off gap
         service._watch_container_exit("r")
         service.finish()
         service._watch_container_exit("r")

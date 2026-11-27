@@ -60,3 +60,22 @@ running) group states were reported as `unknown`, the same as a failed read.
    reallocation or any other status stays `unknown`. The live check reads them as pre-start and
    keeps its slow observe cadence. They never grant authority, never confirm a stop and never
    start accrual.
+
+## Amendment: the container exit watch and one container-log tail
+
+The bounded exit watch (`salad_exit_watch`) reads the same system events while a frame runs, so a
+crash loop is stopped before Salad replaces the machine. Its reads back off, share a daily budget
+and stop for the UTC day after a rate-limited answer, so the one post-stop read of point 3 keeps
+its quota; that read is not sent again once the watch recorded the events. Exit codes are kept in
+first-seen order, and the earliest non-zero exit decides whether a process exit was the workload's
+own (`[1, 137]`) or a kill that came first (`[137, 1]`).
+
+Point 3's "Container stdout logs are not read" is narrowed: after a recorded non-zero process exit,
+and only then, the service makes one durably claimed `read_logs` query of the exact group's
+container logs. The transport reduces it at once to a bounded, sanitized tail (last 20 lines, at
+most 1 KiB, printable ASCII, secret-shaped and identifying values redacted), marked
+`untrusted: true` with its digest; control re-checks that closed shape wherever it is recorded.
+The tail appears only in the guardian's final status, the recorded guardian final and the receipt's
+`guardian_container_exit.stderr_tail`, as an operator explanation of a failure, never as evidence
+or in any authority, admission or settlement decision. A failed, rate-limited or unread query
+records a closed reason instead.

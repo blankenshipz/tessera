@@ -1345,7 +1345,7 @@ class SaladRouteProvider:
                 if final.get(key):
                     # Closed tokens only (event names, exit codes, machine count).
                     fields["guardian_" + key] = final[key]
-            exited = container_exit_receipt(final.get("start_events"))
+            exited = container_exit_receipt(final.get("start_events"), final.get("container_log"))
             if exited is not None:
                 fields["guardian_container_exit"] = exited
             rebinds = final.get("prestart_rebinds")

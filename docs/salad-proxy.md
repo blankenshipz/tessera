@@ -176,7 +176,11 @@ credentials/worker identity require separately authorized operator recovery.
 
 Receipts append to the control event ledger with operation/route/effect attribution,
 status and unknown cost/usage. Provider logs/events are bounded SHA-256 references;
-raw untrusted text is not placed in API projections. These hashes alone do not
+raw untrusted text is not placed in API projections. The one exception is the bounded,
+sanitized container-log tail read once after a recorded non-zero container exit (`read_logs`,
+[ADR 0196 amendment](decisions/0196-salad-start-failure-and-events.md)): at most 20 lines and
+1 KiB, redacted, marked `untrusted: true` with its digest, and shown only as a receipt's
+`guardian_container_exit.stderr_tail`, never used as evidence. These hashes alone do not
 retain bytes or prove custody. Artifact/checkpoint links must match retained
 same-project/operation/epoch/plan manifests. Byte upload, quarantine retention,
 custody release and scientific acceptance use existing APIs, not provider claims.

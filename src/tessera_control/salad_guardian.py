@@ -79,6 +79,10 @@ MIN_START_FAILURE_MACHINES, MAX_START_FAILURE_MACHINES = 2, 10
 # a crash or a failed read never repeats it (Salad limits log queries per day).
 START_EVENTS_ATTEMPT = "start_events_attempt"
 START_EVENTS_PREFIX = "start_events:"
+# The one container-log read after a recorded non-zero exit (salad_container_log): its durable
+# claim, and its bounded, sanitized, untrusted-marked result.
+CONTAINER_LOG_ATTEMPT = "container_log_attempt"
+CONTAINER_LOG_PREFIX = "container_log:"
 OUTPUT_RETAINED_REASON = "output_retained"
 OUTPUT_RETAINED_MARK = "output_retained_mark"
 RECONCILE_OPERATOR = "operator_reconciled_exact_group_stopped"
@@ -601,6 +605,12 @@ class SaladGuardian:
         if events is not None:
             # Additive: the one system-events read of a failed start (closed tokens only).
             result["start_events"] = events
+        from .salad_container_log import closed_container_log
+
+        container_log = closed_container_log(self._event_json(operation, CONTAINER_LOG_PREFIX))
+        if container_log is not None:
+            # Additive: the one bounded, sanitized container-log tail after a non-zero exit.
+            result["container_log"] = container_log
         timeout = self._allocation_timeout_record(operation)
         if timeout is not None:
             # Additive: present only for a group cancelled because nothing was ever allocated.
@@ -743,11 +753,48 @@ class SaladGuardian:
                 (operation, START_EVENTS_ATTEMPT),
             ).fetchone():
                 return False
+            if self._event_json(operation, START_EVENTS_PREFIX) is not None:
+                # Already recorded (the exit watch read them before it stopped the group):
+                # a second query would only spend the daily log quota.
+                return False
             self.db.execute(
                 "INSERT INTO events(operation,at,kind) VALUES(?,?,?)",
                 (operation, self.clock(), START_EVENTS_ATTEMPT),
             )
             return True
+
+    def claim_container_log_read(self, operation: str) -> bool:
+        """True exactly once per operation; the claim is durable before anything is sent, so a
+        restart never spends a second log query on the same group."""
+        with self.db:
+            if self.db.execute(
+                "SELECT 1 FROM events WHERE operation=? AND kind=?",
+                (operation, CONTAINER_LOG_ATTEMPT),
+            ).fetchone():
+                return False
+            self.db.execute(
+                "INSERT INTO events(operation,at,kind) VALUES(?,?,?)",
+                (operation, self.clock(), CONTAINER_LOG_ATTEMPT),
+            )
+            return True
+
+    def record_container_log(self, operation: str, value: dict) -> None:
+        """Keep the closed container-log result (first one wins); anything not closed is dropped."""
+        from .salad_container_log import closed_container_log
+
+        closed = closed_container_log(value)
+        if closed is None or self._event_json(operation, CONTAINER_LOG_PREFIX) is not None:
+            return
+        with self.db:
+            self.db.execute(
+                "INSERT INTO events(operation,at,kind) VALUES(?,?,?)",
+                (
+                    operation,
+                    self.clock(),
+                    CONTAINER_LOG_PREFIX
+                    + json.dumps(closed, sort_keys=True, separators=(",", ":")),
+                ),
+            )
 
     def record_start_events(self, operation: str, record: dict) -> None:
         """Keep the closed result of the one events read; anything not closed is dropped."""

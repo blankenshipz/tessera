@@ -2425,7 +2425,9 @@ class SaladStageDriver:
                 )
                 if used < limit:
                     failure_class = INFRA_SALAD_CREATE_NOT_SENT
-                    detail = f"{detail}; infrastructure failure, retry {used + 1} of {limit}"
+                    detail = (
+                        f"{detail}; infrastructure failure, retry {used + 1} of {limit} allowed"
+                    )
             self.runner._set_attempt(
                 attempt["id"],
                 status="failed_transient",

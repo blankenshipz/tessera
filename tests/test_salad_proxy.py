@@ -624,8 +624,8 @@ def test_artifact_custody_milestone_links_retained_bytes_not_provider_claim(tmp_
         "read_quota",
         "read_availability",
         "read_instance",
-        "read_events",
-        "read_logs",
+        # read_events / read_logs are guardian-only: a worker's request is refused before any
+        # provider call, so it cannot confirm anything (test_salad_guardian_only_reads).
     ],
 )
 def test_explicit_read_operations_cannot_confirm_group_termination(tmp_path, operation):

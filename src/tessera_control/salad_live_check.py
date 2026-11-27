@@ -896,6 +896,11 @@ class SaladLiveSession:
         start_events = closed_record(status.get("start_events"))
         if start_events is not None:
             proof["start_events"] = start_events
+        from .salad_container_log import closed_container_log
+
+        container_log = closed_container_log(status.get("container_log"))
+        if container_log is not None:
+            proof["container_log"] = container_log
         declared = self._multi_output(state)
         if declared is not None:
             return self._multi_evidence(route, state, status, stopped, manifest, declared, proof)
@@ -1221,7 +1226,7 @@ def _note_start_evidence(receipt, evidence):
     for key in ("start_failure", "start_events"):
         if evidence.get(key) is not None:
             receipt["guardian_" + key] = evidence[key]
-    exited = container_exit_receipt(evidence.get("start_events"))
+    exited = container_exit_receipt(evidence.get("start_events"), evidence.get("container_log"))
     if exited is not None:
         # A non-zero process exit: its code(s), and a closed token that no stderr tail was
         # available (the trusted read is system events, which carry no process output).

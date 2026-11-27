@@ -690,8 +690,9 @@ def _attempt_entry(
     if scratch is not None:
         entry["scratch"] = scratch
     if is_infra_class(attempt["failure_class"]):
-        # ADR 0058: the attempt ended for an infrastructure reason and was retried (or, when
-        # the bound was spent, the stage failed); the reason is the recorded detail.
+        # ADR 0058: the attempt ended for an infrastructure reason; the reason is the recorded
+        # detail ("retry N of M allowed" names the bound, not a retry that ran). Whether a later
+        # attempt exists is the stage's own attempt list, never this entry.
         entry["infrastructure_retry"] = {"reason": attempt["failure_detail"]}
     if attempt["failure_class"] == class_fallback.PRESTART_NO_SPEND:
         # ADR 0060 addendum: never started on this class, settled at zero; the stage moved on.

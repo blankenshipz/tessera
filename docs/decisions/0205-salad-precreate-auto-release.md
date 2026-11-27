@@ -137,7 +137,7 @@ cost. The live receipt read `inconclusive` / `custody_stop_or_reconnect_unresolv
 4. **An infrastructure retry, not a scientific one.** When the driver unwinds an attempt as
    `live_check_create_not_sent` and `retry.infra_retries` has a retry left, the attempt is `failed_transient` /
    `infra_salad_create_not_sent` with detail `live_check_create_not_sent; infrastructure failure, retry N of
-   M`, settled at zero. With no infrastructure retry left it keeps `t1_salad_unclaimed`, as before.
+   M allowed`, settled at zero. With no infrastructure retry left it keeps `t1_salad_unclaimed`, as before.
 5. **Owner-requested unwind of a blocked attempt.** `tessera campaign reconcile-unclaimed-attempts
    --campaign-id ID [--dry-run]` (`GET /campaigns/{id}/unclaimed-attempts`,
    `POST /campaigns/{id}/reconcile-unclaimed-attempts`) uses the owner's human control credential. An agent

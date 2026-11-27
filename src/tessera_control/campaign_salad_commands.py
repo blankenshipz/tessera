@@ -12,7 +12,14 @@ import sqlite3
 from collections.abc import Mapping
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationError,
+    field_validator,
+)
 
 from .store import Conflict, NotFound, StoreError, _connect, canonical_digest, utc_now
 
@@ -170,6 +177,18 @@ class _GuardianFinal(BaseModel):
         ]
         | None
     ) = None
+    # Present only after a non-zero container exit: the one bounded, sanitized, untrusted-marked
+    # container-log tail (``salad_container_log``), re-checked here.
+    container_log: dict | None = None
+
+    @field_validator("container_log")
+    @classmethod
+    def _closed_container_log(cls, value):
+        from .salad_container_log import closed_container_log
+
+        if value is not None and closed_container_log(value) is None:
+            raise ValueError("container_log is not the closed shape")
+        return value
 
 
 def _final_dump(final: _GuardianFinal) -> dict:
@@ -521,6 +540,7 @@ class SaladWorkerCommands:
                             "start_events",
                             "safety_stop_cause",
                             "retained_before_move",
+                            "container_log",
                         )
                         or value is not None
                     },

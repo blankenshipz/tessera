@@ -41,7 +41,7 @@ from .remote_execution_models import (
 )
 from .salad_custody import CustodyBinding, SaladCustody, private_database
 from .salad_events import empty_record
-from .salad_exit_watch import ContainerExitWatch
+from .salad_exit_watch import ContainerExitWatch, nonzero_exit_codes
 from .salad_guardian import (
     DEFAULT_ALLOCATION_SECONDS,
     DEFAULT_PRESTART_READ_DEADLINE_SECONDS,
@@ -1580,6 +1580,10 @@ class SaladSafetyService(ContainerExitWatch):
             operation, record = self._start_events_done.pop(0)
             try:
                 self.guardian.record_start_events(operation, record)
+                if nonzero_exit_codes(record):
+                    # The post-stop read found a non-zero process exit the watch did not catch:
+                    # one bounded container-log tail for the receipt (salad_container_log).
+                    self._read_container_log(self._row(operation=operation))
             except Exception:
                 self.diagnostic_write_failures += 1
         self._start_events_threads[:] = [t for t in self._start_events_threads if t.is_alive()]
@@ -2714,6 +2718,7 @@ class SaladSafetyService(ContainerExitWatch):
     def _loop_pass(self):
         self._absence_reads_left = LOST_CREATE_READS_PER_PASS
         self._drain_start_events()
+        self._drain_container_logs()
         now = self.clock()
         if self.jwt.refreshed is None or now - self.jwt.refreshed >= 1800:
             try:

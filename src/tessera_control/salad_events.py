@@ -51,12 +51,26 @@ def _texts(entry: dict[str, Any]) -> list[str]:
     return found
 
 
+def _chronological(items: Any) -> list[Any]:
+    """The page's entries earliest first: by their ``time`` when every entry has one (ISO 8601
+    UTC sorts as text; equal times keep the query's descending order reversed), else the
+    reverse of the query's descending order."""
+    if not isinstance(items, list):
+        return []
+    entries = [entry for entry in items if isinstance(entry, dict)]
+    times = [entry.get("time") for entry in entries]
+    if entries and all(isinstance(value, str) and value for value in times):
+        order = sorted(range(len(entries)), key=lambda index: (times[index], -index))
+        return [entries[index] for index in order]
+    return list(reversed(entries))
+
+
 def summarize_events(items: Any) -> dict[str, Any]:
     """Closed summary of one page of log entries (a list of entry objects)."""
     names: list[str] = []
-    codes: set[int] = set()
+    codes: list[int] = []
     machines: set[str] = set()
-    for entry in items if isinstance(items, list) else []:
+    for entry in _chronological(items):
         if not isinstance(entry, dict):
             continue
         resource = entry.get("resource")
@@ -71,11 +85,13 @@ def summarize_events(items: Any) -> dict[str, Any]:
                 names.append(name)
             for match in _EXIT.finditer(text):
                 code = int(match.group(1))
-                if code <= 255:
-                    codes.add(code)
+                if code <= 255 and code not in codes:
+                    codes.append(code)
     return {
         "events": sorted(names, key=EVENT_NAMES.index),
-        "exit_codes": sorted(codes)[:MAX_EXIT_CODES],
+        # First-seen order, earliest first: a crash-loop exit (1) before the stop's kill (137)
+        # stays distinguishable from a kill that came first (salad_exit_watch).
+        "exit_codes": codes[:MAX_EXIT_CODES],
         "machines": min(len(machines), MAX_MACHINES),
         "empty": not (isinstance(items, list) and items),
     }
