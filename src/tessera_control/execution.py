@@ -31,6 +31,7 @@ from .execution_models import (
 )
 from .external_operations import current_operation_reconciliation
 from .provider_trust import receipt_trust_fields, worker_admits_class
+from .remote_execution_models import SALAD_PROVISIONING_ALLOWANCE_SECONDS
 from .store import (
     Conflict,
     Forbidden,
@@ -1460,7 +1461,20 @@ class ExecutionStore(Store):
             grant_expiry = _parse_utc(grant["expires_at"])
             credential_expiry = _parse_utc(worker["expires_at"])
             task = self._task(connection, worker, grant["task_id"])
-            task_deadline = now_datetime + timedelta(seconds=task["max_duration_seconds"])
+            task_seconds = task["max_duration_seconds"]
+            if connection.execute(
+                """SELECT 1 FROM campaign_stage_attempts a JOIN campaign_salad_attempts sa
+                ON sa.attempt_id = a.id WHERE a.grant_id = ?""",
+                (grant_id,),
+            ).fetchone():
+                # A Salad route's lease is issued before its group is created: allocation, image
+                # pull and input fetch spend it before the workload's own clock starts. Its
+                # admitted route window is the declared run PLUS the provisioning allowance, and
+                # the guardian bounds the run itself from first running, so the lease (which
+                # caps the guardian's outer deadline) covers both instead of letting provisioning
+                # eat the stage's run time. Grant and credential expiry still bound it.
+                task_seconds += SALAD_PROVISIONING_ALLOWANCE_SECONDS
+            task_deadline = now_datetime + timedelta(seconds=task_seconds)
             hard_expires_at = min(grant_expiry, credential_expiry, task_deadline)
             expires_at = min(now_datetime + timedelta(seconds=LEASE_SECONDS), hard_expires_at)
             if expires_at <= now_datetime:

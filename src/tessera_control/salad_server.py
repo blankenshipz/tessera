@@ -20,7 +20,7 @@ from .execution_targets import require_admission_hook
 from .provider_inputs import ProviderInputStore
 from .remote_execution import RemoteExecutionStore
 from .remote_execution_models import ProviderReadback, derived_salad_argv
-from .salad_http import SaladHTTPTransport
+from .salad_http import NOT_SENT_SUMMARY, SaladHTTPTransport
 from .salad_proxy import ACTION
 from .salad_proxy_contract import ProxyPolicy, ProxyRequest, ProxyResult
 from .salad_safety_service import DISPATCH_IPC_SECONDS
@@ -852,6 +852,9 @@ class TrustedSaladServer:
         # True only while a use-time recheck of the committed claim runs; both rechecks precede
         # the one provider call, so a failure while it is set made no provider call.
         rechecking = False
+        # True only from a successful create ``ready`` until ``transport.send`` is called: a
+        # failure while it is set provably sent no create, so it is reported as unsent.
+        unsent_after_ready = False
         try:
             self._credential()
             with self.resolver.resolve(
@@ -873,6 +876,7 @@ class TrustedSaladServer:
                 failure_reason = "provider_unavailable"
                 if request.operation in {"create_stopped", "start"}:
                     self.safety.ready(state)
+                    unsent_after_ready = request.operation == "create_stopped"
                 elif request.operation in {"stop", "delete"}:
                     # Guardian/custody outage must not block the exact provider stop.
                     try:
@@ -896,6 +900,7 @@ class TrustedSaladServer:
                 failure_reason = "credential_unavailable"
                 self._credential()
                 failure_reason = "provider_unavailable"
+                unsent_after_ready = False
                 result = self.transport.send(
                     request.operation, self.policy.target.selection, state["provider_id"], secret
                 )
@@ -939,9 +944,25 @@ class TrustedSaladServer:
                 return result
         except Exception as error:
             _reraise_read_timeout(error, request)
+            if unsent_after_ready:
+                self._report_unsent_create(state)
             if rechecking and request.operation in {"create_stopped", "start"}:
                 self._record_claim_refused(request)
             return ProxyResult(status="unknown", reason=failure_reason)
+
+    def _report_unsent_create(self, state):
+        """Best effort: tell the guardian a ready-admitted create was never sent.
+
+        Called only for a failure after the create's ``ready`` succeeded and before
+        ``transport.send`` was called (a use-time recheck, the credential check), so no
+        provider call was made. The report carries the transport's own ``request_not_sent``
+        summary; the guardian fences at once and releases the reservation only on its own
+        exact-name 404 and complete project-list reads after its settle. A failed report
+        leaves the deadline+margin path."""
+        try:
+            self.safety.create_rejected(state, dict(NOT_SENT_SUMMARY))
+        except Exception:  # noqa: BLE001 - never turns the original failure into anything else
+            pass
 
     def _record_claim_refused(self, request):
         """Best effort: a failed write leaves the claim standing (fail closed, ADR 0205)."""

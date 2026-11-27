@@ -77,6 +77,8 @@ class _RouteDeadline(BaseModel):
     running_seconds: Annotated[int, Field(ge=0, le=86400)]
     # Which limit stopped the run: the declared-run cap or the route window itself.
     limit: Literal["running_cap", "route_deadline"]
+    # Present (False) only when the guardian's adapter said no custody work began.
+    custody_work_begun: Literal[False] | None = None
 
 
 class _PrestartRebind(BaseModel):
@@ -149,6 +151,16 @@ class _GuardianFinal(BaseModel):
     # Present only for a group stopped as a suspected start-failure loop / after an events read.
     start_failure: _StartFailure | None = None
     start_events: _StartEvents | None = None
+
+
+def _final_dump(final: _GuardianFinal) -> dict:
+    """The final as stored: an unset ``route_deadline.custody_work_begun`` is left out, so a
+    route-deadline record without it keeps its earlier stored shape (and digest)."""
+    dumped = final.model_dump()
+    cut = dumped.get("route_deadline")
+    if type(cut) is dict and cut.get("custody_work_begun") is None:
+        cut.pop("custody_work_begun", None)
+    return dumped
 
 
 def _partial_without_custody_evidence(connection, row, manifest_id, receipt) -> bool:
@@ -478,7 +490,7 @@ class SaladWorkerCommands:
                 else json.dumps(
                     {
                         key: value
-                        for key, value in body.guardian_final.model_dump().items()
+                        for key, value in _final_dump(body.guardian_final).items()
                         # Absent unless used, so the stored shape (and its digest) of every
                         # run without an allocation timeout or a pre-start re-bind is unchanged.
                         if key

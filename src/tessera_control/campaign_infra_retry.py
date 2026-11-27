@@ -48,6 +48,36 @@ REALLOCATED_PRECUSTODY = "provider_reallocated_before_custody"
 SALAD_INTERRUPTED = "salad_interrupted"
 
 
+# The provider itself moved the route's instance (the route recorded a reallocation and the
+# provider's own read confirmed the stop) but the live receipt cannot place the move before or
+# after custody work (no guardian allocation-change word, or custody unknown). Outputs are never
+# accepted, so this is infrastructure, never the stage's logic: a fresh attempt (new operation,
+# own claim and hold) may retry it within ``retry.infra_retries``. It settles like any other
+# failed attempt (the whole bounded hold, or a recorded charge), never at an interruption's
+# accrued estimate.
+INFRA_SALAD_REALLOCATED = "infra_salad_reallocated"
+
+
+# The route limit stopped a group whose machine was placed but whose workload never got to run
+# (seen running for at most PROVISIONING_OVERRUN_RUNNING_SECONDS, and the guardian's adapter says
+# no custody work began): a slow image pull or start ate the route window. Infrastructure, never
+# the stage's logic: retried within ``retry.infra_retries`` (then the class/profile fallback),
+# settled at the guardian's accrued estimate like a never-placed group.
+INFRA_SALAD_PROVISIONING_OVERRUN = "infra_salad_provisioning_overrun"
+PROVISIONING_OVERRUN_RUNNING_SECONDS = 60
+
+
+def provisioning_overrun(route_deadline: object) -> bool:
+    """True for the guardian's route-limit record of a run that never got going (see above)."""
+    return (
+        type(route_deadline) is dict
+        and route_deadline.get("limit") == "route_deadline"
+        and type(route_deadline.get("running_seconds")) is int
+        and 0 <= route_deadline["running_seconds"] <= PROVISIONING_OVERRUN_RUNNING_SECONDS
+        and route_deadline.get("custody_work_begun") is False
+    )
+
+
 def is_infra_class(failure_class: object) -> bool:
     """True for a failure class that counts against ``retry.infra_retries``."""
     text = str(failure_class or "")

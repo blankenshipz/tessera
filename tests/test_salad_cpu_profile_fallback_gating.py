@@ -97,7 +97,8 @@ def test_a_zero_bound_single_profile_stage_fails_exactly_as_without_a_chain(tmp_
     found = _outcome(chained)
 
     assert found == expected
-    assert found["failure_class"] == "salad_not_passed" and found["attempt"] == 1
+    # The provider's own confirmed move is infrastructure; no infra retry is enabled here.
+    assert found["failure_class"] == "infra_salad_reallocated" and found["attempt"] == 1
     assert found["switches"] == [] and found["stops"] == []
     assert all(
         e["reason"] != fallback.POST_START_REFUSED for e in chained.events("campaign.blocked")

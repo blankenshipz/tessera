@@ -54,6 +54,14 @@ ALLOCATION_TIMEOUT_REASON = "allocation_timeout"
 ALLOCATION_TIMEOUT_PREFIX = "allocation_timeout:"
 MIN_ALLOCATION_SECONDS, MAX_ALLOCATION_SECONDS = 60, 3600
 DEFAULT_ALLOCATION_SECONDS = 600
+# Provisioning bound, counted from arming (the guardian arms the exact group before its start):
+# a group that has never shown a placed machine, never been seen running and never begun any
+# custody by then is cancelled as ``allocation_timeout`` too. Unlike the allocation deadline it
+# needs no read that says the group started or how many instances it lists, so a provider that
+# keeps a started group ``pending_change`` or omits its counts cannot hold a never-placed group
+# to the route deadline. A machine that was assigned (a slow image pull) latches the allocation
+# evidence and is never cut by this bound. None turns it off.
+MIN_PROVISIONING_SECONDS, MAX_PROVISIONING_SECONDS = 120, 7200
 # A start-failure loop before custody (ADR 0193 point 2, amended): the provider keeps assigning
 # a machine and the container keeps dying before it can call in, so the group never reaches
 # custody and neither the allocation deadline (a machine was assigned) nor a rebind (the
@@ -269,7 +277,16 @@ class SaladGuardian:
         start_failure_machines: int = DEFAULT_START_FAILURE_MACHINES,
         custody_work_started: Callable[[str], bool] | None = None,
         service_stop_cause: Callable[[str], str | None] | None = None,
+        provisioning_seconds: int | None = None,
     ):
+        if provisioning_seconds is not None and (
+            type(provisioning_seconds) is not int
+            or not MIN_PROVISIONING_SECONDS <= provisioning_seconds <= MAX_PROVISIONING_SECONDS
+            or (allocation_seconds is not None and provisioning_seconds < allocation_seconds)
+        ):
+            raise ValueError("invalid_provisioning_seconds")
+        # Not part of the stored assignment either: changing it never mismatches a re-arm.
+        self.provisioning_seconds = provisioning_seconds
         # ``service_stop_cause(operation)``: the closed cause the composing safety service
         # recorded when it put the frame into stop-only recovery (or None). Asked only when a
         # stop-only arm or a cancel is the first stop decision of an operation.
@@ -347,6 +364,11 @@ class SaladGuardian:
             self.db.execute("ALTER TABLE assignments ADD COLUMN instance_seen INTEGER DEFAULT 0")
         if "read_fail_since" not in columns:
             self.db.execute("ALTER TABLE assignments ADD COLUMN read_fail_since REAL")
+        if "armed_at" not in columns:
+            # When the assignment was first armed (before its start). The provisioning bound
+            # counts from here; an assignment armed by an older build has none and never
+            # triggers it.
+            self.db.execute("ALTER TABLE assignments ADD COLUMN armed_at REAL")
         # Every process recovery is stop-only, even if a prior owner died before
         # recording an effect. Never renew running authority from saved state.
         with self.db:
@@ -401,9 +423,9 @@ class SaladGuardian:
             raise ValueError("expired_assignment")
         with self.db:
             self.db.execute(
-                "INSERT OR IGNORE INTO assignments(operation,assignment,heartbeat,last_poll) "
-                "VALUES(?,?,?,?)",
-                (assignment.binding.operation, encoded, now, now),
+                "INSERT OR IGNORE INTO assignments(operation,assignment,heartbeat,last_poll,"
+                "armed_at) VALUES(?,?,?,?,?)",
+                (assignment.binding.operation, encoded, now, now, now),
             )
             if (
                 self.db.execute(
@@ -623,7 +645,17 @@ class SaladGuardian:
                 limit = "running_cap"
         except (ValueError, KeyError, TypeError):
             limit = "unknown"
-        return {"running_seconds": running, "limit": limit}
+        result = {"running_seconds": running, "limit": limit}
+        # Additive: only when the adapter positively says no custody work began (the workload
+        # never called in, nothing was served or written). Unknown or raising says nothing.
+        begun = self.custody_work_started or self.custody_started
+        if begun is not None:
+            try:
+                if begun(operation) is False:
+                    result["custody_work_begun"] = False
+            except Exception:
+                pass
+        return result
 
     def _event_json(self, operation: str, prefix: str) -> dict | None:
         found = self.db.execute(
@@ -822,6 +854,41 @@ class SaladGuardian:
         if found is None or found[0] or found[1] is None:
             return None
         return max(0.0, now - found[1])
+
+    def _never_ran(self, operation: str) -> tuple[float, float] | None:
+        """``(clock start, armed_at)`` when the operation never showed a placed machine (no
+        instance latch), never bound an allocation, was never seen running and the adapter says
+        no custody of any kind has begun; None otherwise (including an adapter that cannot say
+        or raises, and an assignment armed by an older build). The clock start is the first
+        poll that saw the group started, else the arming instant. Database state only: the
+        latch and first-running instant are set only by exact, fresh reads, so a failed or
+        unknown read can neither set nor clear this."""
+        if self.custody_started is None:
+            return None
+        found = self.db.execute(
+            "SELECT instance_seen,alloc_started_at,assigned_allocation,first_running,armed_at "
+            "FROM assignments WHERE operation=?",
+            (operation,),
+        ).fetchone()
+        if found is None or found[0] or found[2] or found[3] is not None or found[4] is None:
+            return None
+        try:
+            if self.custody_started(operation) is not False:
+                return None
+        except Exception:
+            return None
+        return (found[4] if found[1] is None else found[1]), found[4]
+
+    def _provisioning_expired(self, operation: str, now: float) -> float | None:
+        """Seconds since arming when the provisioning bound has passed for a group that never
+        ran (``_never_ran``); None otherwise or when the bound is off."""
+        if self.provisioning_seconds is None:
+            return None
+        never = self._never_ran(operation)
+        if never is None:
+            return None
+        waited = now - never[1]
+        return waited if waited >= self.provisioning_seconds else None
 
     def read_retry_backoff(self, operation: str) -> float | None:
         """Seconds to wait before the next poll while a pre-start read failure is being
@@ -1141,6 +1208,27 @@ class SaladGuardian:
                 retry_detail = read_failure_detail(error)
             else:
                 reason, stopping = "provider_unavailable", True
+        provisioning = None
+        if reason is None and not stopping and not terminal:
+            # Read-independent: a group nothing was ever placed on, seen running or served by
+            # custody is cancelled at the provisioning bound even when no read ever said it
+            # started (the allocation deadline's clock never ran) or every read failed.
+            try:
+                provisioning = self._provisioning_expired(operation, self.clock())
+            except Exception:
+                provisioning = None  # cannot tell: never a timeout
+            if provisioning is not None:
+                reason, stopping, allocation_waited = ALLOCATION_TIMEOUT_REASON, True, provisioning
+        if reason == "deadline" and never_allocated is None and first_running is None:
+            # The route limit reached a group that never ran: without a fresh zero-instance read
+            # (a failed read, counts not said, the clock never started) the same never-placed
+            # evidence still makes it a placement failure, not the workload's.
+            try:
+                never = self._never_ran(operation)
+            except Exception:
+                never = None
+            if never is not None:
+                never_allocated = max(0.0, now - never[0])
         with self.db:
             self.db.execute(
                 "UPDATE assignments SET last_poll=?,stopping=?,allocation_uncertain=?,"
@@ -1195,6 +1283,8 @@ class SaladGuardian:
                                     "deadline_seconds": (
                                         int(allocation_waited)
                                         if self.allocation_seconds is None or reason == "deadline"
+                                        else self.provisioning_seconds
+                                        if provisioning is not None
                                         else self.allocation_seconds
                                     ),
                                 },

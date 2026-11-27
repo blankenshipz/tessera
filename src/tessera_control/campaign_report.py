@@ -45,6 +45,10 @@ _FAILURES = {
     "infra_allocation_timeout": "no cloud instance was allocated in time",
     "infra_salad_create_not_sent": "the cloud create was refused before it was sent, so it "
     "was retried",
+    "infra_salad_provisioning_overrun": "the cloud machine was still starting when the time ran "
+    "out, so it was retried",
+    "infra_salad_reallocated": "the cloud provider moved the run to another machine, so it "
+    "was retried",
     "start_failure_suspected": "the container failed to start on several cloud machines",
     "salad_interrupted": "the cloud provider interrupted the run after it had started",
     "not_started": "it was never started",

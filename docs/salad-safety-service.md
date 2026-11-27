@@ -506,6 +506,35 @@ attempt is recorded as the retryable `infra_allocation_timeout` rather than a pe
 `salad_not_passed`. In that case `deadline_seconds` repeats the elapsed time (the route limit, not
 the allocation setting).
 
+### Amendment: a provisioning bound that needs no start read
+
+The allocation deadline's clock starts only on a read that says the group started (not stopped
+and no `pending_change`) with a count of zero. A provider that keeps a started group's change
+pending, or omits its counts, never starts it, and a never-placed group then ran to the route
+deadline and was recorded as the workload's failure. The guardian therefore also keeps a
+provisioning bound, counted from arming (the exact group is armed before its start):
+`provisioning_deadline_seconds` in the service configuration (default the route window's
+provisioning allowance, 1500 s, never below `allocation_deadline_seconds`; bounds 120 to 7200; an
+invalid value refuses at startup). When it passes with no placed machine ever latched, no
+allocation bound, nothing seen running and the adapter saying no custody of any kind has begun
+(an adapter that cannot say, or raises, never qualifies), the guardian stops the group with
+`allocation_timeout` (`deadline_seconds` is the bound). It reads only the guardian's own
+database, so neither a failed read nor a read that does not say can hold it off. A machine that
+was assigned (a slow image pull) latches the evidence and is never cut by it. An assignment armed
+before this setting existed has no arming instant and never triggers it.
+
+The same never-placed state also gives a `deadline` stop its `allocation_timeout` evidence
+(elapsed seconds since the group was seen started, else since arming) when no fresh zero-count
+read was available, so the route limit of a group that never ran is the retryable
+`infra_allocation_timeout`, not `salad_not_passed`. The live check ends on that evidence like
+on its own timeout, without importing outputs nothing could have written.
+
+Such an attempt settles at the guardian's own accrued estimate, rounded up (zero when nothing
+was ever seen running; a backdated poll gap rounds up to a cent), instead of the whole hold. Salad
+bills only while an instance runs on a machine. The basis stays the provisional
+`guardian_bounded_hold`, so a recorded charge still raises or confirms it, and only the
+guardian's recorded evidence (never a receipt reason) selects it.
+
 When the route limit stops a run after an instance was seen (the guardian's `deadline` stop with
 no allocation-timeout evidence), the status carries `route_deadline.running_seconds` (elapsed
 running seconds) and `route_deadline.limit`: `route_deadline` when the route window itself ran
@@ -514,6 +543,18 @@ out, `running_cap` when the run overran its own declared-run cap. Only the forme
 `salad_not_passed` (the workload overran). It is not retried here. A trainer that stops
 itself and exits 0 remains `succeeded` at platform level; the receipt carries
 `completeness_guard: "experiment"` because output completeness is the experiment's own guard.
+
+When the adapter positively says no custody work began, the record also carries
+`route_deadline.custody_work_begun: false` (absent when it began, is unknown, or the adapter
+raises). A `route_deadline` stop with that word and at most 60 s running is a placed machine
+that never got going (a slow image pull or start), not the workload: control records the
+transient `infra_salad_provisioning_overrun`, retried within `retry.infra_retries` (then the
+class/profile fallback decides), and settles it at the guardian's accrued estimate like a
+never-placed group ([ADR 0206](decisions/0206-salad-provisioning-not-run-time.md)). The lease of
+a Salad campaign attempt also covers the provisioning allowance (lease issue plus the task's
+`max_duration_seconds` plus 1500 s, still bounded by grant and credential expiry), so
+provisioning no longer spends the stage's run time; the run itself stays bounded from first
+running by the running cap.
 
 ## Start-failure loop before custody
 
@@ -565,6 +606,13 @@ stopped, and the status says `custody_work_begun: false`. The campaign runner ma
 fresh attempt (never a re-bind of the old instance), bounded by `retry.max_reallocation_retries`
 and the budget cap ([ADR 0179](decisions/0179-precustody-reallocation-retry.md)). After custody
 work began, or when the guardian cannot say, the stop keeps `provider_stopped_custody_unsealed`.
+
+A route the provider itself moved (the route's reallocation flag, the provider's read of the exact
+group stopped and a confirmed exited worker) whose receipt carries neither guardian custody word
+(another stop cause, or custody unknown) is the transient `infra_salad_reallocated`: never the
+workload's failure, its outputs never accepted, retried within `retry.infra_retries` (then the
+class/profile fallback decides), settled like any failed attempt
+([ADR 0206](decisions/0206-salad-provisioning-not-run-time.md)).
 
 ## Allocation change after custody began
 

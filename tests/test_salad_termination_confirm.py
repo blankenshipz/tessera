@@ -339,7 +339,8 @@ def test_confirmed_termination_releases_the_hold_and_the_input_release(tmp_path)
     world.record_charge(5)
     world.tick_until(lambda: world.status() == "failed")
     assert dict(_held(world)) == {"held_cents": 0, "settled_cents": 5}
-    assert world.attempt()["failure_class"] == "salad_not_passed"
+    # The provider's own confirmed move is infrastructure (no infra retry enabled here).
+    assert world.attempt()["failure_class"] == "infra_salad_reallocated"
     # The campaign finished, so its input release went through the existing revoke.
     assert _release(world)["status"] == "revoked"
     assert _second_release_refused(world, release) is False

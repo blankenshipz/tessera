@@ -29,9 +29,11 @@ from .artifact_manifests import grant_manifest_is_partial
 from .campaign_autoreconcile import MAX_AUTO_REQUEUES, NOT_STARTED, repeat_count
 from .campaign_infra_retry import (
     INFRA_SALAD_CREATE_NOT_SENT,
+    INFRA_SALAD_REALLOCATED,
     REALLOCATED_PRECUSTODY,
     SALAD_INTERRUPTED,
     infra_attempts,
+    provisioning_overrun,
 )
 from .campaign_models import (
     SALAD_TARGET,
@@ -376,6 +378,27 @@ def _guardian_interruption_evidence(
         receipt.get("guardian_stop_cause") == "allocation_changed"
         and receipt.get("custody_work_begun") is True
         and (not provider_confirmed or receipt.get("provider_stop_confirmed") is True)
+    )
+
+
+def _never_allocated(row: dict[str, Any]) -> bool:
+    """The executor's recorded guardian final says the workload never ran: the guardian's
+    allocation-timeout record (cancelled, or the route limit reached, with no machine ever
+    placed, never seen running and no custody begun), or its route-limit record of a placed
+    machine that never got going (``provisioning_overrun``). Only that recorded evidence counts,
+    never a reason string."""
+    try:
+        found = json.loads(row.get("guardian_final_json") or "null")
+    except ValueError:
+        return False
+    if type(found) is dict and provisioning_overrun(found.get("route_deadline")):
+        return found.get("allocation_timeout") is None
+    timeout = found.get("allocation_timeout") if type(found) is dict else None
+    return (
+        type(timeout) is dict
+        and type(timeout.get("elapsed_seconds")) is int
+        and type(timeout.get("deadline_seconds")) is int
+        and found.get("route_deadline") is None
     )
 
 
@@ -2185,6 +2208,12 @@ class SaladStageDriver:
             # Custody began, then the provider moved the instance, and its own read confirmed
             # the stop: a retryable interruption on a NEW operation. Outputs stay unaccepted.
             detail = f"{SALAD_INTERRUPTED}: signal={SIGNAL_ROUTE_FLAG}; {detail}"
+        else:
+            # The provider's own move, confirmed by its read and an exited worker, without the
+            # guardian's word on custody (another stop cause, or custody unknown): never the
+            # workload's failure. A fresh attempt may retry it within ``retry.infra_retries``;
+            # it settles like any failed attempt (never at an interruption's estimate).
+            detail = f"{INFRA_SALAD_REALLOCATED}: signal={SIGNAL_ROUTE_FLAG}; {detail}"
         return "failed", detail, self._evidence(row, state, provider, None)
 
     def _termination_unconfirmed(
@@ -2571,6 +2600,16 @@ class SaladStageDriver:
         instead (rounded up, at least one cent, within the hold), still provisional: a recorded
         charge raises or confirms it later. An estimate above the hold bounds nothing."""
         hold = int(attempt["hold_cents"])
+        if _never_allocated(row):
+            # The guardian recorded that nothing was ever placed (no machine latched, never seen
+            # running, no custody begun): Salad bills only while an instance runs on a machine,
+            # so the hold is not spent. Settle the guardian's own accrued estimate (zero when it
+            # saw nothing run; a backdated poll gap rounds up), still provisional like any
+            # bounded hold: a recorded charge raises or confirms it later.
+            estimate = self._clean_guardian(attempt, row)
+            if estimate is None or hold < 1 or math.ceil(estimate) > hold:
+                return None
+            return math.ceil(estimate)
         if _was_interrupted(attempt):
             estimate = self._clean_guardian(attempt, row, interrupted=True)
             if estimate is None or hold < 1 or math.ceil(estimate) > hold:

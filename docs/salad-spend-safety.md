@@ -216,6 +216,19 @@ the same 24 h watch. Status shows `never_ready_eligible_at` until then. A repeat
 of such a reservation (the live check's pre-create retry) refreshes its heartbeat, so the
 retry cannot push it into recovery; nothing else changes the silence bound.
 
+Unsent after ready: once `ready` admitted a create, the trusted server still rechecks the
+committed claim and the management credential before its one provider call. A failure
+there (or anywhere between a successful `ready` and the transport send) provably sent no
+create, so the server reports it through admin `create_rejected` with the transport's own
+`request_not_sent` summary (`status: 0`). The guardian fences at once and releases the
+reservation through the create-rejected path below (`create_rejected_absent`, 30 s after
+max(report, last `ready`), only on its own exact-name 404 and complete project list), so
+the open-frame slot is not held until the route deadline plus the margin. A failure once
+the send was called is never reported this way, an unconfirmed absence read never
+releases it, and a failed report leaves the deadline-plus-margin path. A route whose
+create was never attempted has no create effect, so the trusted server's guardian
+heartbeat refuses it and its reservation goes silent into the never-ready release above.
+
 Create refused at admission ([ADR 0205 amendment](decisions/0205-salad-precreate-auto-release.md#amendment-2026-11-26-a-create-refused-at-the-use-time-recheck-after-its-claim-q-2704)):
 a create effect whose only receipt is the trusted server's `admission_denied` refusal
 (provider provenance, state `unknown`, no provider id or allocation) always follows a

@@ -253,7 +253,8 @@ def test_a_single_profile_stage_keeps_the_existing_behavior(tmp_path):
     world.record_charge(5)
     world.tick_until(lambda: world.status() == "failed")
     assert world.attempt()["attempt"] == 1
-    assert world.attempt()["failure_class"] == "salad_not_passed"
+    # The provider's own confirmed move is infrastructure; no infra retry is enabled here.
+    assert world.attempt()["failure_class"] == "infra_salad_reallocated"
     assert world.events(fallback.SWITCH_EVENT) == [] and world.events(fallback.STOP_EVENT) == []
     receipt = json.loads(world.row("SELECT receipt_json FROM campaign_receipts")["receipt_json"])
     stage = receipt["stages"][0]

@@ -2131,6 +2131,8 @@ FAILURE_CLASSES = (
     "infra_container_killed",
     "infra_resource_limit",
     "infra_allocation_timeout",
+    "infra_salad_reallocated",
+    "infra_salad_provisioning_overrun",
     "start_failure_suspected",
     "provider_reallocated_before_custody",
     "salad_interrupted",

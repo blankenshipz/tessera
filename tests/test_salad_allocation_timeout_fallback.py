@@ -145,10 +145,11 @@ def test_a_proven_no_instance_timeout_moves_to_the_next_cpu_profile(tmp_path):
     _timeout(world)
     world.tick_until(lambda: len(_attempts(world)) == 2)
     first = _ended(world)
-    # The attempt's own record is today's class and its settlement is unchanged: its hold.
+    # The attempt's own record is today's class; nothing was ever placed, so it settles at the
+    # guardian's accrued estimate (zero here), still a provisional bounded hold, not its hold.
     assert first["status"] == "failed_transient" and first["failure_class"] == TIMEOUT
     assert first["settlement_basis"] == "guardian_bounded_hold"
-    assert first["settled_cents"] == first["hold_cents"] > 0
+    assert first["settled_cents"] == 0 < first["hold_cents"]
     assert "class fallback 1 of 1" in first["failure_detail"]
     [switch] = world.events(fallback.SWITCH_EVENT)
     assert switch["reason"] == fallback.REASON_ALLOCATION_TIMEOUT

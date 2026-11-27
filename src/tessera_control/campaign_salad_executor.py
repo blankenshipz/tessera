@@ -2189,6 +2189,9 @@ def project_guardian_final(
             "running_seconds": cut["running_seconds"],
             "limit": cut["limit"],
         }
+        if cut.get("custody_work_begun") is False:
+            # Additive: the workload never began custody work before the route limit cut it.
+            projected["route_deadline"]["custody_work_begun"] = False
     rebinds = _project_rebinds(status.get("prestart_rebinds"))
     if rebinds is not None:
         projected["prestart_rebinds"] = rebinds

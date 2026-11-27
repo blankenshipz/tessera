@@ -19,7 +19,13 @@ from typing import Any
 from . import provider_trust
 from .campaign_delegation import STEP_TABLE
 from .campaign_image_pull import DEFAULT_INTERRUPTIBLE_MAX_IMAGE_PULL_BYTES
-from .campaign_infra_retry import REALLOCATED_PRECUSTODY, SALAD_INTERRUPTED
+from .campaign_infra_retry import (
+    INFRA_SALAD_PROVISIONING_OVERRUN,
+    INFRA_SALAD_REALLOCATED,
+    REALLOCATED_PRECUSTODY,
+    SALAD_INTERRUPTED,
+    provisioning_overrun,
+)
 from .campaign_models import SALAD_BACKEND, SALAD_RUNTIME, SALAD_TARGET, SaladStageSpec
 from .campaign_providers import (
     ComputeProvider,
@@ -730,6 +736,21 @@ class SaladRouteProvider:
                 manifest_id=attempt.get("manifest_id"),
             )
         deadline = self._route_deadline(rt, attempt)
+        if provisioning_overrun(deadline):
+            # The machine was placed but the workload never got going before the route limit
+            # (no custody work, at most a minute seen running): a slow pull or start, retried
+            # as infrastructure, never the stage's own failure.
+            return Observation(
+                "failed_transient",
+                failure_class=INFRA_SALAD_PROVISIONING_OVERRUN,
+                detail=(
+                    f"{INFRA_SALAD_PROVISIONING_OVERRUN}: the route deadline came after "
+                    f"{deadline['running_seconds']}s running with no custody work begun"
+                )[:500],
+                evidence_kind="salad_live_receipt",
+                evidence_digest=evidence,
+                manifest_id=attempt.get("manifest_id"),
+            )
         if deadline is not None:
             # The guardian stopped a run after an instance was seen because the route window
             # ran out: not a workload bug, and not retried here (retry policy is separate).
@@ -768,6 +789,20 @@ class SaladRouteProvider:
             return Observation(
                 "failed_transient",
                 failure_class=SALAD_INTERRUPTED,
+                detail=f"salad:{failure_detail}"[:500],
+                evidence_kind="salad_live_receipt",
+                evidence_digest=evidence,
+                manifest_id=attempt.get("manifest_id"),
+            )
+        if stored_class == INFRA_SALAD_REALLOCATED or failure_detail.startswith(
+            INFRA_SALAD_REALLOCATED
+        ):
+            # The provider moved the instance (route flag, provider read and exited worker all
+            # confirmed) without the guardian's custody word: infrastructure, retried within
+            # ``retry.infra_retries`` by the runner.
+            return Observation(
+                "failed_transient",
+                failure_class=INFRA_SALAD_REALLOCATED,
                 detail=f"salad:{failure_detail}"[:500],
                 evidence_kind="salad_live_receipt",
                 evidence_digest=evidence,

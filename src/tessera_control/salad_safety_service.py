@@ -33,6 +33,7 @@ from pathlib import Path
 
 from .models import ExecutionSpec
 from .remote_execution_models import (
+    SALAD_PROVISIONING_ALLOWANCE_SECONDS,
     RemoteExecutionPackage,
     RemoteProposal,
     derived_salad_argv,
@@ -44,7 +45,9 @@ from .salad_guardian import (
     DEFAULT_ALLOCATION_SECONDS,
     DEFAULT_PRESTART_READ_DEADLINE_SECONDS,
     MAX_ALLOCATION_SECONDS,
+    MAX_PROVISIONING_SECONDS,
     MIN_ALLOCATION_SECONDS,
+    MIN_PROVISIONING_SECONDS,
     POSTSTART_READ_WINDOW_SECONDS,
     RECONCILE_OPERATOR,
     RECONCILE_PROVIDER,
@@ -590,6 +593,7 @@ class SaladSafetyService:
         max_open_billable_frames=1,
         max_prestart_rebinds=3,
         prestart_read_deadline_seconds=DEFAULT_PRESTART_READ_DEADLINE_SECONDS,
+        provisioning_deadline_seconds=None,
     ):
         # Named, validated setting (60..3600 seconds, default 600): a container group that gets
         # no instance by then is cancelled as ``allocation_timeout`` instead of burning the whole
@@ -600,6 +604,23 @@ class SaladSafetyService:
         ):
             raise ValueError("invalid_allocation_deadline")
         self.allocation_deadline_seconds = allocation_deadline_seconds
+        # Provisioning bound (seconds from arming, 120..7200, never below the allocation
+        # deadline): a group never placed, never seen running and never served by custody is
+        # cancelled as ``allocation_timeout`` by then, whatever its reads said. Default: the
+        # route window's provisioning allowance (or the allocation deadline when that is longer).
+        if provisioning_deadline_seconds is None:
+            provisioning_deadline_seconds = max(
+                SALAD_PROVISIONING_ALLOWANCE_SECONDS, allocation_deadline_seconds
+            )
+        if (
+            type(provisioning_deadline_seconds) is not int
+            or not MIN_PROVISIONING_SECONDS
+            <= provisioning_deadline_seconds
+            <= MAX_PROVISIONING_SECONDS
+            or provisioning_deadline_seconds < allocation_deadline_seconds
+        ):
+            raise ValueError("invalid_provisioning_deadline")
+        self.provisioning_deadline_seconds = provisioning_deadline_seconds
         # ADR 0041 resolved question 4b: an operator setting, an integer 1..4 (bool refused).
         # Every per-frame invariant holds per frame; the total cap is checked in aggregate with
         # the insert, and the unseen-run gap grows with the number of frames a pass may read.
@@ -715,6 +736,7 @@ class SaladSafetyService:
             stop=self._stop,
             clock=clock,
             allocation_seconds=allocation_deadline_seconds,
+            provisioning_seconds=provisioning_deadline_seconds,
             custody_started=self._custody_started,
             custody_work_started=self._custody_work_started,
             max_prestart_rebinds=max_prestart_rebinds,
@@ -3634,6 +3656,7 @@ def main(argv=None):
             allocation_deadline_seconds=cfg.get(
                 "allocation_deadline_seconds", DEFAULT_ALLOCATION_SECONDS
             ),
+            provisioning_deadline_seconds=cfg.get("provisioning_deadline_seconds"),
             control_origin=cfg.get("control_origin"),
             max_open_billable_frames=cfg.get("max_open_billable_frames", 1),
             max_prestart_rebinds=cfg.get("max_prestart_rebinds", 3),

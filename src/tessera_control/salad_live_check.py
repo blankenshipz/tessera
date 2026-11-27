@@ -2681,9 +2681,14 @@ def _drive(
                 receipt["guardian_last_provider_read_failure_request_kind"] = evidence.get(
                     "last_provider_read_failure_request_kind"
                 )
-                if evidence.get("stop_cause") == "allocation_timeout":
-                    # The guardian cancelled the group: no instance was ever allocated in time.
-                    # Nothing more can happen, so stop polling; the reason is kept below.
+                if evidence.get("stop_cause") == "allocation_timeout" or (
+                    evidence.get("stop_cause") == "deadline"
+                    and _allocation_timeout(evidence.get("allocation_timeout")) is not None
+                ):
+                    # The guardian cancelled the group: no instance was ever allocated in time
+                    # (its own deadline or provisioning bound, or the route limit reached a group
+                    # that never ran). Nothing was placed, so there is no output to import: stop
+                    # polling; the reason is kept below.
                     receipt["reason"] = "allocation_timeout"
                     receipt["allocation_timeout"] = evidence.get("allocation_timeout")
                     break

@@ -71,6 +71,8 @@ from .campaign_infra_retry import (
     INFRA_ALLOCATION_TIMEOUT,
     INFRA_CONTAINER_KILLED,
     INFRA_RESOURCE_LIMIT,
+    INFRA_SALAD_PROVISIONING_OVERRUN,
+    INFRA_SALAD_REALLOCATED,
     REALLOCATED_PRECUSTODY,
     RESOURCE_LIMIT_CLASSES,
     SALAD_INTERRUPTED,
@@ -4759,6 +4761,22 @@ class CampaignRunner:
             status, detail = self._placement_failure(
                 ctx, stage["stage_key"], spec_stage, attempt, detail
             )
+        elif (
+            failure_class in {INFRA_SALAD_REALLOCATED, INFRA_SALAD_PROVISIONING_OVERRUN}
+            and status == "failed_transient"
+        ):
+            # The provider's own move without a custody word, or a placed machine that never got
+            # going before the route limit: spends one infra retry; with none left the attempt
+            # (and so the stage) fails permanently under the same class.
+            status, detail = self._placement_failure(
+                ctx, stage["stage_key"], spec_stage, attempt, detail
+            )
+            if status == "failed_permanent" and self._class_fallback(
+                ctx, stage["stage_key"], spec_stage, attempt, "failed"
+            ):
+                # No infra retry left: the class/profile fallback decides exactly as for any
+                # other failed run (it refuses a run that started, recording its stop).
+                return True
         elif failure_class == SALAD_INTERRUPTED and status == "failed_transient":
             # Spends one infra retry; with none left the attempt (and so the stage) fails
             # permanently under the same class. The salvaged checkpoint, if custody holds one,
