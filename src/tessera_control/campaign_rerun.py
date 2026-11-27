@@ -3,7 +3,9 @@
 Pure planning plus the reads it needs. A re-run is a NEW campaign: it is submitted like any
 other, grants nothing, and a person (or the operator's own approval path) approves its exact
 digest. The stages that already succeeded are not run again; a stage that consumed one of their
-outputs gets a ``kind: artifact`` input pinning that output by campaign id and sha256, which the
+outputs gets a ``kind: artifact`` input pinning that output by campaign id and sha256 (an input
+that read several outputs of one stage gets one ``kind: artifact_folder`` input listing each
+output, its declared path and sha256, so the mount layout stays the same; ADR 0209), which the
 platform resolves only from a succeeded attempt in a terminal campaign's receipt whose output
 manifest is retained and custody-released. Nothing is invented: an output with no single
 recorded digest, one that is not custody-released, a v1 spec (for the failed-stages mode) or an
@@ -271,36 +273,45 @@ def build_retry_spec(
                     raise RerunRefused(
                         f"Stage {source['stage']!r} did not succeed and is not retried."
                     )
-                if len(source["outputs"]) != 1:
-                    raise RerunRefused(
-                        f"Input {source['name']!r} reads several outputs of {source['stage']!r}; "
-                        "pin them by hand so the mount layout stays yours to review."
+                pins = [
+                    (output, _recorded_digest(source["stage"], output, unreleased, digests))
+                    for output in source["outputs"]
+                ]
+                if len(pins) == 1:
+                    output, sha256 = pins[0]
+                    inputs.append(
+                        {
+                            "kind": "artifact",
+                            "name": source["name"],
+                            "campaign_id": campaign["id"],
+                            "stage": source["stage"],
+                            "output": output,
+                            "sha256": sha256,
+                        }
                     )
-                if (source["stage"], source["outputs"][0]) in unreleased:
-                    raise RerunRefused(
-                        f"Output {source['outputs'][0]!r} of {source['stage']!r} is not "
-                        "custody-released and retained, so a later campaign cannot pin it; "
-                        "a human restores custody first."
-                    )
-                found = digests.get((source["stage"], source["outputs"][0]), set())
-                if len(found) != 1:
-                    raise RerunRefused(
-                        f"Output {source['outputs'][0]!r} of {source['stage']!r} has no single "
-                        "recorded digest."
-                    )
-                sha256 = next(iter(found))
+                    reused.append({"stage": source["stage"], "output": output, "sha256": sha256})
+                    continue
+                # ADR 0209: several outputs read by one input keep their mount layout as one
+                # explicit folder pin (``<name>/<declared output path>``) in the reviewed spec.
+                files = _folder_files(source, stages[source["stage"]], pins)
                 inputs.append(
                     {
-                        "kind": "artifact",
+                        "kind": "artifact_folder",
                         "name": source["name"],
                         "campaign_id": campaign["id"],
                         "stage": source["stage"],
-                        "output": source["outputs"][0],
-                        "sha256": sha256,
+                        "files": files,
                     }
                 )
-                reused.append(
-                    {"stage": source["stage"], "output": source["outputs"][0], "sha256": sha256}
+                reused.extend(
+                    {
+                        "stage": source["stage"],
+                        "output": item["output"],
+                        "sha256": item["sha256"],
+                        "input": source["name"],
+                        "path": item["path"],
+                    }
+                    for item in files
                 )
             else:
                 inputs.append(source)
@@ -345,6 +356,67 @@ def build_retry_spec(
             "tessera_validate_campaign_spec, then submit it with tessera_submit_campaign."
         ),
     }
+
+
+def _recorded_digest(
+    stage: str,
+    output: str,
+    unreleased: set[tuple[str, str]],
+    digests: dict[tuple[str, str], set[str]],
+) -> str:
+    """The one recorded, custody-released digest of ``output`` of ``stage`` (ADR 0069)."""
+    if (stage, output) in unreleased:
+        raise RerunRefused(
+            f"Output {output!r} of {stage!r} is not custody-released and retained, so a later "
+            "campaign cannot pin it; a human restores custody first."
+        )
+    found = digests.get((stage, output), set())
+    if len(found) != 1:
+        raise RerunRefused(f"Output {output!r} of {stage!r} has no single recorded digest.")
+    return next(iter(found))
+
+
+def _folder_files(
+    source: dict[str, Any], producer: dict[str, Any], pins: list[tuple[str, str]]
+) -> list[dict[str, str]]:
+    """The files of an ``artifact_folder`` pin (ADR 0209): each output's declared path, checked.
+
+    The path is the producing stage's declared ``output.path``, never invented; an undeclared
+    output, an unsafe or repeated path, or a repeated output refuses the whole re-run."""
+    from .campaign_models import folder_path_problem
+
+    declared = {
+        item.get("name"): item.get("path")
+        for item in producer.get("outputs", [])
+        if isinstance(item, dict)
+    }
+    files: list[dict[str, str]] = []
+    for output, sha256 in pins:
+        path = declared.get(output)
+        if not isinstance(path, str):
+            raise RerunRefused(
+                f"Input {source['name']!r} reads output {output!r}, which "
+                f"{source['stage']!r} does not declare."
+            )
+        problem = folder_path_problem(path)
+        if problem is not None:
+            raise RerunRefused(
+                f"Output {output!r} of {source['stage']!r} has path {path!r}, which cannot be "
+                f"pinned as a folder file: it {problem}."
+            )
+        files.append({"output": output, "path": path, "sha256": sha256})
+    outputs = [item["output"] for item in files]
+    paths = [item["path"] for item in files]
+    if len(set(outputs)) != len(outputs) or len(set(paths)) != len(paths):
+        raise RerunRefused(
+            f"Input {source['name']!r} names an output or path of {source['stage']!r} twice."
+        )
+    if any(other.startswith(path + "/") for path in paths for other in paths):
+        raise RerunRefused(
+            f"Input {source['name']!r}: one output path of {source['stage']!r} is a directory "
+            "of another, so the folder layout is ambiguous."
+        )
+    return files
 
 
 def plan_rerun(source: dict[str, Any], request: RerunCampaign) -> dict[str, Any]:

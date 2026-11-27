@@ -177,7 +177,7 @@ def _profiles(
     return found
 
 
-PINNED_KINDS = frozenset({"snapshot", "artifact", "public_artifact"})
+PINNED_KINDS = frozenset({"snapshot", "artifact", "artifact_folder", "public_artifact"})
 
 
 def _unpinned_input(spec: CampaignSpecV2, key: str, inputs: Any) -> str | None:

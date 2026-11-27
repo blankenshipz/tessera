@@ -45,6 +45,7 @@ from .campaign_image_pull import latest_by_stage as image_pull_latest
 from .campaign_io import (
     refuse_submitted_lineage,
     resolve_artifact,
+    resolve_artifact_folder,
     resolve_image_refs,
     resolve_receipt_refs,
 )
@@ -290,6 +291,11 @@ class CampaignStore(
             if source.kind == "artifact":
                 found = resolve_artifact(connection, project, source)
                 return [(found.path, found.sha256, found.size_bytes)]
+            if source.kind == "artifact_folder":  # ADR 0209: one entry per pinned file
+                return [
+                    (found.path, found.sha256, found.size_bytes)
+                    for found in resolve_artifact_folder(connection, project, source)
+                ]
             row = connection.execute(
                 "SELECT manifest_json FROM source_snapshots WHERE id=? AND project_id=?",
                 (source.snapshot_id, project_id),
@@ -533,6 +539,8 @@ class CampaignStore(
             for source in stage.inputs:
                 if source.kind == "artifact":
                     resolve_artifact(connection, project, source)
+                if source.kind == "artifact_folder":
+                    resolve_artifact_folder(connection, project, source)
                 if source.kind != "snapshot":
                     continue  # stage, public_artifact (ADR 0097): no snapshot admission
                 snapshot = SnapshotStore._snapshot(connection, live, source.snapshot_id)

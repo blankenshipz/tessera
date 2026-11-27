@@ -99,9 +99,10 @@ Limits of what exists:
 
 - `tessera_rerun_campaign` in `failed_stages` mode inherits the retry builder's refusals below
   (use `identical` mode for a v1 spec); it does not extend a deadline or raise a cap.
-- `tessera_prepare_stage_retry` refuses v1 specs, an input that reads several outputs of a stage
-  it would pin (the mount layout is for a person to review), and an output with no single
-  recorded digest. It cannot retry across a campaign that has no terminal receipt, because the
+- `tessera_prepare_stage_retry` refuses v1 specs and an output with no single recorded digest or
+  without custody release. An input that reads several outputs of a stage it would pin becomes one
+  `artifact_folder` input listing every file's declared path and digest for review (ADR 0209);
+  one file that cannot be pinned refuses the whole retry. It cannot retry across a campaign that has no terminal receipt, because the
   platform resolves artifact pins from that receipt.
 - A campaign with no active approval still skips the confirmed-exit resolution (ADR 0053 item 9).
 

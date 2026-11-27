@@ -418,7 +418,7 @@ def test_a_v1_spec_can_only_be_rerun_identically(tmp_path):
     assert new["spec_digest"] == env.store.get_campaign(env.owner, campaign["id"])["spec_digest"]
 
 
-def test_an_input_reading_several_outputs_is_refused_not_guessed():
+def test_an_input_reading_several_outputs_is_pinned_as_one_folder_or_refused_whole():
     from tessera_control.campaign_rerun import RerunRefused, build_retry_spec
 
     snap = {"kind": "snapshot", "name": "code", "snapshot_id": "s", "digest": "b" * 64,
@@ -459,7 +459,26 @@ def test_an_input_reading_several_outputs_is_refused_not_guessed():
         ],
     }
     outputs = {"outputs": [{"stage_key": "a", "name": n, "sha256": "d" * 64} for n in ("x", "y")]}
-    with pytest.raises(RerunRefused, match="several outputs"):
+    # ADR 0209: every file releasable, so one explicit folder pin keeps the mount layout.
+    plan = build_retry_spec(campaign, outputs)
+    (pin,) = [i for i in plan["spec"]["stages"][0]["inputs"] if i["name"] == "up"]
+    assert pin == {
+        "kind": "artifact_folder",
+        "name": "up",
+        "campaign_id": "c1",
+        "stage": "a",
+        "files": [
+            {"output": "x", "path": "x.json", "sha256": "d" * 64},
+            {"output": "y", "path": "y.json", "sha256": "d" * 64},
+        ],
+    }
+    assert [(r["output"], r["path"]) for r in plan["reused_outputs"]] == [
+        ("x", "x.json"),
+        ("y", "y.json"),
+    ]
+    # One file that cannot be pinned still refuses the whole re-run (no partial pin).
+    outputs["outputs"][1]["custody_released"] = False
+    with pytest.raises(RerunRefused, match="'y' of 'a' is not custody-released"):
         build_retry_spec(campaign, outputs)
 
 

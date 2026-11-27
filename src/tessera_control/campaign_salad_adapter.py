@@ -117,7 +117,7 @@ def default_program(stage: Any) -> dict[str, Any]:
 # (``bind_workload``); the reviewed ``max_bytes`` cap stays. Upstream sizes are the upstream
 # outputs' declared ``max_bytes``: an output without a declared bound is refused.
 LATE_BIND_SCHEMA = "tessera.salad.late-bound-input.v1"
-CUSTODY_KINDS = ("snapshot", "artifact", "stage")
+CUSTODY_KINDS = ("snapshot", "artifact", "artifact_folder", "stage")
 
 # The (path, max_bytes) of each output a ``stage`` input names, from the upstream stage's
 # declared outputs; None when an output cannot be found or carries no bound.

@@ -38,7 +38,7 @@ from . import campaign_placement_preference as preference
 from .campaign_heavy_remote import FIELD as RECORD_SOURCE
 from .campaign_heavy_remote import NOT_ADDED_REASONS, records
 from .campaign_infra_retry import is_infra_class
-from .campaign_models import NormalStage
+from .campaign_models import NormalStage, pinned_artifacts
 
 EVENT = "campaign.heavy_stage_local_fallback"
 REFUSED_REASON = "heavy_local_refused"
@@ -112,22 +112,23 @@ def input_bytes(
                 if row is not None:
                     entries = json.loads(row["manifest_json"]).get("entries") or ()
                     total += sum(int(entry.get("size") or 0) for entry in entries)
-            elif item.kind == "artifact" and item.campaign_id:
-                row = connection.execute(
-                    """SELECT size_bytes FROM campaign_stage_io WHERE org_id=? AND project_id=?
-                    AND campaign_id=? AND stage_key=? AND direction='output' AND name=?
-                    AND sha256=? LIMIT 1""",
-                    (
-                        campaign["org_id"],
-                        campaign["project_id"],
-                        item.campaign_id,
-                        item.stage,
-                        item.output,
-                        item.sha256,
-                    ),
-                ).fetchone()
-                if row is not None:
-                    total += int(row["size_bytes"])
+            elif item.kind in ("artifact", "artifact_folder") and item.campaign_id:
+                for pin in pinned_artifacts(item):  # ADR 0209: each file of a folder
+                    row = connection.execute(
+                        """SELECT size_bytes FROM campaign_stage_io WHERE org_id=?
+                        AND project_id=? AND campaign_id=? AND stage_key=? AND direction='output'
+                        AND name=? AND sha256=? LIMIT 1""",
+                        (
+                            campaign["org_id"],
+                            campaign["project_id"],
+                            pin.campaign_id,
+                            pin.stage,
+                            pin.output,
+                            pin.sha256,
+                        ),
+                    ).fetchone()
+                    if row is not None:
+                        total += int(row["size_bytes"])
         except (sqlite3.Error, ValueError, TypeError, AttributeError):
             continue  # an unreadable size is unknown, never a placement failure
     return total

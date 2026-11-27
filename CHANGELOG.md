@@ -5,6 +5,7 @@ does not create release tags, a supported binary release or compatibility promis
 
 ## Unreleased
 
+- v0.111.0, a failed-stages re-run keeps a multi-output input's folder (ADR 0209). An input that read several outputs of a succeeded stage was refused; it is now pinned as one `kind: artifact_folder` input under the same name, listing each output's declared path and sha256, so the workload still sees `/inputs/<name>/<path>`. Each file must be custody-released and retained with one recorded digest, or the whole re-run is refused, and a person still approves the new digest. Single-output pins are unchanged.
 - v0.110.0, Salad settlement and runtime hardening (the three entries below: q-2720, q-2721, q-2722).
 - Salad runtime N-items (q-2722): a lease-renewing executing attempt is not called silent inside the executor's time budget, and the runner bounds the renewing-executor wait by the longest configurable termination confirmation (N1); pre-route leases of a blocked or paused campaign are listed for keepalive only (N3); the guardian starts the running cap only on an instance-level running read (N4); a never-ready frame frees its per-run hold at resolution (N5); a closed alert is raised when the project's Salad group list is full (100+ groups), failing closed since no pagination exists (N7).
 - Salad sweep follow-ups (q-2721): keepalive refusal gaps closed and a stale renewal streak cleaned up; the ADR 0193/0196/0197 amendments state the earliest-non-zero-exit rule for a container that exits non-zero.

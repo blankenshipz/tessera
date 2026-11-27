@@ -519,6 +519,64 @@ class ArtifactSource(_Strict):
         return value
 
 
+def folder_path_problem(path: str) -> str | None:
+    """Why ``path`` cannot be a file of a pinned folder (ADR 0209), or None.
+
+    A folder path is relative, POSIX, non-empty, with no empty, ``.`` or ``..`` segment and no
+    backslash, so the mount stays inside the input's own directory."""
+    if not path or path.startswith("/") or "\\" in path or "\x00" in path:
+        return "must be a non-empty relative path"
+    if any(part in {"", ".", ".."} for part in path.split("/")):
+        return "must not contain an empty, '.' or '..' segment"
+    return None
+
+
+class FolderFile(_Strict):
+    """One file of an ``artifact_folder`` input: the producing stage's output, its declared
+    relative path (the mount is ``<input name>/<path>``) and its digest (ADR 0209)."""
+
+    output: Key
+    path: RawString4000
+    sha256: Sha256Digest
+
+    @field_validator("path")
+    @classmethod
+    def _safe_path(cls, value: str) -> str:
+        problem = folder_path_problem(value)
+        if problem is not None:
+            raise ValueError(f"a folder file path {problem}")
+        return value
+
+
+class ArtifactFolderSource(_Strict):
+    """Several outputs of one stage of a finished campaign, pinned under one input name (ADR 0209).
+
+    The folder mounts each file at ``<name>/<path>``, exactly the layout a ``stage`` input that
+    reads several outputs had. Every file is resolved like an ``artifact`` input (succeeded
+    attempt listed by a terminal receipt, custody-released and retained manifest, that sha256)
+    and its ``path`` must equal the producing stage's declared output path. Always
+    ``private_derived``. A single output is pinned as an ordinary ``artifact`` input instead."""
+
+    kind: Literal["artifact_folder"]
+    name: Key
+    campaign_id: Identifier
+    stage: Key
+    files: Annotated[list[FolderFile], Field(min_length=2, max_length=128)]
+
+    @model_validator(mode="after")
+    def _distinct(self) -> ArtifactFolderSource:
+        outputs = [f.output for f in self.files]
+        if len(set(outputs)) != len(outputs):
+            raise ValueError("a folder names each output once")
+        paths = [f.path for f in self.files]
+        if len(set(paths)) != len(paths):
+            raise ValueError("folder file paths must be unique")
+        for path in paths:
+            if any(other.startswith(path + "/") for other in paths):
+                raise ValueError("a folder file path cannot also be a directory of another file")
+        return self
+
+
 class ReceiptOutputSource(_Strict):
     """A reference to an output a finished campaign's receipt lists (ADR 0080).
 
@@ -644,6 +702,7 @@ StageInputV2 = Annotated[
     SnapshotSource
     | StageOutputSource
     | ArtifactSource
+    | ArtifactFolderSource
     | ReceiptOutputSource
     | PublicArtifactSource,
     Field(discriminator="kind"),
@@ -1131,7 +1190,7 @@ def _check_v1_shape(stage: StageSpec) -> None:
 
 @dataclass(frozen=True)
 class NormalInput:
-    kind: Literal["snapshot", "stage", "artifact", "public_artifact"]
+    kind: Literal["snapshot", "stage", "artifact", "artifact_folder", "public_artifact"]
     name: str
     # snapshot
     snapshot_id: str | None = None
@@ -1149,6 +1208,39 @@ class NormalInput:
     public_files: tuple[tuple[str, str, str, int], ...] = ()
     redirect_hosts: tuple[str, ...] = ()
     cache: bool = False
+    # artifact_folder (ADR 0209): (output, path, sha256) per file, with campaign_id and stage
+    files: tuple[tuple[str, str, str], ...] = ()
+
+
+def pinned_artifacts(item: Any) -> tuple[NormalInput, ...]:
+    """The per-file ``artifact`` view of a pinned input: the input itself for an ``artifact``,
+    one entry per file of an ``artifact_folder`` (ADR 0209), nothing for any other kind. Every
+    per-file check (resolution, custody, size, holdout, seals, licences) runs on these."""
+    kind = getattr(item, "kind", None)
+    if kind == "artifact":
+        return (item,)
+    if kind != "artifact_folder":
+        return ()
+    return tuple(
+        NormalInput(
+            "artifact",
+            item.name,
+            campaign_id=item.campaign_id,
+            stage=item.stage,
+            output=output,
+            sha256=sha256,
+            data_class=PRIVATE_DERIVED,
+        )
+        for output, _path, sha256 in item.files
+    )
+
+
+def input_digests(item: Any) -> tuple[str, ...]:
+    """Every content digest a pinned input mounts: a snapshot's digest, an artifact's sha256,
+    each file of an artifact folder; nothing for stage or public inputs."""
+    if getattr(item, "kind", None) == "snapshot":
+        return (item.digest,) if item.digest else ()
+    return tuple(pin.sha256 for pin in pinned_artifacts(item) if pin.sha256)
 
 
 @dataclass(frozen=True)
@@ -1409,6 +1501,17 @@ def _normalize_v2(spec: CampaignSpecV2) -> NormalSpec:
                         ),
                         redirect_hosts=tuple(item.redirect_hosts),
                         cache=item.cache,
+                    )
+                )
+            elif isinstance(item, ArtifactFolderSource):
+                inputs.append(
+                    NormalInput(
+                        "artifact_folder",
+                        item.name,
+                        campaign_id=item.campaign_id,
+                        stage=item.stage,
+                        data_class=PRIVATE_DERIVED,
+                        files=tuple((f.output, f.path, f.sha256) for f in item.files),
                     )
                 )
             elif isinstance(item, ReceiptOutputSource):
@@ -1917,10 +2020,7 @@ def _validate_evaluation(spec: NormalSpec, stage: NormalStage) -> None:
         if other.key == stage.key:
             continue
         for item in other.inputs:
-            if item.kind == "public_artifact":
-                continue
-            digest = item.digest if item.kind == "snapshot" else item.sha256
-            if digest == holdout.partition_digest:
+            if holdout.partition_digest in input_digests(item):
                 raise ValueError(
                     f"Stage {other.key}: input {item.name!r} is the sealed partition of "
                     f"{stage.key}; only its holdout stage may read it"

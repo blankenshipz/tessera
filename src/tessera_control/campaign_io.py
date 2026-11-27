@@ -316,6 +316,60 @@ def resolve_artifact(
     )
 
 
+def _declared_output_path(
+    connection: sqlite3.Connection, campaign: Mapping[str, Any], source: Any, output: str
+) -> str | None:
+    """The path the source campaign's reviewed spec declares for ``output`` of ``source.stage``."""
+    row = connection.execute(
+        "SELECT spec_json FROM campaigns WHERE id=? AND org_id=? AND project_id=?",
+        (source.campaign_id, campaign["org_id"], campaign["project_id"]),
+    ).fetchone()
+    if row is None:
+        return None
+    for stage in json.loads(row["spec_json"]).get("stages", []):
+        if stage.get("key") != source.stage:
+            continue
+        for declared in stage.get("outputs", []):
+            if isinstance(declared, Mapping) and declared.get("name") == output:
+                path = declared.get("path")
+                return path if isinstance(path, str) else None
+    return None
+
+
+def resolve_artifact_folder(
+    connection: sqlite3.Connection, campaign: Mapping[str, Any], source: Any
+) -> list[ResolvedArtifact]:
+    """Resolve every file of a pinned ``artifact_folder`` input or raise Conflict (ADR 0209).
+
+    Each file is resolved exactly as an ``artifact`` input (``resolve_artifact``); one file that
+    does not resolve refuses the whole folder. Each file's ``path`` must equal both the path the
+    source campaign's spec declares for that output and the recorded output path, so the mount
+    ``<name>/<path>`` is the layout the producing stage declared and never an invented one. All
+    files come from one manifest (one succeeded attempt), which the runner composes as one
+    source under the input's name."""
+    from .campaign_models import folder_path_problem, pinned_artifacts
+
+    files = {output: path for output, path, _sha in source.files}
+    resolved: list[ResolvedArtifact] = []
+    for pin in pinned_artifacts(source):
+        path = files[pin.output]
+        problem = folder_path_problem(path)
+        if problem is not None:
+            raise _refuse(source, f"file {pin.output!r}: the path {problem}")
+        found = resolve_artifact(connection, campaign, pin)
+        declared = _declared_output_path(connection, campaign, source, pin.output)
+        if declared is None or declared != path or found.path != path:
+            raise _refuse(
+                source,
+                f"file {pin.output!r}: path {path!r} is not the path the producing stage "
+                "declared for that output",
+            )
+        resolved.append(found)
+    if len({item.manifest_id for item in resolved}) != 1:
+        raise _refuse(source, "its files do not come from one output manifest")
+    return resolved
+
+
 def _receipt_ref_refusal(stage_key: str, ref: Mapping[str, Any], why: str) -> Conflict:
     return Conflict(f"Stage {stage_key!r} receipt_output input {ref['name']!r}: {why}.")
 

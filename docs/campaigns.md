@@ -39,6 +39,12 @@ appended after any entries the stage bound before the refusal was recorded; a re
 another campaign's output (`kind: artifact`); that resolves through the source campaign's
 v2 receipt and its stage I/O index, so a campaign that finished before schema v65 cannot be
 an artifact source.
+Several outputs of one stage of an earlier campaign can be pinned under one input name with
+`kind: artifact_folder` (`name`, `campaign_id`, `stage`, and `files`: two or more entries of
+`output`, `path`, `sha256`). Each file mounts at `<name>/<path>`. The path must be the producing
+stage's declared output path, and each file resolves like an `artifact` pin; one failing file
+refuses the input. A `failed_stages` re-run writes this pin when a re-run stage read several
+outputs of a succeeded stage (ADR 0209).
 
 Instead of copying a campaign id and sha256 by hand, a v2 stage may take a value recorded on an
 earlier campaign's terminal receipt with `kind: receipt_output` (`name`, `stage`, `output`, and

@@ -42,12 +42,16 @@ class SealedRead:
         }
 
 
-def _input_digest(item: Any) -> str | None:
+def _input_digests(item: Any) -> tuple[str, ...]:
+    """Every digest an input pins: a snapshot's, an artifact's, each file of an artifact folder
+    (ADR 0209); none for stage or public inputs."""
     if item.kind == "snapshot":
-        return item.digest
+        return (item.digest,)
     if item.kind == "artifact":
-        return item.sha256
-    return None
+        return (item.sha256,)
+    if item.kind == "artifact_folder":
+        return tuple(sha256 for _output, _path, sha256 in item.files)
+    return ()
 
 
 def _stage_reads(spec: Any) -> dict[str, list[SealedRead]]:
@@ -75,9 +79,9 @@ def _stage_reads(spec: Any) -> dict[str, list[SealedRead]]:
         for stage in spec.stages:
             found: list[SealedRead] = []
             for item in stage.inputs:
-                digest = _input_digest(item)
-                for seal in by_digest.get(digest or "", ()):
-                    found.append(SealedRead(seal.name, seal.role, item.name, "direct"))
+                for digest in _input_digests(item):
+                    for seal in by_digest.get(digest or "", ()):
+                        found.append(SealedRead(seal.name, seal.role, item.name, "direct"))
                 if item.kind != "stage" or item.stage not in stages:
                     continue
                 names = {paths[item.stage].get(path) for path in item.paths}
@@ -109,7 +113,9 @@ def validate_seals(spec: Any) -> None:
     if len(set(names)) != len(names):
         raise ValueError("Seal names must be unique")
     stages = {stage.key: stage for stage in spec.stages}
-    pinned = {_input_digest(item) for stage in spec.stages for item in stage.inputs} - {None}
+    pinned = {
+        digest for stage in spec.stages for item in stage.inputs for digest in _input_digests(item)
+    } - {None}
     unresolved = _UNRESOLVED_DIGEST in pinned
     targets: set[tuple[str, ...]] = set()
     for seal in seals:
@@ -169,7 +175,11 @@ def carried_seals(spec: Any, rerun: set[str], reused: list[dict[str, str]]) -> l
     reads = _stage_reads(spec)
     taint = {key: {(r.seal, r.role) for r in found} for key, found in reads.items()}
     kept_digests = {
-        _input_digest(item) for stage in spec.stages if stage.key in rerun for item in stage.inputs
+        digest
+        for stage in spec.stages
+        if stage.key in rerun
+        for item in stage.inputs
+        for digest in _input_digests(item)
     } - {None}
     carried: list[dict[str, str]] = []
     seen: set[tuple[str, ...]] = set()

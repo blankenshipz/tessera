@@ -39,7 +39,8 @@ or a campaign that is simply to be run again had no path at all.
    manifest is retained and custody-released. The builder moved into the control plane
    (`campaign_rerun.py`, shared with the offline MCP tool) and keeps its refusals: v1 spec,
    output with no single digest, output not custody-released, several outputs of one stage read
-   by one input. `identical` resubmits the same spec (any version), for a campaign to run again
+   by one input (lifted by [ADR 0209](0209-rerun-multi-output-stage-pin.md) when the explicit
+   folder pin is in the reviewed spec; see the amendment below). `identical` resubmits the same spec (any version), for a campaign to run again
    unchanged; it takes no stage keys or cap and yields the same spec digest.
 4. **Spend.** The new cap defaults to the source's cap less what the source settled (never
    below the re-run stages' exposure). The per-submission limit this ADR first set (an explicit
@@ -68,3 +69,13 @@ or a campaign that is simply to be run again had no path at all.
 - It does not shorten the human step: a person still approves the new digest. A custody
   revocation, a changed trust setting or a refused provider fails the re-run loudly at submit or
   approval, not silently.
+
+## Amendment (ADR 0209): several outputs of one stage read by one input
+
+The refusal of "several outputs of one stage read by one input" in section 3 is lifted only for one
+case. The re-run spec must then hold an explicit `kind: artifact_folder` pin under the same input
+name, listing each file's output, declared path and sha256, so the person who approves the new
+digest sees the mount layout (`<name>/<declared output path>`). Each file passes every check of
+section 3. One file that has no single digest, is not custody-released and retained, comes from a
+stage that did not succeed, or comes from a stage that is itself re-run refuses the whole re-run.
+Every other refusal of this ADR stands, and approval of the source digest still approves nothing.

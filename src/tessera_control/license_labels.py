@@ -377,7 +377,7 @@ def _stage_union(
                     connection, spec, item.stage, org_id, project_id, depth, inner, spec_id, memo
                 )
                 result[item.name] = _flatten(upstream)
-        elif item.kind == "artifact":  # another campaign's output
+        elif item.kind in ("artifact", "artifact_folder"):  # another campaign's output(s)
             result[item.name] = _artifact_labels(
                 connection, item, org_id, project_id, depth, inner, memo
             )

@@ -84,6 +84,7 @@ from .campaign_io import (
     IoEntry,
     output_entries,
     resolve_artifact,
+    resolve_artifact_folder,
     write_io,
 )
 from .campaign_leased_hold import (
@@ -3060,6 +3061,22 @@ class CampaignRunner:
                             lineage_node_id=self._node_for(project, listed[path]["sha256"]),
                         )
                     )
+            elif item.kind == "artifact_folder":
+                # ADR 0209: one entry per pinned file, named like a stage input's files.
+                for resolved in self._resolve_artifact_folder(ctx, item):
+                    entries.append(
+                        IoEntry(
+                            name=f"{item.name}/{resolved.path}",
+                            kind=resolved.kind,
+                            media_type=resolved.media_type,
+                            sha256=resolved.sha256,
+                            size_bytes=resolved.size_bytes,
+                            data_class=resolved.data_class,
+                            manifest_id=resolved.manifest_id,
+                            path=resolved.path,
+                            lineage_node_id=resolved.lineage_node_id,
+                        )
+                    )
             elif item.kind == "artifact":
                 resolved = self._resolve_artifact(ctx, item)
                 entries.append(
@@ -3099,6 +3116,13 @@ class CampaignRunner:
         try:
             with self.store.runner_connection() as connection:
                 return resolve_artifact(connection, ctx.campaign, item)
+        except Conflict as error:
+            raise StepFailed("compose_snapshot", "step_refused", str(error)[:300]) from None
+
+    def _resolve_artifact_folder(self, ctx: _Ctx, item: Any) -> list[Any]:
+        try:
+            with self.store.runner_connection() as connection:
+                return resolve_artifact_folder(connection, ctx.campaign, item)
         except Conflict as error:
             raise StepFailed("compose_snapshot", "step_refused", str(error)[:300]) from None
 
@@ -3480,6 +3504,28 @@ class CampaignRunner:
                                 f"{item.name}/{path}",
                                 listed[path]["sha256"],
                                 listed[path]["size"],
+                                "imported_unverified",
+                            )
+                        )
+                elif item.kind == "artifact_folder":
+                    # ADR 0209: one manifest source under the input's name, every file at
+                    # ``<name>/<declared path>``.
+                    files = self._resolve_artifact_folder(ctx, item)
+                    sources.append(
+                        {
+                            "name": item.name,
+                            "kind": "manifest",
+                            "manifest_id": files[0].manifest_id,
+                            "expected_manifest_digest": files[0].manifest_digest,
+                            "relative_paths": [resolved.path for resolved in files],
+                        }
+                    )
+                    for resolved in files:
+                        entries.append(
+                            (
+                                f"{item.name}/{resolved.path}",
+                                resolved.sha256,
+                                resolved.size_bytes,
                                 "imported_unverified",
                             )
                         )
@@ -5175,6 +5221,9 @@ class CampaignRunner:
             elif source.kind == "artifact":
                 # The node that produced the pinned output already exists (same project).
                 inputs.append((f"{source.name}", source.sha256, None, "other"))
+            elif source.kind == "artifact_folder":
+                for _output, path, sha256 in sorted(source.files, key=lambda f: f[1]):
+                    inputs.append((f"{source.name}/{path}", sha256, None, "other"))
             elif source.kind == "public_artifact":
                 for name, _url, sha256, _max in source.public_files:
                     inputs.append((f"{source.name}/{name}", sha256, None, "other"))

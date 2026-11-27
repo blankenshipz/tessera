@@ -304,13 +304,25 @@ def _spec_snapshot_ids(campaign: Mapping) -> set[str]:
 
 
 def _spec_artifact_sources(campaign: Mapping) -> list[dict[str, Any]]:
+    """Every pinned output of another campaign: ``artifact`` inputs and each file of an
+    ``artifact_folder`` input (ADR 0209), as (campaign_id, stage, output, sha256) mappings."""
     spec = json.loads(campaign["spec_json"])
-    return [
-        source
-        for stage in spec["stages"]
-        for source in stage["inputs"]
-        if source["kind"] == "artifact"
-    ]
+    found: list[dict[str, Any]] = []
+    for stage in spec["stages"]:
+        for source in stage["inputs"]:
+            if source["kind"] == "artifact":
+                found.append(source)
+            elif source["kind"] == "artifact_folder":
+                found.extend(
+                    {
+                        "campaign_id": source["campaign_id"],
+                        "stage": source["stage"],
+                        "output": item["output"],
+                        "sha256": item["sha256"],
+                    }
+                    for item in source["files"]
+                )
+    return found
 
 
 def _normal_spec(campaign: Mapping):

@@ -118,14 +118,17 @@ def sealed_input_refusal(connection: sqlite3.Connection, project_id: str, stage:
     for item in stage.inputs:
         if item.kind == "public_artifact":
             continue  # public data fetched on the provider (ADR 0097) is never a sealed partition
-        digest = item.digest if item.kind == "snapshot" else item.sha256
-        if digest in claimed and (holdout is None or holdout.input != item.name):
+        if item.kind == "artifact_folder":
+            digests: tuple[str | None, ...] = tuple(sha for _out, _path, sha in item.files)
+        else:
+            digests = (item.digest if item.kind == "snapshot" else item.sha256,)
+        if any(d in claimed for d in digests) and (holdout is None or holdout.input != item.name):
             return (
                 f"Stage {stage.key}: input {item.name!r} is a sealed partition (claimed, or "
                 "declared by an approved holdout stage); "
                 "only a final holdout evaluation stage may read it"
             )
-        if item.kind == "artifact" and _holdout_stage(
+        if item.kind in ("artifact", "artifact_folder") and _holdout_stage(
             connection, project_id, item.campaign_id, item.stage
         ):
             return (

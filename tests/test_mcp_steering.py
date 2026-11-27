@@ -156,8 +156,9 @@ def test_v1_specs_and_unknown_or_multi_output_inputs_are_refused():
     campaign = _campaign({"a": "succeeded", "b": "failed", "c": "pending"})
     with pytest.raises(RetryRefused, match="Unknown stage"):
         build_retry_spec(campaign, {}, stage_keys=["nope"])
+    # ADR 0209: several outputs become one folder pin only when every file can be pinned.
     campaign["spec"]["stages"][1]["inputs"][1]["outputs"] = ["report", "more"]
-    with pytest.raises(RetryRefused, match="several outputs"):
+    with pytest.raises(RetryRefused, match="'more' of 'a' has no single recorded digest"):
         build_retry_spec(campaign, _outputs(("a", "report", "d")))
 
 
