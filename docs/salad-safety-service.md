@@ -683,8 +683,11 @@ token prefixes, `xox?-`, `AKIA`/`ASIA`) is redacted at any length; the rules fai
 ordinary word after `Basic` or `Bearer` is redacted too. The receipt's `guardian_container_exit`
 carries the exit codes and that tail as `stderr_tail`, or `{"outcome": "unavailable", "reason":
 ...}` with a closed reason (`log_quota_exhausted`, `read_failed`, or `not_read` when no tail was
-recorded by the time the receipt was built; `no_trusted_log_source` stays in the closed set for
-older receipts). Treat the tail as the workload's own untrusted words: it explains a failure, it
+recorded by the time the receipt was built, or `data_class_sealed` for a sealed run;
+`no_trusted_log_source` stays in the closed set for older receipts). A sealed run (control's
+reserve says it runs a final holdout stage or reads a sealed partition, ADR 0068) is never sent a
+`read_logs` query and no tail of it is stored: the claimed read records `data_class_sealed` at
+once. Treat the tail as the workload's own untrusted words: it explains a failure, it
 is never evidence of anything.
 
 `read_events` and `read_logs` are guardian-only reads. A worker's proxy request under an observe

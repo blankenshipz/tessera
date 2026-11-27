@@ -129,11 +129,32 @@ class StepFailed(Exception):
 
 
 class StepTransient(Exception):
-    """The call may or may not have committed; the intent stays pending and is replayed."""
+    """The call may or may not have committed; the intent stays pending and is replayed.
+
+    ``deterministic`` marks a replay that the same error will refuse again (a reduce-only
+    step's store call raised something other than contention or I/O): it is still replayed,
+    but the runner counts ``error_class`` toward its breaker (ADR 0210)."""
+
+    def __init__(
+        self, message: str = "", *, deterministic: bool = False, error_class: str | None = None
+    ) -> None:
+        super().__init__(message)
+        self.deterministic = deterministic
+        self.error_class = error_class
 
 
 class DelegationLapsed(Exception):
     """The approver's authority is gone; the campaign pauses instead of failing the step."""
+
+
+def is_transient_error(error: BaseException) -> bool:
+    """Contention or I/O that a replay of the same pending intent may get past: a busy or
+    locked database, a timeout, an OS or connection error. Anything else a store call raises
+    is deterministic for the same request."""
+    if isinstance(error, sqlite3.OperationalError):
+        text = str(error).lower()
+        return "locked" in text or "busy" in text or "disk i/o" in text
+    return isinstance(error, (TimeoutError, OSError))
 
 
 @dataclass(frozen=True)
@@ -540,7 +561,34 @@ class StepExecutor:
                 self._fail_intent(connection, campaign, intent["id"], type(error).__name__, step)
             raise StepFailed(step, type(error).__name__, str(error)[:300]) from None
         except Exception as error:
-            raise StepTransient(f"{step}: {type(error).__name__}") from None
+            transient = is_transient_error(error)
+            if step in REDUCE_ONLY_STEPS or transient:
+                # Contention or I/O may or may not have committed: the intent stays pending
+                # and is replayed. A reduce-only step (cancel, revoke, reconcile, release)
+                # always stays replayable: it creates no authority, and a sticky failure would
+                # strand a hold that only a later, fixed replay can give back. Its
+                # deterministic error is marked so the runner's breaker counts it and blocks a
+                # running or stopping campaign that keeps raising it (ADR 0210); a cancelling
+                # campaign is not blocked and keeps replaying.
+                raise StepTransient(
+                    f"{step}: {type(error).__name__}",
+                    deterministic=not transient,
+                    error_class=type(error).__name__,
+                ) from None
+            with self.store.runner_connection() as connection:
+                row = connection.execute(
+                    "SELECT * FROM campaign_step_intents WHERE id=?", (intent["id"],)
+                ).fetchone()
+                if row is not None and row["status"] == "done":
+                    # The effect committed (the intent completes in its transaction) and the
+                    # error came after: report the recorded result, never a failure.
+                    return StepResult(
+                        row["response_status"], json.loads(row["response_json"]), row["id"], True
+                    )
+                # A deterministic error of a forward step: recorded and fail-closed, so it is
+                # not replayed forever as if it were contention.
+                self._fail_intent(connection, campaign, intent["id"], type(error).__name__, step)
+            raise StepFailed(step, type(error).__name__, "store call raised") from None
         with self.store.runner_connection() as connection:
             row = connection.execute(
                 "SELECT * FROM campaign_step_intents WHERE id=?", (intent["id"],)

@@ -556,6 +556,13 @@ credential *reference*, and a worker credential is a file path. The file is read
 Provider ids and worker principal ids are placeholders for enrolled principals; the
 deployment's real file is not kept in the repository.
 
+`"salad_max_concurrent_routes": N` (an integer from 1 to 4) records the Salad executor's
+`max_concurrent_paid_routes` for control (ADR 0208). Control then issues no more Salad grants at
+once than that many routes can run: an attempt holds a slot from its grant until its route ends,
+and a stage that finds every slot taken waits at `campaign.stage_waiting_slot` before any grant or
+lease. Unset means unbounded, as before; record it whenever the executor is narrower than the
+project concurrency. Any other value refuses the file.
+
 ### Registering providers and profiles
 
 Contract: [ADR 0081](decisions/0081-validated-provider-registration.md). Instead of editing the file by

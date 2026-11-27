@@ -740,6 +740,10 @@ class SaladSafetyService(ContainerExitWatch):
             # First closed cause with which this service put the frame into stop-only recovery
             # (SERVICE_STOP_CAUSES), written in the transaction that first set ``recovery``.
             "stop_cause": "TEXT",
+            # Control said at reserve that this run is sealed (a holdout stage or a sealed
+            # partition): its container log is never read or stored. Only ever set, never
+            # cleared.
+            "data_class_sealed": "INTEGER DEFAULT 0",
         }.items():
             if name not in columns:
                 self.db.execute(f"ALTER TABLE reservations ADD COLUMN {name} {declaration}")
@@ -1188,14 +1192,19 @@ class SaladSafetyService(ContainerExitWatch):
         return min(row["deadline"], started + row["running_seconds"])
 
     def _billed_remaining(self, row):
-        """Worst-case remaining billed seconds from now."""
+        """Worst-case remaining billed seconds from now: an upper bound, never an understatement.
+
+        Once the running cap has started, the stop deadline bounds it. Before accrual starts
+        (no ``running`` read yet), billing can last at most the running window. A frame that
+        is already accruing over a pulling instance (an accrual-only group ``running`` read)
+        has no running cap yet: the pull can last until the route deadline and the cap then
+        stops it no later than that deadline, so its bound is the whole route deadline."""
         now = self.clock()
-        if row["running_seconds"] is None or self._cap_start(row) is None:
-            window = row["deadline"] - now
-            if row["running_seconds"] is not None:
-                window = min(window, row["running_seconds"])
-            return window
-        return self._stop_deadline(row) - now
+        if row["running_seconds"] is None or self._cap_start(row) is not None:
+            return self._stop_deadline(row) - now
+        if row["first_running_at"] is not None:
+            return row["deadline"] - now
+        return min(row["deadline"] - now, row["running_seconds"])
 
     @staticmethod
     def _lost_create_closed(row):
@@ -2371,6 +2380,12 @@ class SaladSafetyService(ContainerExitWatch):
             fields |= {"name", "seq"}
         elif action == "create_rejected":
             fields |= {"rejection"}
+        if action == "reserve" and "data_class_sealed" in body:
+            # Optional so an older trusted server still reserves (as not sealed); when sent it
+            # must be an exact boolean.
+            if type(body["data_class_sealed"]) is not bool:
+                raise ValueError("invalid_admin_request")
+            fields |= {"data_class_sealed"}
         if set(body) != fields:
             raise ValueError("invalid_admin_request")
         if action == "open_frames":
@@ -2568,6 +2583,13 @@ class SaladSafetyService(ContainerExitWatch):
                         or body["deadline"] < row["deadline"]
                     ):
                         raise ValueError("reservation_mismatch")
+                    if body.get("data_class_sealed") is True:
+                        # Sealed on any reserve stays sealed (a partition sealed between two
+                        # reserves still seals the run); a later reserve never unseals it.
+                        self.db.execute(
+                            "UPDATE reservations SET data_class_sealed=1 WHERE reservation=?",
+                            (reservation,),
+                        )
                     # A repeated reserve before any create admission is the trusted server's
                     # own pre-create retry (ADR 0205): it counts as a heartbeat, so the retry
                     # spacing cannot push the frame into recovery. Never after "ready", a

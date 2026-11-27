@@ -80,6 +80,16 @@ The tail appears only in the guardian's final status, the recorded guardian fina
 or in any authority, admission or settlement decision. A failed, rate-limited or unread query
 records a closed reason instead.
 
+A sealed run never has its container log read or stored. Control tells the guardian at reserve
+whether the route runs a final holdout stage or reads a sealed partition
+([ADR 0068](0068-sealed-holdout-evaluation-stages.md)), failing closed to sealed when the
+campaign spec no longer parses or names the stage. The guardian keeps that flag on the
+reservation (a later reserve may set it, never clear it); after a non-zero exit of a sealed run it
+claims the one log read as usual but sends no query and records the closed reason
+`data_class_sealed`, so the receipt's `stderr_tail` is `{"outcome": "unavailable", "reason":
+"data_class_sealed"}`. The exit codes and closed event tokens are still recorded. A reserve that
+omits the flag (an older trusted server) is treated as not sealed.
+
 A non-zero exit no longer waits for three machines. The three-machine rule above still governs a
 start-failure loop with no failing exit code. When the earliest non-zero exit on a single machine
 is the workload's own (not 137 or 143), while its frame is armed and seen running with no retained

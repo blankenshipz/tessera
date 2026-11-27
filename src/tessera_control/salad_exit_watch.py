@@ -112,10 +112,18 @@ class ContainerExitWatch:
         """After a recorded non-zero exit: one durable-claimed ``read_logs`` of the exact group,
         off the loop thread; the bounded, sanitized tail is recorded by a later pass
         (``_drain_container_logs``). A failed or rate-limited read records a closed token and
-        is never repeated. Nothing here raises."""
+        is never repeated. A sealed run (``data_class_sealed``, told by control at reserve) is
+        never read: the claim records the closed ``data_class_sealed`` token instead. Nothing
+        here raises."""
         from .salad_container_log import summarize_container_log, unavailable
 
         try:
+            if row.get("data_class_sealed"):
+                if self.guardian.claim_container_log_read(row["operation"]):
+                    self._container_log_done.append(
+                        (row["operation"], unavailable("data_class_sealed"))
+                    )
+                return
             if not row["provider_id"] or not self.guardian.claim_container_log_read(
                 row["operation"]
             ):
@@ -143,12 +151,28 @@ class ContainerExitWatch:
 
     def _drain_container_logs(self):
         """Record finished container-log reads (loop thread only). Nothing here raises."""
+        from .salad_container_log import unavailable
+
         while self._container_log_done:
             operation, value = self._container_log_done.pop(0)
             try:
+                if self._operation_sealed(operation):
+                    # Sealed after the read began (a later reserve): the tail is never stored.
+                    value = unavailable("data_class_sealed")
                 self.guardian.record_container_log(operation, value)
             except Exception:
                 self.diagnostic_write_failures += 1
+
+    def _operation_sealed(self, operation):
+        """True when the operation's reservation is recorded sealed; False when unknown (the
+        read-time gate in ``_read_container_log`` already refused every sealed row)."""
+        try:
+            found = self.db.execute(
+                "SELECT data_class_sealed FROM reservations WHERE operation=?", (operation,)
+            ).fetchone()
+        except Exception:
+            return False
+        return bool(found is not None and found[0])
 
     def _watch_budget_open(self):
         """True while today's watch budget has room and no rate limit was seen today."""

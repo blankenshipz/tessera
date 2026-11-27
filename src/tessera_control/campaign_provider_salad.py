@@ -49,6 +49,7 @@ from .campaign_providers import (
 )
 from .campaign_salad import (
     LATE_BOUND_EVENT,
+    PRE_ROUTE_PHASES,
     SaladStageDriver,
     credential_blocked,
     credential_message,
@@ -81,6 +82,9 @@ from .salad_workload_contract import (
 from .store import Conflict, Store
 
 PROVIDER_ID = "salad"
+# Attempt phases (``campaign_salad``) that occupy one of the executor's route slots: a grant
+# not yet leased, then every phase up to and including the running route.
+ROUTE_SLOT_PHASES = ("awaiting_lease", *PRE_ROUTE_PHASES, "route_started", "executing")
 RUNTIME = SALAD_RUNTIME
 # Salad's custody total (``MAX_TOTAL_OUTPUT_BYTES``) and per-stage file cap.
 OUTPUT_LIMITS = OutputLimits(
@@ -195,6 +199,28 @@ def public_artifact_refusal(stage: Any, config: SaladStageSpec) -> str | None:
     return _cache_refusal(stage, config)
 
 
+def admitted_nonpublic_input(connection: sqlite3.Connection, stage: Any) -> bool:
+    """Admission-time form of ``stage_has_nonpublic_input`` (ADR 0040 section 4) over every
+    input kind, read against the store. A snapshot is public only when its live admission
+    basis is ``public_only`` (recorded public and carrying no approved code); a pinned
+    ``public_artifact`` is fetched by digest on the provider (ADR 0097) and is never private.
+    Every other kind (a stage output, an ``artifact`` or ``artifact_folder`` pin, a chained
+    receipt reference) and any unknown kind counts as non-public, as does a ``send_classes``
+    naming a class other than ``public``: unknown fails closed."""
+    for source in getattr(stage, "inputs", ()):
+        kind = getattr(source, "kind", None)
+        if kind == "public_artifact":
+            continue
+        if kind != "snapshot":
+            return True
+        snapshot_id = getattr(source, "snapshot_id", None)
+        if not isinstance(snapshot_id, str) or not snapshot_id:
+            return True
+        if provider_trust.admission_basis(connection, snapshot_id) != "public_only":
+            return True
+    return any(c != "public" for c in (getattr(stage, "send_classes", None) or ()))
+
+
 def _hosts_declared(config: SaladStageSpec) -> bool:
     egress = config.workload.egress
     return bool(egress.fetches or egress.redirect_hosts)
@@ -270,7 +296,12 @@ class SaladRouteProvider:
         credential_directory: str | None = None,
         guardian_reader: Any = None,
         manifest_size_reader: Callable[[str], int | None] | None = None,
+        route_width: int | None = None,
     ) -> None:
+        # The executor's ``max_concurrent_paid_routes`` as the operator records it for control
+        # (``salad_max_concurrent_routes``). When set, no more Salad grants exist at once than
+        # routes can run, so a wide campaign waits before any grant or lease instead of after.
+        self.route_width = route_width
         self.profiles = profiles
         self.credential_directory = credential_directory
         # Reads the image's total compressed layer size from its registry manifest. None until
@@ -564,11 +595,7 @@ class SaladRouteProvider:
         if (
             public_pins(stage) is None
             and _hosts_declared(config)
-            and any(
-                provider_trust.admission_basis(connection, source.snapshot_id) != "public_only"
-                for source in stage.inputs
-                if source.kind == "snapshot"
-            )
+            and admitted_nonpublic_input(connection, stage)
         ):
             raise Conflict(
                 "Salad stage input is not public (or carries approved code) and cannot "
@@ -1000,8 +1027,34 @@ class SaladRouteProvider:
         cents, basis = self._translate(lambda: self.driver(rt).settlement_for(None, row))
         return Settlement(cents=cents, basis=basis, final=basis != "guardian_bounded_hold")
 
+    def free_slots(self, rt: RunnerServices, ctx: Any, stage: Any) -> int | None:
+        """Route slots left, or None when the operator recorded no executor width (unbounded,
+        as before). Counts every Salad attempt, of any campaign, that holds a grant the executor
+        will lease or has leased and has not yet finished its route: ``reserved`` from the
+        grant through ``route_proposed``, then ``running`` once the route started (the start
+        flips the attempt's status in the same transaction as its phase)."""
+        if self.route_width is None:
+            return None
+        marks = ",".join("?" for _ in ROUTE_SLOT_PHASES)
+        row = rt.one(
+            f"""SELECT count(*) AS n FROM campaign_stage_attempts a
+            LEFT JOIN campaign_salad_attempts sa ON sa.attempt_id=a.id
+            WHERE a.status IN ('reserved','running') AND a.grant_id IS NOT NULL
+            AND (a.provider_id=? OR sa.attempt_id IS NOT NULL)
+            AND COALESCE(sa.phase,'awaiting_lease') IN ({marks})""",
+            (PROVIDER_ID, *ROUTE_SLOT_PHASES),
+        )
+        return max(self.route_width - (int(row["n"]) if row else 0), 0)
+
+    def slot_free(self, rt: RunnerServices, ctx: Any, stage: Any) -> bool:
+        slots = self.free_slots(rt, ctx, stage)
+        return slots is None or slots > 0
+
     def exposure_open(self, connection: sqlite3.Connection, campaign_id: str) -> bool:
         return SaladStageDriver.exposure_open(None, connection, campaign_id)  # type: ignore[arg-type]
+
+    def unresolved_exposure_open(self, connection: sqlite3.Connection, campaign_id: str) -> bool:
+        return SaladStageDriver.unresolved_exposure_open(None, connection, campaign_id)  # type: ignore[arg-type]
 
     def after_tick(self, rt: RunnerServices, ctx: Any) -> None:
         """Late charges are added once by CAS; bounded-hold settlements get confirmed."""
@@ -1449,9 +1502,12 @@ def register_provider_instance(
     profiles: SaladCampaignProfiles | None = None,
     credential_directory: str | None = None,
     guardian_reader: Any = None,
+    route_width: int | None = None,
 ) -> ComputeProvider:
     """Register (or replace, when this module registered it before) the ``salad`` provider."""
-    candidate = SaladRouteProvider(profiles, credential_directory, guardian_reader)
+    candidate = SaladRouteProvider(
+        profiles, credential_directory, guardian_reader, route_width=route_width
+    )
     instance = replace_provider(candidate) if _REGISTERED else register_provider(candidate)
     if not _REGISTERED:
         _REGISTERED.append(True)
@@ -1486,7 +1542,12 @@ def register_from_config(config: dict | None) -> None:
         from .guardian_record_reader import build_https_reader
 
         reader = build_https_reader(guardian_read)
-    register_provider_instance(profiles, directory, reader)
+    width = (config or {}).get("salad_max_concurrent_routes")
+    if width is not None and (
+        isinstance(width, bool) or not isinstance(width, int) or not 1 <= width <= 4
+    ):
+        raise ValueError("salad_max_concurrent_routes must be an integer from 1 to 4")
+    register_provider_instance(profiles, directory, reader, route_width=width)
 
 
 def config_sections() -> tuple[ConfigSection, ...]:
@@ -1495,6 +1556,11 @@ def config_sections() -> tuple[ConfigSection, ...]:
     def validate(document: dict) -> None:
         if document.get("salad_profiles") is not None:
             SaladCampaignProfiles.model_validate(document["salad_profiles"])
+        width = document.get("salad_max_concurrent_routes")
+        if width is not None and (
+            isinstance(width, bool) or not isinstance(width, int) or not 1 <= width <= 4
+        ):
+            raise ValueError("salad_max_concurrent_routes must be an integer from 1 to 4")
 
     def describe(entry: dict) -> dict:
         profile = SaladCampaignProfile.model_validate(entry)

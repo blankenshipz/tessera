@@ -51,6 +51,8 @@ from .campaign_salad_executor import (
     TERMINATION_CONFIRM_MAX_SECONDS,
 )
 from .campaign_settlement import apply_late_charge, confirm_settlement
+from .campaign_stage_failure_stop import STAGE_FAILED_STOP
+from .campaign_stage_failure_stop import attempt_held as stop_held
 from .campaign_steps import StepFailed
 from .campaign_store import _GuardianFinal
 from .campaign_unclaimed import Refused
@@ -110,6 +112,9 @@ EXPOSURE_PHASES = (
     "awaiting_charge",
     "unknown",
 )
+# Phases whose cost is not bounded by a live hold of their own: a charge is owed or unknown.
+# A zero-cent infrastructure retry waits only for these, not for a healthy running sibling.
+UNRESOLVED_EXPOSURE_PHASES = ("outcome_recorded", "awaiting_charge", "unknown")
 PRE_ROUTE_PHASES = ("leased", "awaiting_review", "reviewed", "capability_ready", "route_proposed")
 DECISION_HOURS = 23
 CAPABILITY_HOURS = 23
@@ -487,6 +492,18 @@ def _safety_stopped(row: dict[str, Any]) -> bool:
         return safety_stop_cause(json.loads(row.get("guardian_final_json") or "null")) is not None
     except ValueError:
         return False
+
+
+def _phase_open(connection: sqlite3.Connection, campaign_id: str, phases: tuple[str, ...]) -> bool:
+    marks = ",".join("?" for _ in phases)
+    return (
+        connection.execute(
+            f"""SELECT 1 FROM campaign_salad_attempts sa JOIN campaign_stage_attempts a
+            ON a.id = sa.attempt_id WHERE a.campaign_id=? AND sa.phase IN ({marks}) LIMIT 1""",
+            (campaign_id, *phases),
+        ).fetchone()
+        is not None
+    )
 
 
 class SaladStageDriver:
@@ -1065,6 +1082,8 @@ class SaladStageDriver:
             return lease_lapse.requeue(self, ctx, attempt, lapsed)
         if phase in PRE_ROUTE_PHASES and (expired or grant["status"] != "active"):
             return self._abandon(ctx, stage, spec_stage, attempt, "grant_expired_before_route")
+        if phase == "route_started" and self._held_by_sibling_stop(ctx, attempt, row):
+            return self._abandon(ctx, stage, spec_stage, attempt, STAGE_FAILED_STOP)
         handler = {
             "leased": self._propose_decisions,
             "awaiting_review": self._await_review,
@@ -2017,6 +2036,16 @@ class SaladStageDriver:
         except (TypeError, ValueError):
             return False
 
+    def _held_by_sibling_stop(
+        self, ctx: _Ctx, attempt: dict[str, Any], row: dict[str, Any]
+    ) -> bool:
+        """A queued route (``route_started``, not yet executing) of a campaign that a sibling's
+        failure stopped, with nothing sent: it must not launch (ADR 0208)."""
+        with self.runner.store.runner_connection() as connection:
+            if not stop_held(connection, attempt["id"]):
+                return False
+        return self._never_sent(ctx, row, self.route_state(row["route_id"]))
+
     def _never_sent(self, ctx: _Ctx, row: dict[str, Any], state: dict[str, Any] | None) -> bool:
         """True when control's own records prove no provider create or start was sent.
 
@@ -2472,6 +2501,14 @@ class SaladStageDriver:
                         f"{CREATE_NOT_SENT}; not requeued as not started: "
                         f"{FRAME_FENCE_BEFORE_CREATE} repeated {repeats + 1} times"
                     )
+            if reason == STAGE_FAILED_STOP:
+                # A sibling's failure stopped the campaign before this route was sent anything:
+                # released at 0 and never launched. Not started, whatever the repeat count.
+                failure_class = NOT_STARTED
+                detail = (
+                    f"{reason}: a sibling stage failed before this route was sent anything; "
+                    "released at 0, not launched"
+                )
             if reason == SILENT_NEVER_SENT:
                 detail = (
                     f"{reason}: the route window passed and control holds no create or start "
@@ -2986,15 +3023,12 @@ class SaladStageDriver:
     # exposure, late charges ----------------------------------------------------------
 
     def exposure_open(self, connection: sqlite3.Connection, campaign_id: str) -> bool:
-        marks = ",".join("?" for _ in EXPOSURE_PHASES)
-        return (
-            connection.execute(
-                f"""SELECT 1 FROM campaign_salad_attempts sa JOIN campaign_stage_attempts a
-                ON a.id = sa.attempt_id WHERE a.campaign_id=? AND sa.phase IN ({marks}) LIMIT 1""",
-                (campaign_id, *EXPOSURE_PHASES),
-            ).fetchone()
-            is not None
-        )
+        return _phase_open(connection, campaign_id, EXPOSURE_PHASES)
+
+    def unresolved_exposure_open(self, connection: sqlite3.Connection, campaign_id: str) -> bool:
+        """Open exposure whose cost is unresolved (a charge owed or unknown); not an attempt
+        that is merely leased or running inside its own hold."""
+        return _phase_open(connection, campaign_id, UNRESOLVED_EXPOSURE_PHASES)
 
     def late_charges(self, ctx: _Ctx) -> None:
         """Charges recorded after settlement are added once, by CAS, as late charges.

@@ -21,6 +21,7 @@ from pydantic import (
     field_validator,
 )
 
+from .campaign_stage_failure_stop import HELD_CAMPAIGN_STATUS, attempt_held
 from .store import Conflict, NotFound, StoreError, _connect, canonical_digest, utc_now
 
 
@@ -624,6 +625,14 @@ class SaladWorkerCommands:
                 ORDER BY sa.updated_at, sa.attempt_id""",
                 (worker["org_id"], worker["id"], SILENT_EXECUTOR),
             ).fetchall()
-            return [dict(row) for row in rows]
+            work = [dict(row) for row in rows]
+            for item in work:
+                # A route a sibling's failure stopped before it started is listed as held:
+                # the executor keeps it alive for the runner's release and never launches it.
+                if item["phase"] == "route_started" and attempt_held(
+                    connection, item["attempt_id"]
+                ):
+                    item["campaign_status"] = HELD_CAMPAIGN_STATUS
+            return work
         finally:
             connection.close()

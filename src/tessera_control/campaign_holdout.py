@@ -192,6 +192,38 @@ def _declared_holdouts(campaign_id: str, spec_json: str) -> frozenset[str]:
     return declared
 
 
+def route_data_class_sealed(
+    connection: sqlite3.Connection, project_id: str, route_id: str, data_digest: str | None
+) -> bool:
+    """True when a Salad route runs a holdout stage or reads a sealed partition (ADR 0068).
+
+    The guardian is told so at reserve and then never reads or stores the run's container log
+    (its tail is recorded as the closed ``data_class_sealed`` token instead). Fail closed: a
+    campaign spec that no longer parses, or no longer names the stage, counts as sealed."""
+    from .campaign_models import input_digests, parse_spec_json
+
+    sealed = sealed_digests(connection, project_id)
+    if data_digest is not None and data_digest in sealed:
+        return True
+    row = connection.execute(
+        """SELECT a.stage_key, c.spec_json FROM campaign_salad_attempts s
+        JOIN campaign_stage_attempts a ON a.id=s.attempt_id
+        JOIN campaigns c ON c.id=a.campaign_id
+        WHERE s.route_id=? AND c.project_id=?""",
+        (route_id, project_id),
+    ).fetchone()
+    if row is None:
+        return False
+    try:
+        stages = normalize(parse_spec_json(row["spec_json"])).stages
+    except ValueError:
+        return True
+    stage = next((s for s in stages if s.key == row["stage_key"]), None)
+    if stage is None or stage.holdout is not None:
+        return True
+    return any(d in sealed for item in stage.inputs for d in input_digests(item))
+
+
 def holdout_output_source(
     connection: sqlite3.Connection, project_id: str, manifest_id: str
 ) -> tuple[str, str] | None:

@@ -1137,7 +1137,9 @@ class CampaignStore(
                 connection, campaign, spec, approval, body.preapprovals, forward
             )
             revision = campaign["revision"] + 1
-            # Re-approval never resumes forward work after cancel (or while blocked).
+            # Re-approval never resumes forward work after cancel (or while blocked) in this
+            # transaction. A campaign the runner breaker blocked (ADR 0210) is resumed by the
+            # runner's next pass after this approval, once no attempt is unknown.
             resulting = "running" if forward else campaign["status"]
             connection.execute(
                 "UPDATE campaigns SET status=?, revision=?, updated_at=? WHERE id=?",

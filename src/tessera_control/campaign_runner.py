@@ -153,6 +153,7 @@ from .campaign_slot_reclaim import (
     unclaimed_expired_grant,
     waiters_ahead,
 )
+from .campaign_stage_failure_stop import is_stage_failure_stop, keeps_retry
 from .campaign_steps import (
     DelegationLapsed,
     StepExecutor,
@@ -188,6 +189,16 @@ MAX_STAGE_LOOPS = 12
 MAX_ATTEMPT_NUMBERS = 5
 # One per (campaign, provider, step, class): a refusal that escaped a provider evidence hook.
 EVIDENCE_PASS_FAILED_EVENT = "campaign.evidence_pass_failed"
+# One per (campaign, stage, class): an error one stage raised; the pass goes on to the next stage.
+STAGE_RUNNER_ERROR_EVENT = "campaign.stage_runner_error"
+# The runner breaker: this many consecutive drives of one campaign that raised the same error
+# class block the campaign (reduce-only, holds kept) with ``runner_error:<Class>``.
+RUNNER_ERROR_EVENT = "campaign.runner_error"
+RUNNER_ERROR_PREFIX = "runner_error:"
+RUNNER_ERROR_THRESHOLD = 10
+# One per (campaign, class): a cancelling campaign that keeps raising one error class. It is
+# never blocked (the cancel keeps replaying its reduce-only steps); this only makes it visible.
+CANCEL_RUNNER_ERROR_EVENT = "campaign.cancel_runner_error"
 # Step slot of a snapshot release renewed before its grant is issued (ADR 0048).
 RELEASE_RENEWAL_ORDINAL = 2
 RELEASE_SLACK_SECONDS = 120
@@ -324,6 +335,11 @@ class CampaignRunner:
         self._idle_cursor: str | None = None
         # Which open output uploads are still gaining bytes (ADR 0064).
         self.upload_progress = UploadProgress()
+        # The runner breaker: campaign -> {error class: consecutive drives that raised it}.
+        # In memory; a clean drive clears the campaign's entry.
+        self._error_streaks: dict[str, dict[str, int]] = {}
+        # Error classes the stages of the current drive raised (isolated per stage).
+        self._drive_errors: set[str] = set()
 
     # -- tick -----------------------------------------------------------------------
 
@@ -346,9 +362,13 @@ class CampaignRunner:
         except _LeaseLost:
             self._actions.append("lease_lost")
             return TickReport(tuple(self._actions), len(ids))
+        for stale in set(self._error_streaks) - set(ids):
+            del self._error_streaks[stale]
         for campaign_id in ids:
             if self._budget <= 0:
                 break
+            self._drive_errors = set()
+            raised: str | None = None
             try:
                 try:
                     self._drive(campaign_id)
@@ -362,12 +382,40 @@ class CampaignRunner:
                     # A schema or SQL fault is not contention: record it, never defer it.
                     log.error("campaign %s database error: %s", campaign_id, error)
                     self._actions.append(f"error:{campaign_id}:OperationalError")
+                    raised = "OperationalError"
+                else:
+                    # A deferral is not a clean drive and clears no streak. Contention counts
+                    # nothing; a deterministic replay (a reduce-only step's non-transient
+                    # error) counts its class, and errors earlier stages recorded in this
+                    # pass count either way. A StepTransient's message names the step and
+                    # the underlying class only.
+                    log.warning(
+                        "campaign %s step deferred: %s",
+                        campaign_id,
+                        str(error)[:200]
+                        if isinstance(error, StepTransient) and str(error)
+                        else type(error).__name__,
+                    )
+                    self._actions.append(f"deferred:{campaign_id}")
+                    deterministic = (
+                        isinstance(error, StepTransient)
+                        and error.deterministic
+                        and error.error_class
+                    )
+                    self._count_drive(campaign_id, deterministic or None, complete=False)
                     continue
-                log.warning("campaign %s step deferred: %s", campaign_id, type(error).__name__)
-                self._actions.append(f"deferred:{campaign_id}")
+            except _Waiting:
+                # A wait neither counts nor clears a streak (errors earlier stages recorded in
+                # this pass still count).
+                log.error("campaign %s runner error: %s", campaign_id, "Waiting")
+                self._actions.append(f"error:{campaign_id}:Waiting")
+                self._count_drive(campaign_id, None, complete=False)
+                continue
             except Exception as error:  # noqa: BLE001 - one campaign must not stop the others
                 log.error("campaign %s runner error: %s", campaign_id, type(error).__name__)
                 self._actions.append(f"error:{campaign_id}:{type(error).__name__}")
+                raised = type(error).__name__
+            self._count_drive(campaign_id, raised)
         # Optional tick-level provider upkeep (``sweep``), for example confirming late
         # settlements of finished campaigns.
         for provider_id in provider_ids():
@@ -1680,16 +1728,166 @@ class CampaignRunner:
                 # no later stage takes a forward step it would be refused (ADR 0038 addendum).
                 self._actions.append(f"pass_ended:{ctx.campaign['id']}")
                 return
-            if self._drive_stage_cancel(ctx, entry["stage_key"]):
-                continue
-            self._unwind_failed(ctx, entry["stage_key"])
-            for _ in range(MAX_STAGE_LOOPS):
-                self._executed = False
-                if not self._advance_stage(ctx, entry["stage_key"]) or self._executed:
-                    break
-                if not self._still_forward_legal(ctx):
-                    break
+            key = entry["stage_key"]
+            try:
+                if self._drive_stage_cancel(ctx, key):
+                    continue
+                self._unwind_failed(ctx, key)
+                for _ in range(MAX_STAGE_LOOPS):
+                    self._executed = False
+                    if not self._advance_stage(ctx, key) or self._executed:
+                        break
+                    if not self._still_forward_legal(ctx):
+                        break
+            except (
+                _LeaseLost,
+                DelegationLapsed,
+                _Waiting,
+                StepTransient,
+                sqlite3.OperationalError,
+            ):
+                # Control flow (lease, delegation, waiting, contention) and database faults
+                # end the pass exactly as before.
+                raise
+            except StepFailed as error:
+                self._stage_step_failed(ctx, key, error)
+            except Exception as error:  # noqa: BLE001 - one stage must not starve the others
+                self._stage_runner_error(ctx, key, type(error).__name__)
         self._maybe_complete(ctx)
+
+    def _stage_step_failed(self, ctx: _Ctx, key: str, error: StepFailed) -> None:
+        """A refused step that escaped one stage's non-attempt paths (placement, success,
+        reconcile, cancel). With no attempt that may be running or holding a live grant, the
+        stage fails closed; otherwise it is recorded and the pass goes on (a person or the
+        attempt's own evidence path settles it), never failing a started attempt."""
+        stage = self._stage_row(ctx, key)
+        live = any(
+            attempt["status"] in ACTIVE_ATTEMPT or attempt["status"] == "unknown"
+            for attempt in self._attempts(ctx, key)
+        )
+        if stage["status"] in TERMINAL_STAGE or live:
+            self._stage_runner_error(
+                ctx, key, "StepFailed", step=error.step, step_error_class=error.error_class
+            )
+            return
+        reason = f"step_failed:{error.step}:{error.error_class}"
+        log.warning("campaign %s stage %s failed closed: %s", ctx.campaign["id"], key, reason)
+        self._stage_failed(ctx, key, reason)
+        self._actions.append(f"stage_failed:{key}:{reason}")
+
+    def _stage_runner_error(self, ctx: _Ctx, key: str, error_class: str, **detail: str) -> None:
+        """Log one stage's error by class, record it once per (campaign, stage, class) and
+        count it toward the breaker; the pass goes on with the next stage. Descriptive only:
+        no exception text or payload is stored."""
+        log.error("campaign %s stage %s runner error: %s", ctx.campaign["id"], key, error_class)
+        self._actions.append(f"error:{ctx.campaign['id']}:{key}:{error_class}")
+        self._drive_errors.add(error_class)
+        try:
+            with self.store.runner_connection() as connection:
+                self._hold_lease(connection)
+                self._emit_once_in(
+                    connection,
+                    ctx,
+                    STAGE_RUNNER_ERROR_EVENT,
+                    {"stage_key": key, "error_class": error_class[:80]},
+                    {name: str(value)[:80] for name, value in detail.items()},
+                )
+        except sqlite3.Error:  # descriptive only: the pass goes on
+            return
+
+    # -- the runner breaker -----------------------------------------------------------
+
+    def _count_drive(self, campaign_id: str, raised: str | None, *, complete: bool = True) -> None:
+        """Count one drive's error classes. A complete drive clears every class it did not
+        raise (a clean one clears all); an incomplete one (deferred or waiting) only adds what
+        it raised and clears nothing. A class raised by ``RUNNER_ERROR_THRESHOLD``
+        consecutive counted drives trips the breaker."""
+        classes = set(self._drive_errors)
+        self._drive_errors = set()
+        if raised is not None:
+            classes.add(raised)
+        previous = self._error_streaks.get(campaign_id, {})
+        if not classes:
+            if complete:
+                self._error_streaks.pop(campaign_id, None)
+            return
+        streaks = {name: previous.get(name, 0) + 1 for name in classes}
+        if not complete:
+            streaks = {**previous, **streaks}
+        self._error_streaks[campaign_id] = streaks
+        tripped = sorted(name for name, count in streaks.items() if count >= RUNNER_ERROR_THRESHOLD)
+        if tripped:
+            self._trip_breaker(campaign_id, tripped[0], streaks[tripped[0]])
+
+    def _trip_breaker(self, campaign_id: str, error_class: str, count: int) -> None:
+        """Block a running campaign that keeps raising one error class, through the ordinary
+        block path: reduce-only, every attempt, grant and hold left as they are for a person
+        to reconcile; nothing settled and no stage failed. It stays blocked until a person
+        re-approves it (``_drive_blocked``) or cancels it."""
+        reason = f"{RUNNER_ERROR_PREFIX}{error_class}"[:300]
+        try:
+            with self.store.runner_connection() as connection:
+                self._hold_lease(connection)
+                row = connection.execute(
+                    "SELECT * FROM campaigns WHERE id=?", (campaign_id,)
+                ).fetchone()
+                if row is None:
+                    return
+                campaign = dict(row)
+                blocked = connection.execute(
+                    """UPDATE campaigns SET status='blocked',
+                    stop_reason=COALESCE(stop_reason, ?), updated_at=?
+                    WHERE id=? AND status IN ('running','stopping')""",
+                    (reason, _iso(self.now()), campaign_id),
+                ).rowcount
+                if blocked:
+                    payload = {
+                        "error_class": error_class[:80],
+                        "consecutive": count,
+                        "threshold": RUNNER_ERROR_THRESHOLD,
+                    }
+                    self.store.record_runner_event(
+                        connection, campaign, RUNNER_ERROR_EVENT, payload
+                    )
+                    self.store.record_runner_event(
+                        connection,
+                        campaign,
+                        "campaign.blocked",
+                        {"reason": "runner_error", "error_class": error_class[:80]},
+                    )
+                    self._free_campaign_releases(connection, campaign_id, "campaign_blocked")
+                elif campaign["status"] == "cancel_requested":
+                    ctx = _Ctx(campaign, None, None, 0)  # type: ignore[arg-type]
+                    self._emit_once_in(
+                        connection,
+                        ctx,
+                        CANCEL_RUNNER_ERROR_EVENT,
+                        {"error_class": error_class[:80]},
+                        {"threshold": RUNNER_ERROR_THRESHOLD},
+                    )
+        except (sqlite3.Error, _LeaseLost) as error:
+            log.error("campaign %s breaker could not block: %s", campaign_id, type(error).__name__)
+            return
+        if blocked:
+            # A resumed campaign starts a fresh count.
+            self._error_streaks.pop(campaign_id, None)
+            log.error("campaign %s blocked: %s", campaign_id, reason)
+            self._actions.append(f"blocked:{campaign_id}:{reason}")
+
+    def _runner_error_block_stands(self, campaign_id: str, project_id: str) -> bool:
+        """A breaker block holds until a person re-approves the campaign after it."""
+        row = self._one(
+            """SELECT
+              (SELECT max(cursor) FROM events WHERE project_id=? AND event_type=?
+                AND json_extract(payload_json,'$.campaign_id')=?) AS tripped,
+              (SELECT max(cursor) FROM events WHERE project_id=?
+                AND event_type='campaign.approved'
+                AND json_extract(payload_json,'$.campaign_id')=?) AS approved""",
+            (project_id, RUNNER_ERROR_EVENT, campaign_id, project_id, campaign_id),
+        )
+        if row is None or row["tripped"] is None:
+            return False
+        return row["approved"] is None or row["approved"] < row["tripped"]
 
     def _evidence_pass(self, ctx: _Ctx, providers: list[Any] | None = None) -> None:
         """Each provider's optional evidence-only hook (``evidence_pass``): verification of
@@ -1892,8 +2090,16 @@ class CampaignRunner:
             ):
                 # ADR 0179: the bound on fresh attempts after a pre-custody reallocation.
                 return self._stage_failed(ctx, key, f"{REALLOCATED_PRECUSTODY}_exhausted")
+            # A sibling's failure ends scientific retries, not this stage's own 0 cent
+            # infrastructure retries: those keep their approved bound (infra_retries was
+            # already compared when the attempt was classified, max_class_fallbacks just
+            # below), and the scientific bound and the attempt-number cap still bind.
+            sibling_stop = stopping and is_stage_failure_stop(
+                self._campaign(ctx.campaign["id"])["stop_reason"]
+            )
+            kept = sibling_stop and keeps_retry(latest["failure_class"])
             if (
-                not stopping
+                (not stopping or kept)
                 and latest["failure_class"] == class_fallback.PRESTART_NO_SPEND
                 and (
                     moved + self._timeout_move_count(ctx, key) > base.retry.max_class_fallbacks
@@ -1902,10 +2108,13 @@ class CampaignRunner:
             ):
                 return self._stage_failed(ctx, key, class_fallback.EXHAUSTED)
             if (
-                stopping
+                (stopping and not kept)
                 or scientific >= spec_stage.retry.max_attempts
                 or stage["attempts_used"] >= MAX_ATTEMPT_NUMBERS
             ):
+                if sibling_stop and latest["failure_class"] == NOT_STARTED:
+                    # Never admitted: ended without a charge by the stop, not by a retry bound.
+                    return self._stage_failed(ctx, key, f"{NOT_STARTED}_campaign_stopped")
                 return self._stage_failed(ctx, key, f"{latest['failure_class']}_exhausted")
             if self._lease_cap_waiting(ctx, key, spec_stage, latest):
                 return False
@@ -1985,7 +2194,7 @@ class CampaignRunner:
             if verdict != "go":
                 return verdict == "failed"
             if prepare:
-                progress = self._provider(base).prepare(self, ctx, key)
+                progress = self._prepare_stage(self._provider(base), ctx, key)
                 if progress != "ready":
                     return progress == "progress"
             return self._reserve(ctx, key)
@@ -2011,10 +2220,23 @@ class CampaignRunner:
         # ``ready``; nothing is reserved before. No earlier attempt is taken as proof that the
         # provider is still prepared (a stage may move A -> B -> A): ``prepare`` is idempotent
         # and returns ``ready`` without effects once its work stands (ComputeProvider).
-        progress = provider.prepare(self, ctx, key)
+        progress = self._prepare_stage(provider, ctx, key)
         if progress != "ready":
             return progress == "progress"
         return self._reserve(ctx, key)
+
+    def _prepare_stage(self, provider: Any, ctx: _Ctx, key: str) -> str:
+        """``provider.prepare`` for the stage's next attempt. It runs before any reservation,
+        grant or hold of that attempt, so a refused preparation step (recorded, it would
+        replay the same refusal every tick) fails the stage closed: ``progress``."""
+        try:
+            return provider.prepare(self, ctx, key)
+        except StepFailed as error:
+            reason = f"prepare_refused:{error.step}:{error.error_class}"
+            log.warning("campaign %s stage %s %s", ctx.campaign["id"], key, reason)
+            self._stage_failed(ctx, key, reason)
+            self._actions.append(f"stage_failed:{key}:{reason}")
+            return "progress"
 
     def _image_pull_preflight(self, ctx: _Ctx, key: str, base: NormalStage) -> bool | None:
         """The image pull-size preflight for a stage that is not placed: the recorded section,
@@ -2140,9 +2362,11 @@ class CampaignRunner:
     def _decide_placement(
         self, ctx: _Ctx, key: str, base: NormalStage, stage_row: Mapping[str, Any]
     ) -> placement.Decision:
+        free_retry = self._free_retry(ctx, key)
+
         def exposure_open(connection: sqlite3.Connection) -> bool:
             return any(
-                provider.exposure_open(connection, ctx.campaign["id"])
+                self._provider_exposure(provider, connection, ctx.campaign["id"], free_retry)
                 for provider in self._providers(ctx)
             ) or self._dropped_provider_exposure(connection, ctx, ctx.campaign["id"])
 
@@ -2452,7 +2676,9 @@ class CampaignRunner:
                 },
             )
         try:
-            return self._reserve_hold(ctx, key, hold, spec_stage.provider)
+            return self._reserve_hold(
+                ctx, key, hold, spec_stage.provider, self._free_retry(ctx, key)
+            )
         except _ExposureBlocked:
             # An attempt with unresolved provider exposure blocks new positive holds.
             self.emit_once(
@@ -2511,7 +2737,41 @@ class CampaignRunner:
             return self._stage_failed(ctx, key, "input_not_admitted")
         return None
 
-    def _reserve_hold(self, ctx: _Ctx, key: str, hold: int, provider_id: str | None = None) -> bool:
+    def _free_retry(self, ctx: _Ctx, key: str) -> bool:
+        """True when the stage's next attempt is a retry of a failure that cost nothing: the
+        latest attempt ended for an infrastructure reason that keeps its own bound and settled
+        at 0 cents. Such a retry is not an unresolved cost, so a healthy running sibling does
+        not hold it back; ``awaiting_charge`` and ``unknown`` exposure still does."""
+        attempts = self._attempts(ctx, key)
+        if not attempts:
+            return False
+        latest = attempts[-1]
+        return (
+            latest["status"] == "failed_transient"
+            and keeps_retry(latest["failure_class"])
+            and latest["settled_cents"] == 0
+        )
+
+    @staticmethod
+    def _provider_exposure(
+        provider: Any, connection: sqlite3.Connection, campaign_id: str, free_retry: bool
+    ) -> bool:
+        """The provider's open exposure for a new positive hold. A free retry asks only about
+        exposure whose cost is unresolved, when the provider can tell the difference; a provider
+        that cannot keeps the whole gate (fail closed)."""
+        narrow = getattr(provider, "unresolved_exposure_open", None) if free_retry else None
+        if narrow is not None:
+            return bool(narrow(connection, campaign_id))
+        return bool(provider.exposure_open(connection, campaign_id))
+
+    def _reserve_hold(
+        self,
+        ctx: _Ctx,
+        key: str,
+        hold: int,
+        provider_id: str | None = None,
+        free_retry: bool = False,
+    ) -> bool:
         provider_id = provider_id or ctx.spec.stage(key).provider
         refused_event: dict[str, Any] | None = None
         with self.store.runner_connection() as connection:
@@ -2530,7 +2790,7 @@ class CampaignRunner:
             if (
                 hold > 0
                 and any(
-                    provider.exposure_open(connection, campaign["id"])
+                    self._provider_exposure(provider, connection, campaign["id"], free_retry)
                     for provider in self._providers(ctx)
                 )
                 or (hold > 0 and self._dropped_provider_exposure(connection, ctx, campaign["id"]))
@@ -6194,14 +6454,22 @@ class CampaignRunner:
             (ctx.campaign["id"],),
         )
         if remaining is None:
+            if self._runner_error_block_stands(ctx.campaign["id"], ctx.campaign["project_id"]):
+                return  # the breaker's block: a person re-approves (or cancels) first
             campaign = self._campaign(ctx.campaign["id"])
-            cancelling = (campaign["stop_reason"] or "").startswith("cancel:")
+            stop_reason = campaign["stop_reason"] or ""
+            cancelling = stop_reason.startswith("cancel:")
+            # The breaker's own stop reason is operational, not a stop decision: a re-approved
+            # campaign resumes without it (the reason stays on the runner_error event).
+            cleared = stop_reason.startswith(RUNNER_ERROR_PREFIX)
             with self.store.runner_connection() as connection:
                 connection.execute(
-                    "UPDATE campaigns SET status=?, updated_at=? WHERE id=? AND status='blocked'",
+                    "UPDATE campaigns SET status=?, updated_at=?, stop_reason=CASE WHEN ? "
+                    "THEN NULL ELSE stop_reason END WHERE id=? AND status='blocked'",
                     (
                         "cancel_requested" if cancelling else "running",
                         _iso(self.now()),
+                        cleared,
                         ctx.campaign["id"],
                     ),
                 )
@@ -6210,7 +6478,11 @@ class CampaignRunner:
                     campaign,
                     "campaign.unblocked",
                     # ``at`` (the runner's clock) restarts the Salad silent-executor clock.
-                    {"cancelling": cancelling, "at": _iso(self.now())},
+                    {
+                        "cancelling": cancelling,
+                        "at": _iso(self.now()),
+                        **({"cleared_stop_reason": stop_reason[:300]} if cleared else {}),
+                    },
                 )
 
     # -- completion -----------------------------------------------------------------

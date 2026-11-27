@@ -15,7 +15,14 @@ MAX_LINES = 20
 MAX_BYTES = 1024
 MAX_LINE_CHARS = 200
 MAX_ITEMS = 1000
-REASONS = ("no_trusted_log_source", "log_quota_exhausted", "read_failed", "not_read")
+# ``data_class_sealed``: a holdout run or a sealed partition; the log is never read or stored.
+REASONS = (
+    "no_trusted_log_source",
+    "log_quota_exhausted",
+    "read_failed",
+    "not_read",
+    "data_class_sealed",
+)
 _KEYS = {"outcome", "untrusted", "lines", "truncated", "sha256"}
 _REDACTED = "[redacted]"
 

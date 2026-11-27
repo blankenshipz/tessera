@@ -268,6 +268,8 @@ class SaladSafetyClient:
                 budget_binding=state["budget_binding"],
                 route_digest=state["proposal_digest"],
                 deadline=state["guardian_deadline"],
+                # Fail closed: a state without the flag is treated as sealed.
+                data_class_sealed=state.get("data_class_sealed", True) is not False,
             )
         )
 
@@ -738,6 +740,13 @@ class TrustedSaladExecutionStore(RemoteExecutionStore):
                     _parse_utc(state["budget_binding"]["expires_at"]).timestamp(),
                     _parse_utc(lease["hard_expires_at"]).timestamp(),
                     time.time() + proposal.selection.resources.max_seconds,
+                )
+                from .campaign_holdout import route_data_class_sealed
+
+                # A holdout stage or a sealed partition: the guardian never reads or stores
+                # this run's container log (ADR 0068; told at reserve).
+                state["data_class_sealed"] = route_data_class_sealed(
+                    db, state["project_id"], ident, proposal.selection.manifests.data
                 )
             return state
 

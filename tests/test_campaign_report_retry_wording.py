@@ -41,15 +41,31 @@ def _stage(*classes):
 
 
 @pytest.mark.parametrize("failure_class", INFRA)
-def test_an_only_attempt_under_another_stop_reason_was_not_retried(failure_class):
-    report = _stage_report(
-        _stage(failure_class), {}, True, False, "stage_failed:other:salad_container_exited_nonzero"
-    )
+def test_an_only_attempt_under_a_cancel_was_not_retried(failure_class):
+    report = _stage_report(_stage(failure_class), {}, True, False, "cancel:operator")
     assert "was retried" not in str(report)
     assert report["outcome"].endswith(
         "but it was not retried because the campaign was already stopping"
     )
     assert report["retried_because"] is None
+
+
+SIBLING_STOP = "stage_failed:other:salad_container_exited_nonzero"
+
+
+@pytest.mark.parametrize("failure_class", INFRA)
+def test_an_infra_failure_under_a_siblings_failure_used_up_its_own_retries(failure_class):
+    """ADR 0208: a sibling's failure does not end a 0 cent infrastructure retry, so a stage
+    whose last attempt ended that way stopped on its own bound, not on the campaign's stop."""
+    report = _stage_report(_stage(failure_class), {}, True, False, SIBLING_STOP)
+    assert "already stopping" not in str(report) and "was retried" not in str(report)
+    assert report["outcome"].endswith("but its retries were used up")
+    # The same after earlier retries of the stage under that stop.
+    report = _stage_report(
+        _stage(failure_class, failure_class, failure_class), {}, True, False, SIBLING_STOP
+    )
+    assert report["outcome"].endswith("but its retries were used up")
+    assert report["retried_because"].endswith("so it was retried")
 
 
 @pytest.mark.parametrize("reason", ["cancel:operator", "budget_overrun"])
@@ -139,13 +155,20 @@ def _relabel(connection, campaign_id, *, stop_reason, extra_attempt=False):
 def test_the_report_for_an_unretried_create_not_sent_does_not_say_retried(tmp_path, monkeypatch):
     monkeypatch.setattr(report_module, "load_verified_receipt", lambda *a: None)
     world, campaign, connection = _failed_campaign(tmp_path)
-    _relabel(
-        connection, campaign["id"], stop_reason="stage_failed:other:salad_container_exited_nonzero"
-    )
+    _relabel(connection, campaign["id"], stop_reason="cancel:operator")
     report = build_report(connection, campaign["id"])
     text = render_text(report)
     assert "was retried" not in text and "was retried" not in str(report)
     assert "not retried because the campaign was already stopping" in text
+
+
+def test_the_report_after_a_siblings_failure_names_the_stages_own_bound(tmp_path, monkeypatch):
+    monkeypatch.setattr(report_module, "load_verified_receipt", lambda *a: None)
+    world, campaign, connection = _failed_campaign(tmp_path)
+    _relabel(connection, campaign["id"], stop_reason=SIBLING_STOP)
+    text = render_text(build_report(connection, campaign["id"]))
+    assert "already stopping" not in text and "was retried" not in text
+    assert "but its retries were used up" in text
 
 
 def test_the_report_with_a_second_attempt_says_retried(tmp_path, monkeypatch):

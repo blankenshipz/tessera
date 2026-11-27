@@ -258,7 +258,8 @@ def free_slots(rt: Any, ctx: Any, provider: Any, stage: NormalStage) -> int | No
     """Free slots on a provider, or None when the provider does not bound them itself."""
     count = getattr(provider, "free_slots", None)
     if count is not None:
-        return int(count(rt, ctx, stage))
+        slots = count(rt, ctx, stage)
+        return None if slots is None else int(slots)
     probe = getattr(provider, "slot_free", None)
     if probe is not None:
         return 1 if probe(rt, ctx, stage) else 0

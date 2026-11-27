@@ -19,6 +19,7 @@ from .campaign_models import parse_spec_json
 from .campaign_read_scope import own_clause
 from .campaign_receipt_read import load_verified_receipt
 from .campaign_receipts import build_receipt
+from .campaign_stage_failure_stop import is_stage_failure_stop, keeps_retry
 from .model_spend import MICRO
 
 REPORT_SCHEMA = "tessera.campaign-report.v1"
@@ -313,12 +314,18 @@ def _egress(attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
     return result
 
 
-def _retry_disposition(stage_key: str, stop_reason: str | None) -> str:
+def _retry_disposition(
+    stage_key: str, stop_reason: str | None, failure_class: str | None = None
+) -> str:
     """Why the last attempt of a failed stage has no later attempt, from the records: a stop
     reason that does not name this stage was set before the stage failed (a stage failure sets
     the reason only when none is set), so the campaign was already stopping; otherwise the
-    stage's own bounds ended it."""
+    stage's own bounds ended it. A sibling stage's failure (ADR 0208) does not end a 0 cent
+    infrastructure retry: such a stage kept retrying under that stop, so only its own bounds
+    can have ended it. A cancel or a budget stop still ends every retry."""
     if stop_reason and not stop_reason.startswith(f"stage_failed:{stage_key}:"):
+        if is_stage_failure_stop(stop_reason) and keeps_retry(failure_class):
+            return "used_up"
         return "stopping"
     return "used_up"
 
@@ -338,7 +345,7 @@ def _stage_outcome(
         return "failed", "failed because " + _failure_words(
             last.get("failure_class"),
             last.get("exit_code"),
-            _retry_disposition(stage["stage_key"], stop_reason),
+            _retry_disposition(stage["stage_key"], stop_reason, last.get("failure_class")),
         )
     if status == "refused_budget":
         return "not_started", "was not started because the remaining budget was too small"
