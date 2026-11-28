@@ -15,6 +15,8 @@ and no receipt section, so every existing spec and receipt keeps its shape and d
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -162,14 +164,23 @@ def sealed_access(spec: Any, stage_key: str) -> list[dict[str, str]]:
     return [unique[key].as_receipt() for key in sorted(unique)]
 
 
+def _carried_name(seal_name: str, role: str, sha256: str) -> str:
+    """A deterministic Key-safe name for a carried digest seal: a readable prefix of the
+    original name plus 12 hex of a hash over (name, role, sha256), so seals whose names share
+    a prefix never collide. validate_seals still refuses any duplicate that remains."""
+    blob = json.dumps([seal_name, role, sha256], separators=(",", ":")).encode()
+    return f"{seal_name[:19]}-{hashlib.sha256(blob).hexdigest()[:12]}"
+
+
 def carried_seals(spec: Any, rerun: set[str], reused: list[dict[str, str]]) -> list[dict[str, str]]:
     """The seals of a re-run spec (ADR 0069) planned from the original ``spec`` (normal form).
 
     A stage that is not re-run disappears and its outputs come back as pinned ``artifact``
     inputs (``reused``: stage, output, sha256). Each such artifact keeps every seal it carried
     in the original spec, as a digest seal on its sha256: the seal on the output itself, and
-    every seal its producing stage read (lineage). A digest seal stays while a re-run stage still
-    mounts that digest, and an output seal stays while its stage is re-run. Nothing is
+    every seal its producing stage read (lineage), named by a hash of (name, role, sha256). A
+    digest seal stays while a re-run stage still mounts that digest, and an output seal stays
+    while its stage is re-run. Nothing is
     dropped that a re-run stage could still reach, so a re-run never reads more than the
     original was allowed to."""
     reads = _stage_reads(spec)
@@ -206,7 +217,7 @@ def carried_seals(spec: Any, rerun: set[str], reused: list[dict[str, str]]) -> l
         }
         for seal_name, role in sorted(on_output | taint.get(item["stage"], set())):
             entry = {
-                "name": f"{seal_name[:23]}-{item['sha256'][:8]}",
+                "name": _carried_name(seal_name, role, item["sha256"]),
                 "role": role,
                 "digest": item["sha256"],
             }

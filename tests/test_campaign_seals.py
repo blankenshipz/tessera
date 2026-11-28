@@ -285,10 +285,12 @@ def test_a_rerun_keeps_the_seals_its_pinned_outputs_carried():
     assert [s["key"] for s in retry["stages"]] == ["score"]
     # The sealed test slice and the output derived from the sealed labels stay sealed by digest;
     # the raw-labels seal has no reader left, and the unsealed model output is not sealed.
-    assert retry["seals"] == [
-        {"name": "test-split-22222222", "role": "evaluation", "digest": "2" * 64},
-        {"name": "heldout-33333333", "role": "evaluation", "digest": "3" * 64},
+    assert [(s["role"], s["digest"]) for s in retry["seals"]] == [
+        ("evaluation", "2" * 64),
+        ("evaluation", "3" * 64),
     ]
+    assert retry["seals"][0]["name"].startswith("test-split-")
+    assert retry["seals"][1]["name"].startswith("heldout-")
     normal = normalize(_parse(retry))
     assert {item["input"] for item in sealed_access(normal, "score")} == {"test", "feats"}
     # Without the role the planned re-run would be refused like the original.

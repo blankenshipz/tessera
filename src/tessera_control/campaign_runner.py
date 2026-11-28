@@ -6096,6 +6096,13 @@ class CampaignRunner:
                 self._resolve_exited(ctx, attempt)
             except (sqlite3.IntegrityError, Conflict):
                 log.error("exited resolution rolled back for attempt %s", attempt["id"])
+            except (StepFailed, frames.FrameRefused) as error:
+                # One refused attempt (its transaction rolled back whole) must not abort the pass:
+                # a cancel_requested campaign has to reach _drive_cancel. A settlement refusal is
+                # recorded by _record_blocked_settlements; nothing is recorded again here.
+                log.warning(
+                    "exited resolution refused for attempt %s: %s", attempt["id"], error
+                )
 
     def _resolve_exited(self, ctx: _Ctx, attempt: dict[str, Any]) -> bool:
         """Settle one attempt and release its grant and slot in one transaction; True when it did.
@@ -6257,6 +6264,10 @@ class CampaignRunner:
                 self._close_unreported_exit(ctx, attempt)
             except (sqlite3.IntegrityError, Conflict):
                 log.error("unreported-exit close rolled back for attempt %s", attempt["id"])
+            except (StepFailed, frames.FrameRefused) as error:
+                log.warning(
+                    "unreported-exit close refused for attempt %s: %s", attempt["id"], error
+                )
 
     def _close_unreported_exit(self, ctx: _Ctx, attempt: dict[str, Any]) -> bool:
         """Close one attempt, settle it at zero and release its grant and slot in one transaction.
