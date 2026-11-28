@@ -50,10 +50,13 @@ so run it from the release you are about to install, before stopping anything ([
 0214](decisions/0214-deploy-gate-startup-equal-check.md)). `--check-config` is the startup path
 itself: the same parsing and validation a start runs, then an exit without binding a socket,
 writing state, taking a lock, contacting anything or reading a secret value. So `startup.*` fails
-exactly when that service's start would refuse its configuration (exit 2), and also when the
-check could not run (any other exit). Two parts of a start are not exercised: the guardian's
-certificate is not loaded together with its key (that reads the key), and `serve` does not open
-the control database (`state.schema` covers it). A stale executor `source_revision` is a note,
+when that service's start would refuse its configuration (exit 2), and also when the check could
+not run (any other exit), with these exceptions, where a real start can still refuse what the
+check passes: the executor's check does not read or authenticate the worker credential (it checks
+only that the file is private), `serve` does not load the runtime owner (its loader runs adapter
+code) or exercise the agent sandbox witness (both are printed as notes in the check's line), the
+guardian's certificate is not loaded together with its key (that reads the key), and `serve` does
+not open the control database (`state.schema` covers it). A stale executor `source_revision` is a note,
 not a failure, because `deploy-upgrade` re-pins it; the start itself still refuses a stale pin.
 
 | Check | What it reads | Fix |
@@ -64,7 +67,14 @@ not a failure, because `deploy-upgrade` re-pins it; the start itself still refus
 
 Exit codes of the services themselves: 2 only when the operator's configuration is refused
 (the units set `RestartPreventExitStatus=2`), 1 for every other fatal error, so
-`Restart=on-failure` restarts a transient fault (a key fetch at boot, a busy database).
+`Restart=on-failure` restarts a transient fault (a key fetch at boot, a busy database). The one
+exception is `tessera serve` failing to load its runtime owner configuration at a real start,
+which exits 78 (the check, which does not load the owner, never returns it).
+
+Readiness: under `tessera serve`, `/health/ready` is unready (`runner_not_ticked`) until the
+in-process runner completes its first tick. If `tick()` raises on every attempt since the process
+started, readiness stays unready indefinitely, and under Kubernetes the pod then leaves its
+Service; read the runner's error log rather than waiting.
 
 An applied fix writes an owner-only receipt (`tessera.deploy-fix-receipt.v1`) to `--receipt-dir`.
 It records the digests before and after and the key names or schema versions that changed, never a

@@ -116,6 +116,13 @@ SAFETY_STOP_CAUSES = frozenset(
 # at least one cent, within the hold (provisional, like every guardian-bounded settlement).
 # ``campaign_salad.reconciled_no_output_refusal`` holds the fail-closed conditions.
 INFRA_SALAD_RECONCILED_NO_OUTPUT = "infra_salad_reconciled_no_output"
+
+# ADR 0225: the route ended at its deadline or by the provider's own stop and the guardian's
+# closed frame says no machine was ever placed, none seen running and no custody begun. Nothing
+# ran, so it is provider capacity, never the stage: a fresh attempt (own claim and hold) retries
+# within ``retry.infra_retries``. It settles at the guardian's recorded estimate, never above the
+# hold (provisional, like every guardian-bounded settlement).
+INFRA_SALAD_NEVER_ALLOCATED = "infra_salad_never_allocated"
 RECONCILED_NO_OUTPUT_REASON = "provider_reconciled_no_output"
 
 # ADR 0216: a person reconciled an unknown attempt as retryable infrastructure through the
@@ -150,6 +157,7 @@ PLACEMENT_RETRY_CLASSES = frozenset(
         INFRA_SALAD_SAFETY_STOP,
         INFRA_SALAD_RECONCILED_NO_OUTPUT,
         INFRA_SALAD_EXECUTOR_LOST,
+        INFRA_SALAD_NEVER_ALLOCATED,
     }
 )
 

@@ -69,7 +69,8 @@ running the preparation again.
    - the Salad stage adapter's input plan, which composes `<name>/<path>` per file, so the planned
      snapshot digest is the one the runner composes;
    - runner composition, input index and lineage;
-   - holdout and seal checks;
+   - holdout and seal checks. A folder cannot be a holdout input, so a re-run of a final holdout
+     stage whose holdout input reads several outputs is still refused at submit;
    - licence-label lineage;
    - the heavy-input size estimate;
    - compose-step manifest ownership.

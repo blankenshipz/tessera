@@ -17,8 +17,8 @@ instead of deciding in its own ``except``:
 - ``deterministic``: anything else, including an ``OSError`` whose errno is not listed or
   that has none (``EEXIST``, ``EXDEV``, ``EINVAL``, a ``URLError``). Inside a step it fails a
   forward step's intent (a reduce-only replay counts toward the breaker); elsewhere it counts
-  toward the campaign's breaker. Only a missing blob for a recorded sha (``is_missing_blob``)
-  fails an idle stage outright.
+  toward the campaign's breaker. Only an ``ENOENT`` whose path names a sha-256 digest
+  (``is_missing_blob``) fails an idle stage outright.
 
 The host alarm is process-wide and in memory (a full disk cannot record it in the database);
 ``observability`` reports it on the operator health read while it stands.
@@ -97,7 +97,8 @@ _SQLITE_ENVIRONMENT = (
 
 class MissingBlob(FileNotFoundError):
     """A blob whose sha is recorded is gone from its store (for example removed by retention).
-    The same on every pass, so it may fail an idle stage outright (``is_missing_blob``)."""
+    ``is_missing_blob`` accepts it as such. Nothing in the runner raises it today: a missing
+    blob normally arrives as a plain ``FileNotFoundError``, matched by path name instead."""
 
     def __init__(self, sha256: str, filename: str | None = None) -> None:
         super().__init__(errno.ENOENT, "recorded blob is missing", filename)
@@ -179,8 +180,10 @@ def state_root_fault(error: OSError, state_dir: os.PathLike[str] | str) -> bool:
 
 
 def is_missing_blob(error: BaseException) -> bool:
-    """The one known file error that fails an idle stage outright: a recorded blob that is
-    gone (``MissingBlob``, or ``ENOENT`` on a path named by a sha-256 digest)."""
+    """The one known file error that fails an idle stage outright: ``MissingBlob``, or an
+    ``ENOENT`` whose final path component contains a 64-hex-digit run (a sha-256 digest). The
+    match is by name only, so any missing file or directory so named counts, not only a blob in
+    a blob store."""
     if isinstance(error, MissingBlob):
         return True
     if not isinstance(error, OSError) or error.errno != errno.ENOENT:

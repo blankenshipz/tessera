@@ -22,7 +22,7 @@ def _expanded_json(world):
     return json.loads(expanded(world).model_dump_json(exclude_none=True))
 
 
-def test_a_checkpoint_composed_retry_binds_a_pinned_contract_to_the_composed_digest(tmp_path, near):
+def test_a_checkpoint_composed_retry_binds_a_pinned_contract_to_the_composed_digest(tmp_path, near):  # noqa: F811 - pytest fixture
     world = cpu_world(tmp_path, near)
     data = _expanded_json(world)
     normal = stage_on_candidate(normalize(parse_spec(data)).stages[0], "salad")
@@ -40,7 +40,8 @@ def test_a_checkpoint_composed_retry_binds_a_pinned_contract_to_the_composed_dig
     assert f"input:{'e' * 64}:{cap}" in bound.argv_template
     assert f"input:{declared['snapshot_digest']}:{declared['max_bytes']}" not in bound.argv_template
     # No checkpoint bytes: the contract is bound only when it is late-bound, cap untouched.
-    assert stage_workload(row, normal, checkpoint_bytes=None).input.max_bytes == declared["max_bytes"]
+    unbound = stage_workload(row, normal, checkpoint_bytes=None)
+    assert unbound.input.max_bytes == declared["max_bytes"]
     # Nothing composed yet: nothing to bind.
     assert (
         stage_workload({}, normal, checkpoint_bytes=777).input.snapshot_digest
@@ -59,7 +60,7 @@ def _stale(data, **change):
     return spec
 
 
-def test_a_current_contract_submits_and_a_stale_one_is_a_409_before_any_hold(tmp_path, near):
+def test_a_current_contract_submits_and_a_stale_one_is_a_409_before_any_hold(tmp_path, near):  # noqa: F811 - pytest fixture
     world = cpu_world(tmp_path, near)
     data = _expanded_json(world)
     assert world.env.submit(spec=data)["id"]  # the fresh derivation passes
@@ -90,9 +91,7 @@ def _pinned_world(tmp_path):
     from test_salad_interruption_retry import checkpoint_world
 
     world = checkpoint_world(tmp_path)
-    row = world.row(
-        "SELECT manifest_json FROM source_snapshots WHERE id=?", world.env.snapshot_id
-    )
+    row = world.row("SELECT manifest_json FROM source_snapshots WHERE id=?", world.env.snapshot_id)
     base = json.loads(row["manifest_json"])["total_bytes"]
     (stage,) = world.spec["stages"]
     stage["provider_config"]["workload"]["input"] = {
@@ -112,7 +111,7 @@ def _to_retry(world):
     )
 
 
-def test_a_checkpoint_retry_binds_a_contract_admission_accepts(tmp_path, adapted):
+def test_a_checkpoint_retry_binds_the_composed_snapshot_with_a_raised_cap(tmp_path, adapted):
     """The retry composed with the checkpoint (real runner, Salad world): the contract the route
     carries names the composed snapshot, and its raised cap admits it where the reviewed cap
     would not (admission refuses ``manifest total_bytes > input.max_bytes``).
@@ -138,9 +137,10 @@ def test_a_checkpoint_retry_binds_a_contract_admission_accepts(tmp_path, adapted
     bound = driver._workload(ctx, stage, spec_stage)
     assert bound.input.snapshot_digest == stage["input_snapshot_digest"]
     assert bound.input.max_bytes == reviewed + len(CHECKPOINT) >= total
-    assert f"{stage['input_snapshot_digest']}:{bound.input.max_bytes}" in "".join(
-        bound.argv_template
-    ) or bound.runtime != "gpu_runtime_v1"
+    assert (
+        f"{stage['input_snapshot_digest']}:{bound.input.max_bytes}" in "".join(bound.argv_template)
+        or bound.runtime != "gpu_runtime_v1"
+    )
     assert driver.retry_input_refusal(ctx, stage, spec_stage) is None  # fits the profile
     # One composition, one read: a second call is served from the per-snapshot cache.
     assert driver._checkpoint_bytes(ctx, stage) == len(CHECKPOINT)

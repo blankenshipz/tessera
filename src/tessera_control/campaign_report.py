@@ -58,6 +58,8 @@ _FAILURES = {
     "the most the cloud safety service allowed it to spend, with no output kept",
     "infra_salad_executor_lost": "the machine running the cloud job lost track of the run; "
     "the cloud safety service confirmed it stopped, before any output was kept",
+    "infra_salad_never_allocated": "the cloud provider never gave it a machine before the "
+    "route ended (nothing ran)",
     "start_failure_suspected": "the container failed to start on several cloud machines",
     "salad_container_exited_nonzero": "the container process exited with a failing code",
     "salad_interrupted": "the cloud provider interrupted the run after it had started",
@@ -88,6 +90,7 @@ _RETRY_ENDED = frozenset(
         "infra_salad_reconciled_no_output",
         "infra_reconciled_retryable",
         "infra_salad_executor_lost",
+        "infra_salad_never_allocated",
     }
 )
 _RETRY_WORDS = {

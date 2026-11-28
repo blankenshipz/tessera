@@ -461,6 +461,16 @@ def _never_allocated(row: dict[str, Any]) -> bool:
         found = json.loads(row.get("guardian_final_json") or "null")
     except ValueError:
         return False
+    if (
+        type(found) is dict
+        and found.get("never_allocated") is True
+        and found.get("route_deadline") is None
+        and found.get("allocation_timeout") is None
+        and found.get("start_events") is None
+        and found.get("start_failure") is None
+        and found.get("status") in ("stopped", "reconciled")
+    ):
+        return True  # ADR 0225: the guardian's own closed-frame word
     if type(found) is dict and provisioning_overrun(found.get("route_deadline")):
         return found.get("allocation_timeout") is None
     timeout = found.get("allocation_timeout") if type(found) is dict else None
@@ -469,6 +479,24 @@ def _never_allocated(row: dict[str, Any]) -> bool:
         and type(timeout.get("elapsed_seconds")) is int
         and type(timeout.get("deadline_seconds")) is int
         and found.get("route_deadline") is None
+    )
+
+
+def _never_marked(row: dict[str, Any]) -> bool:
+    """The recorded final carries the ADR 0225 marker itself (not merely an allocation-timeout or
+    provisioning-overrun record), closed and uncontradicted. Only this widens settlement."""
+    try:
+        found = json.loads(row.get("guardian_final_json") or "null")
+    except ValueError:
+        return False
+    return (
+        type(found) is dict
+        and found.get("never_allocated") is True
+        and found.get("status") in ("stopped", "reconciled")
+        and found.get("route_deadline") is None
+        and found.get("allocation_timeout") is None
+        and found.get("start_events") is None
+        and found.get("start_failure") is None
     )
 
 
@@ -922,9 +950,7 @@ class SaladStageDriver:
             stage, spec_stage, checkpoint_bytes=self._checkpoint_bytes(ctx, stage)
         )
 
-    def retry_input_refusal(
-        self, ctx: _Ctx, stage: dict[str, Any], spec_stage: Any
-    ) -> str | None:
+    def retry_input_refusal(self, ctx: _Ctx, stage: dict[str, Any], spec_stage: Any) -> str | None:
         """A closed reason when a checkpoint retry's raised input cap no longer fits the operator
         profile (``max_input_bytes`` of the stage adapter, and the declared fetch plus input bytes
         within ``disk_mb``), else None. Checked right after the retry composes, before any lease
@@ -3458,7 +3484,7 @@ class SaladStageDriver:
             # so the hold is not spent. Settle the guardian's own accrued estimate (zero when it
             # saw nothing run; a backdated poll gap rounds up), still provisional like any
             # bounded hold: a recorded charge raises or confirms it later.
-            estimate = self._clean_guardian(attempt, row)
+            estimate = self._clean_guardian(attempt, row, provider_close=_never_marked(row))
             if estimate is None or hold < 1 or math.ceil(estimate) > hold:
                 return None
             return math.ceil(estimate)
@@ -3548,6 +3574,7 @@ class SaladStageDriver:
                     or _provider_moved(attempt)
                     or _retained_before_move(row)
                     or _provider_closed(row)
+                    or _never_marked(row)
                     or _safety_stopped(row)
                     or provider_closed
                     else {"stopped"}

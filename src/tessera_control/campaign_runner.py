@@ -2243,8 +2243,10 @@ class CampaignRunner:
 
     def _trip_breaker(self, campaign_id: str, error_class: str, count: int) -> None:
         """Block a running campaign that keeps raising one error class, through the ordinary
-        block path: reduce-only, every attempt, grant and hold left as they are for a person
-        to reconcile; nothing settled and no stage failed. It stays blocked until a person
+        block path: reduce-only, no stage failed and no running attempt, lease or leased grant
+        touched, left as they are for a person to reconcile. The block itself settles nothing; a
+        later pass of the blocked campaign gives back each never-leased Salad grant, settled at
+        zero (``_release_unleased_grants``, ADR 0208 addendum). It stays blocked until a person
         re-approves it (``_drive_blocked``) or cancels it.
 
         A campaign the breaker cannot block (already blocked, paused, cancelling) gets one

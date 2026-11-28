@@ -79,6 +79,13 @@ keeps accruing past a deadline while a stop is unconfirmed.
   contract's `workload_seconds` (<= 3600) plus a 120 s upload grace.
   Once the instance is first seen running, the guardian stops the run at
   `min(route deadline, first_running_at + running_seconds)`.
+  While an image pull is charged before the workload itself is running (the group
+  reports `running` over an instance that is still creating or downloading), the running
+  window has not started, so the worst-case remaining cost is bounded by the route
+  deadline (deadline minus now), not by `running_seconds`. On the first accruing read the
+  guardian checks the accrued cost plus the published rate over that remaining time against
+  the reservation's cost cap, and fails closed (`cost_cap` fence) when it would exceed it,
+  or when the rate is unknown or stale.
 
 ## Total budget cap
 

@@ -179,6 +179,9 @@ class _GuardianFinal(BaseModel):
         ]
         | None
     ) = None
+    # Present (True) only when the guardian says the frame closed without a machine ever placed,
+    # seen running or served by custody (ADR 0225).
+    never_allocated: Literal[True] | None = None
     # Present only after a non-zero container exit: the one bounded, sanitized, untrusted-marked
     # container-log tail (``salad_container_log``), re-checked here.
     container_log: dict | None = None
@@ -220,6 +223,7 @@ def _stored_final(final: _GuardianFinal) -> str:
                 "start_events",
                 "safety_stop_cause",
                 "retained_before_move",
+                "never_allocated",
                 "container_log",
             )
             or value is not None

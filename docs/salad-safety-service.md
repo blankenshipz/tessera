@@ -580,7 +580,7 @@ raises). A `route_deadline` stop with that word and at most 60 s running is a pl
 that never got going (a slow image pull or start), not the workload: control records the
 transient `infra_salad_provisioning_overrun`, retried within `retry.infra_retries` (then the
 class/profile fallback decides), and settles it at the guardian's accrued estimate like a
-never-placed group ([ADR 0206](decisions/0206-salad-provisioning-not-run-time.md)). The lease of
+never-placed group ([ADR 0206](decisions/0206-salad-provisioning-not-run-time.md)). A closed frame the provider ended itself (or that reached the route limit) with no machine ever placed, seen running or served by custody carries `never_allocated: true`; control records `infra_salad_never_allocated`, retried within `retry.infra_retries` and settled at the estimate ([ADR 0225](decisions/0225-salad-never-allocated-retryable.md)). The lease of
 a Salad campaign attempt also covers the provisioning allowance (lease issue plus the task's
 `max_duration_seconds` plus 1500 s, still bounded by grant and credential expiry), so
 provisioning no longer spends the stage's run time; the run itself stays bounded from first

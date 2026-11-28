@@ -47,8 +47,10 @@ deterministic error repeated every interval forever (observed live: a re-run loo
    `RUNNER_ERROR_THRESHOLD` (10) consecutive drives, a `running` or `stopping` campaign is
    blocked through the ordinary block path with `stop_reason=runner_error:<Class>` (only when no
    stop reason is set), one `campaign.runner_error` event and a `campaign.blocked` event. The
-   block is reduce-only: no attempt, grant or hold is touched, nothing is settled and no stage is
-   failed. Unlike an unknown-attempt block it is not lifted by the runner on its own or by a
+   block itself is reduce-only: no stage is failed and no attempt, lease or leased grant is
+   touched, and the block settles nothing. A later pass of the blocked campaign gives back each
+   never-leased Salad grant, settled at zero (ADR 0208 addendum), as for any blocked campaign.
+   Unlike an unknown-attempt block it is not lifted by the runner on its own or by a
    restart: it stands until a person re-approves the campaign (a `campaign.approved` event after
    the breaker's event); the existing unblock then resumes it and clears the breaker's own stop
    reason, recorded as `cleared_stop_reason` on `campaign.unblocked`. Cancel works as for any
@@ -142,7 +144,9 @@ of them, each then needing re-approval.
      reduce-only step's replay is counted toward the breaker (as before). Outside a step it is
      recorded once as a stage or hook runner error and counted toward the breaker; the stage is
      not failed. The one exception is a missing blob for a recorded sha
-     (`runner_faults.MissingBlob`, or `ENOENT` on a path named by a sha-256 digest): a stage that
+     (`ENOENT` whose final path component contains a sha-256 digest, matched by name only, so a
+     tenant or project file or directory so named counts too; `runner_faults.MissingBlob` is also
+     accepted but nothing raises it today): a stage that
      raises it with no active or `unknown` attempt fails closed as `os_error:ENOENT`, and one with
      such an attempt is recorded as a stage runner error and counted, never failing a started
      attempt.

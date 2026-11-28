@@ -23,6 +23,7 @@ from .campaign_infra_retry import (
     GUARDIAN_UNAVAILABLE_PRESTART_CLASSES,
     INFRA_SALAD_EXECUTOR_LOST,
     INFRA_SALAD_GUARDIAN_UNAVAILABLE,
+    INFRA_SALAD_NEVER_ALLOCATED,
     INFRA_SALAD_PROVISIONING_OVERRUN,
     INFRA_SALAD_REALLOCATED,
     INFRA_SALAD_RECONCILED_NO_OUTPUT,
@@ -351,7 +352,9 @@ def admitted_nonpublic_input(connection: sqlite3.Connection, stage: Any) -> bool
     ``public_artifact`` is fetched by digest on the provider (ADR 0097) and is never private.
     Every other kind (a stage output, an ``artifact`` or ``artifact_folder`` pin, a chained
     receipt reference) and any unknown kind counts as non-public, as does a ``send_classes``
-    naming a class other than ``public``: unknown fails closed."""
+    naming a class other than ``public``: unknown fails closed. Spec validation already refuses a
+    non-snapshot input that declares hosts; this check mainly covers ``check_stage`` paths that
+    skip re-validation and snapshots whose recorded state differs from the spec."""
     for source in getattr(stage, "inputs", ()):
         kind = getattr(source, "kind", None)
         if kind == "public_artifact":
@@ -969,6 +972,21 @@ class SaladRouteProvider:
                 evidence_digest=evidence,
                 manifest_id=attempt.get("manifest_id"),
             )
+        if self._guardian_never_allocated(rt, attempt):
+            # ADR 0225: the guardian's closed frame says no machine was ever placed, seen running
+            # or served by custody, and the route ended at its limit or by the provider's own
+            # stop. Nothing ran: provider capacity, retried within ``retry.infra_retries``.
+            return Observation(
+                "failed_transient",
+                failure_class=INFRA_SALAD_NEVER_ALLOCATED,
+                detail=(
+                    f"{INFRA_SALAD_NEVER_ALLOCATED}: the route ended before any machine was "
+                    "allocated or seen running; nothing ran"
+                )[:500],
+                evidence_kind="salad_live_receipt",
+                evidence_digest=evidence,
+                manifest_id=attempt.get("manifest_id"),
+            )
         exited = exit_failure_detail(self._guardian_record(rt, attempt, "start_events"))
         moved = None if exited is None else self._moved_runtime_exit(rt, attempt)
         if moved is not None:
@@ -1275,6 +1293,21 @@ class SaladRouteProvider:
             return json.loads(row["guardian_final_json"]).get(key)
         except (ValueError, AttributeError):
             return None
+
+    @classmethod
+    def _guardian_never_allocated(cls, rt: RunnerServices, attempt: Mapping[str, Any]) -> bool:
+        """The recorded guardian final carries ``never_allocated`` and nothing contradicts it: no
+        recorded exit, route-deadline record or allocation timeout (each has its own class), and
+        the final is closed. Missing or unknown evidence is False (today's behaviour)."""
+        if cls._guardian_record(rt, attempt, "never_allocated") is not True:
+            return False
+        return (
+            cls._guardian_record(rt, attempt, "status") in {"stopped", "reconciled"}
+            and cls._guardian_record(rt, attempt, "route_deadline") is None
+            and cls._guardian_record(rt, attempt, "allocation_timeout") is None
+            and cls._guardian_record(rt, attempt, "start_events") is None
+            and cls._guardian_record(rt, attempt, "start_failure") is None
+        )
 
     @staticmethod
     def _allocation_timeout(

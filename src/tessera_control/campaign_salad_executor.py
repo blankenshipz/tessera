@@ -2740,6 +2740,16 @@ def project_guardian_final(
         if cut.get("custody_work_begun") is False:
             # Additive: the workload never began custody work before the route limit cut it.
             projected["route_deadline"]["custody_work_begun"] = False
+    if (
+        status.get("never_allocated") is True
+        and status.get("status") in {"stopped", "reconciled"}
+        and status.get("stop_cause") in {None, "deadline"}
+        and "allocation_timeout" not in projected
+        and "route_deadline" not in projected
+    ):
+        # Additive (ADR 0225): the guardian's own word that no machine was ever placed, seen
+        # running or served by custody before the frame closed.
+        projected["never_allocated"] = True
     rebinds = _project_rebinds(status.get("prestart_rebinds"))
     if rebinds is not None:
         projected["prestart_rebinds"] = rebinds

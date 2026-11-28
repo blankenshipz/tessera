@@ -38,8 +38,10 @@ Four gaps let a deploy, or the code a deploy installs, take a running program do
    `tessera.config-check.v1` line (program, the route width it parsed, short notes), 2 when the
    start would refuse the configuration, 1 when the check could not run. Exclusions are named in
    its notes: the serve runtime owner (its loader runs adapter code) and the agent sandbox witness
-   are not exercised; the guardian does not load its certificate together with its key; a
-   well-formed but stale executor `source_revision` is a note, since `deploy-upgrade` re-pins it
+   are not exercised, and the executor's check does not read or authenticate the worker
+   credential, so a real start can refuse what the check passes in those three places; the
+   guardian does not load its certificate together with its key; a well-formed but stale
+   executor `source_revision` is a note, since `deploy-upgrade` re-pins it
    after the stop (the start itself still refuses it).
 2. **`deploy-check` runs them under the new release.** `--serve-args`, `--executor-args` and
    `--guardian-args` (and a plan service's `config_check`) give the units' argument strings; each
@@ -48,7 +50,8 @@ Four gaps let a deploy, or the code a deploy installs, take a running program do
    `salad_max_concurrent_routes` ≤ the executors' `max_concurrent_paid_routes` (summed) ≤ the
    guardians' `max_open_billable_frames` (summed). Every level that is set is compared, so an
    executor wider than its guardians fails even when control's width is unset; a reported width
-   that is not an integer fails. Only then does an unset control width warn.
+   that is not an integer fails. Only then does an unset width warn (control's, or an executor or
+   guardian that reported none).
    The guardian config is closed: every key is named, unknown and misspelt keys, missing required
    keys and wrong types (a boolean where an integer is expected) are refused at start.
 3. **Stored state is re-read with the new code.** With a state directory, `deploy-check` opens the
@@ -58,15 +61,17 @@ Four gaps let a deploy, or the code a deploy installs, take a running program do
    check runs only once the stored schema is current: for a release that carries a migration it
    is skipped before the stop and first runs in the post-migrate smoke, after the restart (it is
    not re-implemented against pre-migration rows). A release without a migration is checked
-   before any stop. At
-   runtime a spec that does not verify blocks the campaign (`campaign.blocked` with
-   `stored_spec_unreadable` or `spec_digest_mismatch`, once) instead of failing it; nothing about
+   before any stop. At runtime a spec that does not verify blocks the campaign
+   (`campaign.blocked` with `stored_spec_unreadable` or `spec_digest_mismatch`, once) instead
+   of failing it; nothing about
    its stages, attempts, grants or holds changes. When the spec verifies again (a fix or a
    rollback) the campaign resumes and the reason is cleared; the approval's digest check still
    applies.
 4. **Exit code 2 is config refusal only** (`tessera_control.exit_codes`). Every other fatal error
-   exits 1, so `Restart=on-failure` restarts it. The guardian writes the service-health file the
-   executor writes (`tessera.service-health.v1`, `--health-file`, at most every 5 s), and its unit
+   exits 1, so `Restart=on-failure` restarts it, except that `tessera serve` exits 78 when its
+   runtime owner configuration cannot be loaded at a real start. The guardian writes the
+   service-health file the executor writes (`tessera.service-health.v1`, `--health-file`, at
+   most every 5 s), and its unit
    gets the same report-only health-check timer.
 5. **The stop guard is lease-aware.** The upgrade reads every Salad attempt from `leased` through
    `executing` whose grant is unresolved and whose lease is live, and refuses when any held lease

@@ -1093,8 +1093,8 @@ class SaladHTTPTransport:
         )
 
     def send(self, operation, selection, provider_id, secret):
-        self._post_sent = None
-        self._reading_logs = False  # None: no create POST attempted in this call
+        self._post_sent = None  # None: no create POST attempted in this call
+        self._reading_logs = False
         try:
             self._check(selection, secret)
             if provider_id is not None and not re.fullmatch(r"[a-f0-9]{32}", provider_id):

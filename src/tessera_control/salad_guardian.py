@@ -57,6 +57,11 @@ WORKLOAD_EXIT_PREFIX = "workload_exit:"
 # instant): the group is cancelled through the ordinary stop path and the record below is kept.
 ALLOCATION_TIMEOUT_REASON = "allocation_timeout"
 ALLOCATION_TIMEOUT_PREFIX = "allocation_timeout:"
+# The first stop causes (None: the provider ended the group, no stop of the guardian's own) under
+# which a closed frame that never showed a machine is reported ``never_allocated`` (ADR 0225).
+# Never ``allocation_changed``: the provider reported an allocation, so the reallocation rules
+# (ADR 0179, ADR 0221) decide, not a never-placed group.
+NEVER_ALLOCATED_CAUSES = frozenset({None, "deadline"})
 MIN_ALLOCATION_SECONDS, MAX_ALLOCATION_SECONDS = 60, 3600
 DEFAULT_ALLOCATION_SECONDS = 600
 # Provisioning bound, counted from arming (the guardian arms the exact group before its start):
@@ -619,6 +624,18 @@ class SaladGuardian:
         if timeout is not None:
             # Additive: present only for a group cancelled because nothing was ever allocated.
             result["allocation_timeout"] = timeout
+        if (
+            timeout is None
+            and deadline_run is None
+            and row[0] in {"stopped", "reconciled"}
+            and result["stop_cause"] in NEVER_ALLOCATED_CAUSES
+            and self._never_ran(operation) is not None
+        ):
+            # Additive (ADR 0225): the frame is closed, ended at the route limit or by the provider
+            # (no stop cause of the guardian's own), and its own database says no machine was
+            # ever placed, none seen running and no custody of any kind began. Database state and
+            # the adapter's positive ``custody_started is False`` only: an unknown says nothing.
+            result["never_allocated"] = True
         rebinds = self._prestart_rebinds(operation)
         if rebinds:
             # Additive: absent unless an allocation was re-bound before anything started.

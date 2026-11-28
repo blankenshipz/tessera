@@ -1544,12 +1544,29 @@ class SaladSafetyService(ContainerExitWatch):
             return self.guardian.status(row["operation"])["status"]
         return "reconciled" if branch == "lost_create_closed" else "reserved"
 
+    @staticmethod
+    def _sighted(row) -> bool:
+        """True when the reservation records any sighting: a bound allocation or machine, a run
+        seen, accrual started, or an uncertain allocation."""
+        return bool(
+            row["allocation"]
+            or row["machine"]
+            or row["seen_running"]
+            or row["seen_running_at"] is not None
+            or row["first_running_at"] is not None
+            or row["allocation_uncertain"]
+        )
+
     def _status(self, row):
         self._account(row)
         row = self._row(row["reservation"])
         branch = self._frame_branch(row)
         if branch == "bound":
             status = self.guardian.status(row["operation"])
+            if status.get("never_allocated") and self._sighted(row):
+                # ADR 0225: the reservation's own record shows a placement, a machine or a run
+                # that the guardian's database did not: the marker is never passed through.
+                status.pop("never_allocated")
         elif branch == "lost_create_closed":
             record = json.loads(row["lost_create_resolution"])
             # Terminal by definite absence, never a stop: nothing was created.

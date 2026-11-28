@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 from salad_campaign_fixture import HOLD, SaladWorld, salad_provider_reset  # noqa: F401
@@ -216,12 +217,17 @@ def test_an_approved_code_snapshot_is_non_public_for_route_policy_and_fetch_host
     adopted = _adopt_approved_code(world, tmp_path)
     driver = provider.driver(world.runner)
     row = {"operation_id": "op", "epoch": 1}
+    ctx = SimpleNamespace(campaign={"id": "c1", "project_id": "p"})
     plain = {"input_snapshot_digest": "d" * 64}
-    assert driver._selection(None, plain, stage, row).salad.execution.data_policy == (
+    assert driver._selection(ctx, plain, stage, row).salad.execution.data_policy == (
         "public_released_only"
     )
-    approved = {"input_snapshot_digest": "d" * 64, "input_snapshot_id": adopted["id"]}
-    selected = driver._selection(None, approved, stage, row)
+    approved = {
+        "stage_key": "g1",
+        "input_snapshot_digest": "d" * 64,
+        "input_snapshot_id": adopted["id"],
+    }
+    selected = driver._selection(ctx, approved, stage, row)
     assert selected.salad.execution.data_policy == "provider_trust_policy_v1"
     moved = stage.model_copy(
         update={
