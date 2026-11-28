@@ -36,6 +36,7 @@ from tessera_control import campaign_provider_worker as worker
 from tessera_control.campaign_models import normalize, parse_spec, stage_on_candidate
 from tessera_control.campaign_providers import register_provider, unregister_provider
 from tessera_control.campaign_rerun import build_retry_spec
+from tessera_control.store import Conflict
 from tessera_control.campaign_salad import LATE_BOUND_EVENT, stage_workload
 from tessera_control.campaign_salad_adapter import (
     expand_spec,
@@ -213,7 +214,7 @@ def expand_workload(contract):
     return SimpleNamespace(input=SaladStageSpec.model_validate(contract).workload.input)
 
 
-def test_a_contract_that_is_not_the_recorded_key_fails_the_stage_closed(tmp_path, host):
+def test_a_contract_that_is_not_the_recorded_key_is_a_409_at_submit(tmp_path, host):
     world = _world(tmp_path, ["result"])
     new = _fail_dependent_then_rerun(world)
     # A hand-submitted copy of the re-run whose reviewed contract declares another digest than
@@ -227,25 +228,9 @@ def test_a_contract_that_is_not_the_recorded_key_fails_the_stage_closed(tmp_path
             f"input:{'d' * 64}:{work['input']['max_bytes']}" if t == old else t
             for t in work["argv_template"]
         ]
-    new = world.env.submit(spec=spec)
-    world.env.approve(new)
-    world.campaign = world.env.store.get_campaign(world.env.owner, new["id"])
-    world.tick_until(
-        lambda: (
-            world.row(
-                "SELECT 1 FROM campaign_salad_stages WHERE campaign_id=? AND source_id IS NOT NULL",
-                new["id"],
-            )
-            is not None
-        )
-    )
-    world.assess_source()
-    world.tick_until_phase("awaiting_lease")
-    world.lease_and_package()
-    world.tick_until(lambda: _stage_row(world)["status"] == "failed", limit=80)
-    reason = world.row("SELECT stop_reason FROM campaigns WHERE id=?", new["id"])["stop_reason"]
-    assert reason == "stage_failed:g1:step_refused"
-    assert world.row("SELECT 1 FROM campaign_salad_attempts WHERE route_id IS NOT NULL") is None
+    # The submit-time recheck (a fresh input plan) refuses it before any hold.
+    with pytest.raises(Conflict, match="adapted Salad contract is stale"):
+        world.env.submit(spec=spec)
 
 
 # -- pure -------------------------------------------------------------------------------------

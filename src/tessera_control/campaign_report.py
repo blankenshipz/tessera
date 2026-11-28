@@ -52,6 +52,8 @@ _FAILURES = {
     "infra_salad_reallocated": "the cloud provider moved the run to another machine",
     "infra_salad_safety_stop": "the cloud safety service stopped the run for its own health "
     "(not because of the stage)",
+    "infra_salad_reconciled_no_output": "the cloud provider confirmed the run's machine stopped "
+    "after its placement became uncertain, before any output was kept",
     "start_failure_suspected": "the container failed to start on several cloud machines",
     "salad_container_exited_nonzero": "the container process exited with a failing code",
     "salad_interrupted": "the cloud provider interrupted the run after it had started",
@@ -79,6 +81,7 @@ _RETRY_ENDED = frozenset(
         "infra_salad_guardian_unavailable",
         "infra_salad_reallocated",
         "infra_salad_safety_stop",
+        "infra_salad_reconciled_no_output",
     }
 )
 _RETRY_WORDS = {

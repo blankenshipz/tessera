@@ -103,6 +103,17 @@ SAFETY_STOP_CAUSES = frozenset(
     }
 )
 
+# ADR 0212: the route never confirmed its termination, but the guardian's own recorded final
+# says the safety service closed the frame by its provider-confirmed reconcile (a fresh exact
+# read of the group stopped with zero instances) after the allocation became uncertain, and no
+# output was retained, sealed or collected. Nothing of the run can be accepted and its spend has
+# ended, so it is infrastructure: a fresh attempt (new operation, own claim and hold) may retry
+# it within ``retry.infra_retries``. It settles at the guardian's recorded estimate rounded up,
+# at least one cent, within the hold (provisional, like every guardian-bounded settlement).
+# ``campaign_salad.reconciled_no_output_refusal`` holds the fail-closed conditions.
+INFRA_SALAD_RECONCILED_NO_OUTPUT = "infra_salad_reconciled_no_output"
+RECONCILED_NO_OUTPUT_REASON = "provider_reconciled_no_output"
+
 # Transient Salad infrastructure classes the runner retries through ``_placement_failure``
 # (one ``retry.infra_retries`` each; with none left, the class/profile fallback decides and the
 # attempt fails permanently under the same class, never ``salad_not_passed``).
@@ -112,6 +123,7 @@ PLACEMENT_RETRY_CLASSES = frozenset(
         INFRA_SALAD_PROVISIONING_OVERRUN,
         INFRA_SALAD_GUARDIAN_UNAVAILABLE,
         INFRA_SALAD_SAFETY_STOP,
+        INFRA_SALAD_RECONCILED_NO_OUTPUT,
     }
 )
 

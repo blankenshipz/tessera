@@ -242,18 +242,23 @@ def is_late_bound(stage: Any, contract: Any) -> bool:
     return declared.snapshot_digest in keys
 
 
-def bind_workload(contract: WorkloadContractV1, snapshot_digest: str) -> WorkloadContractV1:
+def bind_workload(
+    contract: WorkloadContractV1, snapshot_digest: str, max_bytes: int | None = None
+) -> WorkloadContractV1:
     """``contract`` with its declared input digest (and the argv ``input:`` token) replaced by
-    the composed snapshot's ``snapshot_digest``. The reviewed ``max_bytes`` cap is unchanged,
-    and the result is validated as a contract of its own."""
+    the composed snapshot's ``snapshot_digest``. The reviewed ``max_bytes`` cap is unchanged
+    unless ``max_bytes`` is given (a checkpoint retry, ADR 0211), and the result is validated
+    as a contract of its own."""
     declared = contract.input
     if declared is None:
         raise ValueError("the workload contract declares no input to bind")
     old = f"input:{declared.snapshot_digest}:{declared.max_bytes}"
+    cap = declared.max_bytes if max_bytes is None else max_bytes
     data = contract.model_dump(mode="json")
     data["input"]["snapshot_digest"] = snapshot_digest
+    data["input"]["max_bytes"] = cap
     data["argv_template"] = [
-        f"input:{snapshot_digest}:{declared.max_bytes}" if token == old else token
+        f"input:{snapshot_digest}:{cap}" if token == old else token
         for token in contract.argv_template
     ]
     return WorkloadContractV1.model_validate(data)

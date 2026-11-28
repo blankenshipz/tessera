@@ -72,6 +72,7 @@ from .campaign_infra_retry import (
     INFRA_ALLOCATION_TIMEOUT,
     INFRA_CONTAINER_KILLED,
     INFRA_RESOURCE_LIMIT,
+    INFRA_SALAD_RECONCILED_NO_OUTPUT,
     PLACEMENT_RETRY_CLASSES,
     REALLOCATED_PRECUSTODY,
     RESOURCE_LIMIT_CLASSES,
@@ -3847,6 +3848,10 @@ class CampaignRunner:
             # A retry: compose its input snapshot (with the interrupted predecessor's
             # checkpoint when one was salvaged), then re-check it under the setting in force now.
             stage = self._compose_for_retry(ctx, stage, spec_stage, attempt)
+            refuse = getattr(self._provider(spec_stage), "retry_input_refusal", None)
+            reason = None if refuse is None else refuse(self, ctx, stage, spec_stage)
+            if reason:  # ADR 0211: a checkpoint that cannot fit, refused before any lease or hold
+                raise StepFailed("compose_snapshot", "step_refused", reason)
             stamped = self._stamp_trust(ctx, stage, spec_stage, attempt)
             if stamped is not None:
                 return stamped
@@ -5046,6 +5051,15 @@ class CampaignRunner:
     ) -> bool:
         grant_id = attempt["grant_id"]
         settlement, basis = self._settlement_for(spec_stage, attempt)
+        detail = str(attempt["failure_detail"] or "").removeprefix("salad:")
+        if attempt["failure_class"] == INFRA_SALAD_RECONCILED_NO_OUTPUT or detail.startswith(
+            INFRA_SALAD_RECONCILED_NO_OUTPUT
+        ):
+            # ADR 0212: with no worker-confirmed exit, the guardian's provider-confirmed close
+            # is the termination evidence; the Salad driver re-checks it as it reconciles.
+            closed = getattr(self._provider(spec_stage), "reconcile_closed_no_output", None)
+            if closed is not None and closed(self, ctx, attempt, settlement, basis):
+                return True
 
         def build() -> tuple[dict[str, str], dict[str, Any]]:
             grant = self._one("SELECT revision FROM execution_grants WHERE id=?", (grant_id,))
@@ -6100,9 +6114,7 @@ class CampaignRunner:
                 # One refused attempt (its transaction rolled back whole) must not abort the pass:
                 # a cancel_requested campaign has to reach _drive_cancel. A settlement refusal is
                 # recorded by _record_blocked_settlements; nothing is recorded again here.
-                log.warning(
-                    "exited resolution refused for attempt %s: %s", attempt["id"], error
-                )
+                log.warning("exited resolution refused for attempt %s: %s", attempt["id"], error)
 
     def _resolve_exited(self, ctx: _Ctx, attempt: dict[str, Any]) -> bool:
         """Settle one attempt and release its grant and slot in one transaction; True when it did.

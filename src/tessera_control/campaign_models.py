@@ -2235,6 +2235,7 @@ FAILURE_CLASSES = (
     "infra_salad_provisioning_overrun",
     "infra_salad_guardian_unavailable",
     "infra_salad_safety_stop",
+    "infra_salad_reconciled_no_output",
     "start_failure_suspected",
     "salad_container_exited_nonzero",
     "provider_reallocated_before_custody",

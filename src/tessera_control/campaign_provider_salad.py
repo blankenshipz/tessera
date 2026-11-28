@@ -24,6 +24,7 @@ from .campaign_infra_retry import (
     INFRA_SALAD_GUARDIAN_UNAVAILABLE,
     INFRA_SALAD_PROVISIONING_OVERRUN,
     INFRA_SALAD_REALLOCATED,
+    INFRA_SALAD_RECONCILED_NO_OUTPUT,
     INFRA_SALAD_SAFETY_STOP,
     REALLOCATED_PRECUSTODY,
     SAFETY_STOP_CAUSES,
@@ -47,6 +48,7 @@ from .campaign_providers import (
     register_provider,
     replace_provider,
 )
+from .campaign_runner import TERMINAL_ATTEMPT
 from .campaign_salad import (
     LATE_BOUND_EVENT,
     PRE_ROUTE_PHASES,
@@ -55,7 +57,13 @@ from .campaign_salad import (
     credential_message,
     salad_config,
 )
-from .campaign_salad_adapter import CUSTODY_KINDS, bind_workload, is_late_bound
+from .campaign_salad_adapter import (
+    CUSTODY_KINDS,
+    bind_workload,
+    input_plan,
+    is_late_bound,
+    rebound_key,
+)
 from .campaign_salad_lease_cap import admission_refusal as lease_cap_admission_refusal
 from .campaign_store import SALAD_REFUSAL
 from .models import ExecutionSpec
@@ -85,6 +93,27 @@ PROVIDER_ID = "salad"
 # Attempt phases (``campaign_salad``) that occupy one of the executor's route slots: a grant
 # not yet leased, then every phase up to and including the running route.
 ROUTE_SLOT_PHASES = ("awaiting_lease", *PRE_ROUTE_PHASES, "route_started", "executing")
+# The one definition of "occupies a route slot" (ADR 0208), over ``campaign_stage_attempts a``
+# left-joined to ``campaign_salad_attempts sa``: a Salad attempt that holds a grant, whose
+# status is not terminal (``campaign_runner.TERMINAL_ATTEMPT``) and whose phase is in
+# ``ROUTE_SLOT_PHASES`` (no Salad row yet reads as ``awaiting_lease``). Status is excluded by the
+# terminal set, not listed, so ``granted`` and ``admitted`` (after ``issue_grant`` and
+# ``admit_attempt``), ``reserved``, ``running`` and any later non-terminal status all count.
+_TERMINAL = tuple(sorted(TERMINAL_ATTEMPT))
+ROUTE_SLOT_SQL = (
+    "a.grant_id IS NOT NULL AND a.status NOT IN ({}) ".format(",".join("?" for _ in _TERMINAL))
+    + "AND (a.provider_id=? OR sa.attempt_id IS NOT NULL) "
+    + "AND COALESCE(sa.phase,'awaiting_lease') IN ({})".format(
+        ",".join("?" for _ in ROUTE_SLOT_PHASES)
+    )
+)
+
+
+def route_slot_params() -> tuple[str, ...]:
+    """Bind values for ``ROUTE_SLOT_SQL``, in order."""
+    return (*_TERMINAL, PROVIDER_ID, *ROUTE_SLOT_PHASES)
+
+
 RUNTIME = SALAD_RUNTIME
 # Salad's custody total (``MAX_TOTAL_OUTPUT_BYTES``) and per-stage file cap.
 OUTPUT_LIMITS = OutputLimits(
@@ -386,6 +415,13 @@ class SaladRouteProvider:
         profiles = self.profiles.profiles if self.profiles is not None else []
         return [self.credential_state(profile, now) for profile in profiles]
 
+    def reconcile_closed_no_output(
+        self, rt: RunnerServices, ctx: Any, attempt: Mapping[str, Any], settlement: int, basis: str
+    ) -> bool:
+        """ADR 0212: the driver's guardian-evidenced reconcile of a reconciled-without-output
+        attempt (``SaladStageDriver.reconcile_closed_no_output``); False for the ordinary step."""
+        return self.driver(rt).reconcile_closed_no_output(ctx, dict(attempt), settlement, basis)
+
     def driver(self, rt: RunnerServices) -> SaladStageDriver:
         """One driver per runner services object. It lives in the runner's own
         ``provider_state``, so it is evicted with the runner (a provider-held map would
@@ -494,6 +530,39 @@ class SaladRouteProvider:
                 )
         except ValueError as error:
             raise ValueError(f"{label}: adapted stage: {error}") from None
+
+    def check_adapted_input(
+        self, connection: sqlite3.Connection, stage: Any, entries: Any, upstream: Any
+    ) -> None:
+        """An adapted stage's reviewed contract still declares the input the stage now has.
+
+        A re-run (ADR 0069/0209) or a retry spec carries the expanded adapted ``provider_config``
+        over changed inputs, so the contract's declared input is checked here, at submit and at
+        approval, against a fresh ``input_plan``: the same snapshot digest (or the late-bind /
+        re-run key the stage rebinds to) and a cap that covers the plan's. A mismatch is a 409
+        before any hold, never a stage that cannot route. Stages that are not adapted are
+        unchanged (their contract is reviewed as written)."""
+        config = _salad_config(stage)
+        if config is None or not config.adapted:
+            return
+        profile = None if self.profiles is None else self.profiles.get(config.profile)
+        if profile is None or getattr(profile, "stage_adapter", None) is None:
+            return  # check_stage refuses an unknown profile; no adapter section: nothing to plan
+        plan = input_plan(stage, profile, entries, upstream)
+        declared = config.workload.input
+        problem = None
+        if plan is None or declared is None:
+            if (plan is None) != (declared is None):
+                problem = "the workload contract's input does not match the stage's inputs"
+        elif declared.snapshot_digest not in {plan[0], rebound_key(stage)}:
+            problem = "the workload contract declares an input other than the stage's inputs"
+        elif declared.max_bytes < plan[1]:
+            problem = "the workload contract's input cap is below the stage's inputs"
+        if problem is not None:
+            raise Conflict(
+                f"Stage {stage.key!r}: adapted Salad contract is stale: {problem}; "
+                "re-derive it from the current inputs."
+            )
 
     def runtime_capabilities(self, stage: Any) -> frozenset[str] | None:
         """What the stage's runtime image can do, from the operator profile's
@@ -692,6 +761,13 @@ class SaladRouteProvider:
         """Study variant and split lock for the stage experiment; False after a step ran."""
         return self.driver(rt).experiment_ready(ctx, dict(stage_row), stage)
 
+    def retry_input_refusal(
+        self, rt: RunnerServices, ctx: Any, stage_row: Mapping, stage: Any
+    ) -> str | None:
+        """A closed reason when a checkpoint retry's raised input cap does not fit the operator
+        profile (ADR 0211); the runner fails the stage with it before any lease or hold."""
+        return self.driver(rt).retry_input_refusal(ctx, dict(stage_row), stage)
+
     def advance(self, rt: RunnerServices, ctx: Any, stage_row: Mapping, attempt: Mapping) -> bool:
         driver = self.driver(rt)
         spec_stage = driver._spec(ctx, stage_row["stage_key"])
@@ -881,6 +957,21 @@ class SaladRouteProvider:
                 evidence_digest=evidence,
                 manifest_id=attempt.get("manifest_id"),
             )
+        if stored_class == INFRA_SALAD_RECONCILED_NO_OUTPUT or failure_detail.startswith(
+            INFRA_SALAD_RECONCILED_NO_OUTPUT
+        ):
+            # ADR 0212: the route never confirmed termination, but the guardian's recorded final
+            # is the safety service's provider-confirmed close of an uncertain allocation and no
+            # output was retained (control's verify step checked every condition). Outputs are
+            # never accepted; retried within ``retry.infra_retries`` by the runner.
+            return Observation(
+                "failed_transient",
+                failure_class=INFRA_SALAD_RECONCILED_NO_OUTPUT,
+                detail=f"salad:{failure_detail}"[:500],
+                evidence_kind="salad_live_receipt",
+                evidence_digest=evidence,
+                manifest_id=attempt.get("manifest_id"),
+            )
         if self._guardian_record(rt, attempt, "retained_before_move") is True:
             # The run retained its output first; then the provider changed the allocation while
             # the group was stopping, so the guardian could only close the frame by the
@@ -1029,20 +1120,16 @@ class SaladRouteProvider:
 
     def free_slots(self, rt: RunnerServices, ctx: Any, stage: Any) -> int | None:
         """Route slots left, or None when the operator recorded no executor width (unbounded,
-        as before). Counts every Salad attempt, of any campaign, that holds a grant the executor
-        will lease or has leased and has not yet finished its route: ``reserved`` from the
-        grant through ``route_proposed``, then ``running`` once the route started (the start
-        flips the attempt's status in the same transaction as its phase)."""
+        as before). Counts every Salad attempt, of any campaign, that occupies a route slot
+        (``ROUTE_SLOT_SQL``): it holds a grant, its status is not terminal, and its phase is
+        between the grant and the end of its route."""
         if self.route_width is None:
             return None
-        marks = ",".join("?" for _ in ROUTE_SLOT_PHASES)
         row = rt.one(
             f"""SELECT count(*) AS n FROM campaign_stage_attempts a
             LEFT JOIN campaign_salad_attempts sa ON sa.attempt_id=a.id
-            WHERE a.status IN ('reserved','running') AND a.grant_id IS NOT NULL
-            AND (a.provider_id=? OR sa.attempt_id IS NOT NULL)
-            AND COALESCE(sa.phase,'awaiting_lease') IN ({marks})""",
-            (PROVIDER_ID, *ROUTE_SLOT_PHASES),
+            WHERE {ROUTE_SLOT_SQL}""",
+            route_slot_params(),
         )
         return max(self.route_width - (int(row["n"]) if row else 0), 0)
 

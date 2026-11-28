@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 VERDICTS = frozenset({"open", "stopped", "reconciled", "absent"})
+FINAL_STATUSES = frozenset({"reserved", "armed", "stopped", "reconciled", "unknown"})
 FRAME_RECORD_KEYS = frozenset({"reservation", "verdict", "sequence", "record_digest"})
 CONFIG_SCHEMA = "tessera.salad.guardian-read.v1"
 _CONFIG_KEYS = frozenset({"schema", "host", "port", "token_file", "ca_file", "certificate_sha256"})
@@ -60,6 +61,24 @@ class HttpsGuardianRecordReader:
         if type(reply) is not dict:
             return None
         return validate_frame_record(reply.get("frame_record"), reservation)
+
+    def read_final(self, reservation: str) -> dict[str, Any] | None:
+        """ADR 0212: the guardian's final status for ``reservation``, projected exactly as the
+        executor records it (``project_guardian_final``), from the same read-only ``status``
+        call; None when the guardian cannot be reached or answers anything unprojectable.
+        Never raises."""
+        try:
+            reply = self._client._call({"operation": "status", "reservation": reservation})
+        except Exception:
+            return None
+        if type(reply) is not dict or reply.get("status") not in FINAL_STATUSES:
+            return None
+        from .campaign_salad_executor import project_guardian_final
+
+        try:
+            return project_guardian_final(reply)
+        except Exception:
+            return None
 
 
 def load_reader_config(path: Path | str) -> dict[str, Any]:

@@ -168,6 +168,21 @@ def _read_summary(row: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _normal_upstream_outputs(normal: Any) -> Any:
+    """``UpstreamOutputs`` over a normalized spec: a ``stage`` input is resolved to paths, so its
+    sizes are the declared ``max_bytes`` of the upstream stage's outputs at exactly those paths."""
+    declared = {stage.key: {o.path: o.max_bytes for o in stage.outputs} for stage in normal.stages}
+
+    def find(source: Any) -> list[tuple[str, int]] | None:
+        outputs = declared.get(source.stage)
+        paths = list(getattr(source, "paths", None) or ())
+        if outputs is None or not paths or any(outputs.get(path) is None for path in paths):
+            return None
+        return [(path, outputs[path]) for path in paths]
+
+    return find
+
+
 class LicenseRefused(Conflict):
     """A provider's licence-label restriction refuses a stage's inputs (a permanent refusal for
     that provider; placement records it as ``license_label``). ``labels`` are the sorted
@@ -521,6 +536,14 @@ class CampaignStore(
                     "scratch request (scratch_bytes applies to worker-grant CPU providers)."
                 )
             provider.check_stage(connection, project_id, stage)
+            check_contract = getattr(provider, "check_adapted_input", None)
+            if check_contract is not None:
+                check_contract(
+                    connection,
+                    stage,
+                    self.adapter_entries(connection, live, project_id),
+                    _normal_upstream_outputs(normal),
+                )
             self.check_grant_lifetime(provider, stage)
             try:
                 provider_trust.check_narrowing(

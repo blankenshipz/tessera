@@ -30,7 +30,9 @@ from .campaign_autoreconcile import MAX_AUTO_REQUEUES, NOT_STARTED, repeat_count
 from .campaign_infra_retry import (
     INFRA_SALAD_CREATE_NOT_SENT,
     INFRA_SALAD_REALLOCATED,
+    INFRA_SALAD_RECONCILED_NO_OUTPUT,
     REALLOCATED_PRECUSTODY,
+    RECONCILED_NO_OUTPUT_REASON,
     SALAD_INTERRUPTED,
     infra_attempts,
     provisioning_overrun,
@@ -43,7 +45,8 @@ from .campaign_models import (
     StageSpec,
     stage_on_candidate,
 )
-from .campaign_salad_adapter import bind_workload, is_late_bound
+from .campaign_checkpoint import CHECKPOINT_PATH, composed_checkpoint
+from .campaign_salad_adapter import MIB, bind_workload, is_late_bound
 from .campaign_salad_commands import LIVE_CHECK_NO_RECEIPT, SILENT_EXECUTOR
 from .campaign_salad_executor import (
     FINISH_RETRY_SECONDS,
@@ -57,6 +60,7 @@ from .campaign_steps import StepFailed
 from .campaign_store import _GuardianFinal
 from .campaign_unclaimed import Refused
 from .campaign_unclaimed import assess as assess_unclaimed
+from .execution import reconcile_grant_row
 from .external_operations import current_operation_reconciliation
 from .guardian_record_reader import validate_frame_record
 from .programs import program_context
@@ -274,22 +278,44 @@ LATE_BIND_CODES = frozenset(
 
 # A reviewed workload contract (or the operator profile) cannot form a valid route selection.
 SELECTION_INVALID = "salad_workload_contract_invalid"
+# A checkpoint retry whose raised input cap does not fit the operator profile (ADR 0211).
+CHECKPOINT_OVER_CAP = "salad_checkpoint_over_cap"
 
 
-def stage_workload(stage: dict[str, Any], spec_stage: Any) -> Any:
+def stage_checkpoint_name(spec_stage: Any) -> str:
+    """The declared checkpoint output's name (for a refusal that names it)."""
+    return next((o.name for o in spec_stage.outputs if o.path == CHECKPOINT_PATH), "checkpoint")
+
+
+def stage_workload(
+    stage: dict[str, Any], spec_stage: Any, *, checkpoint_bytes: int | None = None
+) -> Any:
     """The workload contract the stage's route carries.
 
     An adapted stage whose inputs include another stage's output declares its input by the
     late-bind key; once the runner has composed the input snapshot, the contract carries that
     snapshot's digest instead (``bind_workload``), so the route's ``manifests.data``, the
     contract's input and the argv ``input:`` token are one digest. Before composition the
-    reviewed contract is returned unchanged, which never matches a route's data digest."""
+    reviewed contract is returned unchanged, which never matches a route's data digest.
+
+    A checkpoint-resume retry (ADR 0197) composes a new snapshot with one more manifest source,
+    so the digest a pinned (not late-bound) adapted contract declared no longer names the input
+    and the reviewed cap has no room for the checkpoint. ``checkpoint_bytes`` is the size the
+    checkpoint's own receipt recorded (``composed_checkpoint``), never caller-supplied: the
+    contract is then bound to the composed digest with ``input.max_bytes`` raised by exactly that
+    many bytes (ADR 0211). ``retry_input_refusal`` refuses it before any lease when the raised cap
+    no longer fits the operator profile."""
     salad = salad_config(spec_stage)
     contract = salad.workload
-    if not salad.adapted or not is_late_bound(spec_stage, contract):
+    if not salad.adapted or contract.input is None:
+        return contract
+    if not is_late_bound(spec_stage, contract) and not checkpoint_bytes:
         return contract
     digest = stage.get("input_snapshot_digest")
-    return bind_workload(contract, str(digest)) if digest else contract
+    if not digest:
+        return contract
+    cap = contract.input.max_bytes + (checkpoint_bytes or 0)
+    return bind_workload(contract, str(digest), cap if checkpoint_bytes else None)
 
 
 def _termination_confirmed(state: dict[str, Any] | None) -> bool:
@@ -442,8 +468,142 @@ def _was_interrupted(attempt: dict[str, Any]) -> bool:
 # worker, whose custody could not be placed after the move (``infra_salad_reallocated``) or was
 # the guardian's pre-custody word (``provider_reallocated_before_custody``). The guardian closes
 # such a frame by the provider-confirmed reconcile, so its final reads ``reconciled`` with
-# ``allocation_uncertain`` set, never ``stopped``.
-PROVIDER_MOVED_CLASSES = (INFRA_SALAD_REALLOCATED, REALLOCATED_PRECUSTODY)
+# ``allocation_uncertain`` set, never ``stopped``. ADR 0212's reconciled-without-output class
+# closes the same way (the safety service's provider-confirmed reconcile of an uncertain
+# allocation), so it settles and is read the same way.
+PROVIDER_MOVED_CLASSES = (
+    INFRA_SALAD_REALLOCATED,
+    REALLOCATED_PRECUSTODY,
+    INFRA_SALAD_RECONCILED_NO_OUTPUT,
+)
+
+# The verify step's word for a route whose own provider receipts never confirmed termination.
+ROUTE_UNCONFIRMED = "route termination is not confirmed by provider receipts"
+# ADR 0212: why a re-read attempt is still held (closed code), recorded once per change of code;
+# an unexpected error of that re-read, recorded once per error class; control's refresh of the
+# guardian final it re-reads; and the least time between two such guardian reads per attempt.
+RECONCILED_NO_OUTPUT_HELD_EVENT = "campaign.salad_reconciled_no_output_held"
+RECONCILED_NO_OUTPUT_ERROR_EVENT = "campaign.salad_reconciled_no_output_error"
+GUARDIAN_FINAL_REFRESHED_EVENT = "campaign.salad_guardian_final_refreshed"
+GUARDIAN_FINAL_REFRESH_SECONDS = 60
+# Guardian statuses after which its final never changes (the guardian reconciles only a frame
+# that is neither stopped nor reconciled).
+_TERMINAL_FINAL = frozenset({"stopped", "reconciled"})
+# Provider readback states that list a live (or starting) instance for the route.
+_LIVE_READ_STATES = frozenset({"running", "pending", "deploying"})
+
+
+def _lists_live_instance(state: dict[str, Any], since: datetime) -> bool:
+    """The route's latest provider readback observed at or after ``since`` (the guardian
+    final's observation) lists a live or starting instance (or any allocation). Readbacks older
+    than the final are superseded by the safety service's later provider-confirmed close, and a
+    later clean readback supersedes an earlier live one. A provider readback whose time cannot
+    be read counts as current and is never superseded (fail closed)."""
+    current: list[tuple[datetime | None, dict[str, Any]]] = []
+    for receipt in state.get("receipts") or []:
+        if type(receipt) is not dict or receipt.get("provenance") != "provider":
+            continue
+        try:
+            observed = _parse_utc(str(receipt.get("observed_at")))
+        except (TypeError, ValueError):
+            observed = None
+        if observed is None or observed >= since:
+            current.append((observed, receipt))
+
+    def live(receipt: dict[str, Any]) -> bool:
+        return receipt.get("state") in _LIVE_READ_STATES or receipt.get("allocation_id") is not None
+
+    if any(observed is None and live(receipt) for observed, receipt in current):
+        return True
+    timed = [(observed, receipt) for observed, receipt in current if observed is not None]
+    if not timed:
+        return False
+    latest = timed[0]
+    for item in timed[1:]:
+        if item[0] >= latest[0]:  # the later-recorded of equal times wins
+            latest = item
+    return live(latest[1])
+
+
+def reconciled_no_output_refusal(
+    connection: sqlite3.Connection,
+    attempt: dict[str, Any],
+    row: dict[str, Any],
+    state: dict[str, Any],
+) -> str | None:
+    """ADR 0212: ``None`` when an attempt whose route never confirmed termination may resolve as
+    ``infra_salad_reconciled_no_output``; otherwise the closed code of the first condition that
+    keeps it ``unknown`` (fail closed). Pure read.
+
+    Every condition must hold:
+
+    * the executor's recorded guardian final is ``reconciled`` by the safety service's own
+      provider-confirmed close (``RECONCILE_PROVIDER``, never an operator attestation) with
+      ``allocation_uncertain`` set;
+    * that final is clean (no orphan, escalation, budget fence or unknown rate, no billed cost)
+      and carries a finite cost estimate whose next whole cent is at least 0 and within the hold;
+    * no output was retained, sealed or collected: no retained-before-move marker, no manifest or
+      uploaded artifact under the grant, and no output named or retained on the live receipt;
+    * no provider readback recorded on the route since that final lists a live instance."""
+    if row.get("guardian_final_json") is None:
+        return "no_guardian_final"
+    try:
+        final = _GuardianFinal.model_validate_json(row["guardian_final_json"])
+    except ValueError:
+        return "guardian_final_unreadable"
+    if final.status != "reconciled" or final.reason != RECONCILE_PROVIDER:
+        return "guardian_not_provider_reconciled"
+    if not final.allocation_uncertain:
+        return "allocation_not_uncertain"
+    if final.orphan or final.escalation_pending or final.budget_fenced or final.rate_unknown:
+        return "guardian_final_not_clean"
+    if final.actual_billed_cost_cents is not None:
+        return "billed_cost_recorded"
+    try:
+        estimate = Decimal(final.estimated_exposure_cents or "")
+        rate = Decimal(final.published_hourly_rate_usd or "")
+    except InvalidOperation:
+        return "no_cost_estimate"
+    if not estimate.is_finite() or estimate < 0 or not rate.is_finite() or rate <= 0:
+        return "no_cost_estimate"
+    hold = int(attempt.get("hold_cents") or 0)
+    if hold < 1 or max(1, math.ceil(estimate)) > hold:
+        return "estimate_above_hold"
+    if final.retained_before_move is True:
+        return "output_retained"
+    if row.get("manifest_id") is not None or attempt.get("manifest_id") is not None:
+        return "output_collected"
+    try:
+        receipt = json.loads(row.get("live_receipt_json") or "null")
+    except ValueError:
+        return "live_receipt_unreadable"
+    if type(receipt) is not dict:
+        return "live_receipt_unreadable"
+    cancel = receipt.get("control_cancel")
+    if (
+        receipt.get("status") == "passed"
+        or receipt.get("outputs")
+        or receipt.get("output_sha256") is not None
+        or (type(cancel) is dict and cancel.get("output_retained") is True)
+    ):
+        return "output_retained"
+    grant_id = attempt.get("grant_id")
+    for table in ("artifact_manifests", "artifacts"):
+        if (
+            grant_id is None
+            or connection.execute(
+                f"SELECT 1 FROM {table} WHERE grant_id=? LIMIT 1", (grant_id,)
+            ).fetchone()
+            is not None
+        ):
+            return "output_collected"
+    try:
+        since = _parse_utc(final.observed_at)
+    except (TypeError, ValueError):
+        return "guardian_final_unreadable"
+    if _lists_live_instance(state, since):
+        return "provider_lists_live_instance"
+    return None
 
 
 def _provider_moved(attempt: dict[str, Any]) -> bool:
@@ -513,12 +673,17 @@ class SaladStageDriver:
         # ``runner`` is the ``RunnerServices`` object the provider was handed; the driver
         # also uses the runner's step/attempt helpers (ADR 0040 §2).
         self.runner = runner
+        self._checkpoint_cache: dict[tuple[str, str, str], int | None] = {}
         self._profiles = profiles
         # Control's own read of the guardian's per-frame record (ADR 0041 section 7); without
         # it no frame settles on a guardian verdict.
         self._guardian_reader = guardian_reader
         # (input, source stage) of the resolver refusal found by ``_late_bound_refusal``.
         self._refused_inputs: dict[str, tuple[str | None, str | None]] = {}
+        # ADR 0212: per attempt, when control may next read the guardian's final, and the code
+        # of the last read (repeated while throttled, so the held code stays stable).
+        self._final_refresh_at: dict[str, datetime] = {}
+        self._final_refresh_code: dict[str, str | None] = {}
 
     # -- small helpers --------------------------------------------------------------
 
@@ -700,6 +865,58 @@ class SaladStageDriver:
             profile = None  # refused later with its own reason
         return operator_config_freshness.launch_problem(name, profile)
 
+    def _checkpoint_bytes(self, ctx: _Ctx, stage: dict[str, Any]) -> int | None:
+        """Bytes of the checkpoint the stage's current input snapshot was composed with, from the
+        receipt recorded when it was composed (None: the base composition). Read once per
+        composed snapshot, not per call."""
+        snapshot_id = stage.get("input_snapshot_id")
+        if not snapshot_id:
+            return None
+        cache_key = (ctx.campaign["id"], stage["stage_key"], snapshot_id)
+        if cache_key not in self._checkpoint_cache:
+            with self.runner.store.runner_connection() as connection:
+                found = composed_checkpoint(
+                    connection, ctx.campaign, stage["stage_key"], snapshot_id
+                )
+            self._checkpoint_cache[cache_key] = None if found is None else found.bytes
+        return self._checkpoint_cache[cache_key]
+
+    def _workload(self, ctx: _Ctx, stage: dict[str, Any], spec_stage: Any) -> Any:
+        """``stage_workload`` for this attempt: bound to the checkpoint-composed snapshot, with
+        the cap raised by the checkpoint's bytes, when the current snapshot was composed with
+        one (ADR 0197, ADR 0211)."""
+        return stage_workload(
+            stage, spec_stage, checkpoint_bytes=self._checkpoint_bytes(ctx, stage)
+        )
+
+    def retry_input_refusal(
+        self, ctx: _Ctx, stage: dict[str, Any], spec_stage: Any
+    ) -> str | None:
+        """A closed reason when a checkpoint retry's raised input cap no longer fits the operator
+        profile (``max_input_bytes`` of the stage adapter, and the declared fetch plus input bytes
+        within ``disk_mb``), else None. Checked right after the retry composes, before any lease
+        or hold, so the stage fails with the checkpoint named instead of after packaging."""
+        if not self._checkpoint_bytes(ctx, stage):
+            return None
+        contract = self._workload(ctx, stage, spec_stage)
+        if contract.input is None:
+            return None
+        profile = self.profile(spec_stage)
+        cap = contract.input.max_bytes
+        ceiling = getattr(getattr(profile, "stage_adapter", None), "max_input_bytes", None)
+        name = stage_checkpoint_name(spec_stage)
+        if ceiling is not None and cap > ceiling:
+            return (
+                f"{CHECKPOINT_OVER_CAP}: checkpoint {name!r} makes the input {cap} bytes, over "
+                f"the profile's max_input_bytes {ceiling}"
+            )
+        if contract.egress.declared_bytes() + cap > profile.disk_mb * MIB:
+            return (
+                f"{CHECKPOINT_OVER_CAP}: checkpoint {name!r} makes the input {cap} bytes, over "
+                f"profile disk_mb {profile.disk_mb} with the declared fetches"
+            )
+        return None
+
     def _selection(
         self,
         ctx: _Ctx,
@@ -715,7 +932,7 @@ class SaladStageDriver:
         try:
             return derive_selection(
                 self.profile(spec_stage),
-                stage_workload(stage, spec_stage),
+                self._workload(ctx, stage, spec_stage),
                 operation_id=row["operation_id"],
                 epoch=row["epoch"],
                 snapshot_digest=stage_data_digest(stage, spec_stage),
@@ -887,7 +1104,7 @@ class SaladStageDriver:
             self._refuse_late_bound(ctx, key, refusal, spec_stage)
             return False
         row = self._stage_row(ctx, key)
-        contract = stage_workload(stage, spec_stage)
+        contract = self._workload(ctx, stage, spec_stage)
         if row["study_variant_id"] is None:
             code = derived_digests(self.profile(spec_stage), contract, spec_stage.image)
             result = self.runner._step(
@@ -1124,7 +1341,9 @@ class SaladStageDriver:
         template = salad.program
         selection = self._selection(ctx, stage, spec_stage, row, closed=not preview)
         try:
-            digests = derived_digests(profile, stage_workload(stage, spec_stage), spec_stage.image)
+            digests = derived_digests(
+                profile, self._workload(ctx, stage, spec_stage), spec_stage.image
+            )
         except ValueError as error:  # a ValidationError is one: the contract is bad
             if preview:
                 raise
@@ -1152,7 +1371,7 @@ class SaladStageDriver:
                         "One Salad GPU container, exact reviewed class; "
                         + salad_route_window_description(
                             max_seconds,
-                            stage_workload(stage, spec_stage).workload_seconds,
+                            self._workload(ctx, stage, spec_stage).workload_seconds,
                             profile.route_max_seconds,
                         )
                     ),
@@ -1692,7 +1911,7 @@ class SaladStageDriver:
         salad_row = self._stage_row(ctx, key)
         profile = self.profile(spec_stage)
         declaration = capability_declaration(
-            profile, stage_workload(stage, spec_stage), spec_stage.image
+            profile, self._workload(ctx, stage, spec_stage), spec_stage.image
         )
         digest = canonical_digest(declaration)
         existing = (
@@ -2166,6 +2385,10 @@ class SaladStageDriver:
           to run but was provably never sent anything, gets the reduce-only ``cancel_route``
           when the only unclaimed refusal is ``route_wants_run``; the unchanged unclaimed proof
           then decides on the runner's own reconcile.
+        * An attempt already ``unknown`` because its route never confirmed termination is
+          re-read once per pass: when the guardian's recorded final now shows the provider-
+          confirmed close of an uncertain allocation with no output (ADR 0212), it resolves
+          as retryable infrastructure and its stage resumes (``_resume_reconciled_no_output``).
 
         A reconciled grant or a settled attempt is never touched."""
         rows = self.runner._rows(
@@ -2175,9 +2398,9 @@ class SaladStageDriver:
             WHERE a.campaign_id=? AND a.settled_cents IS NULL
             AND g.status IN ('active','cancel_requested')
             AND ((sa.phase='outcome_recorded' AND a.status IN ('running','unknown'))
-              OR (sa.phase='unknown' AND sa.waiting_reason=? AND a.status='unknown'))
+              OR (sa.phase='unknown' AND sa.waiting_reason IN (?,?) AND a.status='unknown'))
             ORDER BY a.stage_key, a.attempt""",
-            (ctx.campaign["id"], SILENT_EXECUTOR),
+            (ctx.campaign["id"], SILENT_EXECUTOR, ROUTE_UNCONFIRMED),
         )
         for attempt in rows:
             key = attempt["stage_key"]
@@ -2191,6 +2414,8 @@ class SaladStageDriver:
                     if attempt["status"] == "unknown" and not self._late_imported(attempt):
                         continue
                     self._verify(ctx, self.runner._stage_row(ctx, key), spec_stage, attempt, row)
+                elif row["phase"] == "unknown" and row["waiting_reason"] == ROUTE_UNCONFIRMED:
+                    self._resume_guarded(ctx, attempt, row)
                 else:
                     self._cancel_never_sent(ctx, key, attempt, row)
             except StepFailed as error:
@@ -2201,6 +2426,284 @@ class SaladStageDriver:
                 self.runner._attempt_failed(ctx, key, attempt, error.error_class, error.detail)
             except _waiting():
                 continue
+
+    def _resume_reconciled_no_output(
+        self, ctx: _Ctx, attempt: dict[str, Any], row: dict[str, Any]
+    ) -> None:
+        """ADR 0212 for an attempt the verify step already left ``unknown`` (route termination
+        unconfirmed): the unchanged ``verify_outcome`` decides. Only its reconciled-without-output
+        verdict moves the attempt; then, in one transaction, the attempt leaves ``unknown`` with
+        the failed verdict (the provider adapter classifies it, the runner retries it within
+        ``retry.infra_retries`` and settles it at the guardian's estimate), its stage leaves
+        ``blocked_unknown`` and one event records it. Anything else keeps today's block, its
+        waiting reason unchanged (so the next blocked pass re-reads it again), with the closed
+        code of why it is held recorded once per change of code.
+
+        A stored guardian final that is not terminal yet (the executor recorded before the
+        guardian's close) is first refreshed from control's own guardian read
+        (``_refresh_guardian_final``); an unreadable guardian holds."""
+        row, refresh_code = self._refresh_guardian_final(ctx, attempt, row)
+        verdict, detail, evidence = self.verify_outcome(ctx, attempt, row)
+        if verdict != "failed" or not detail.startswith(INFRA_SALAD_RECONCILED_NO_OUTPUT):
+            self._note_held(ctx, attempt, refresh_code or self._held_code(attempt, row, verdict))
+            return
+        runner = self.runner
+        with runner.store.runner_connection() as connection:
+            runner._touch(
+                connection,
+                "campaign_salad_attempts",
+                "attempt_id=? AND phase='unknown'",
+                (attempt["id"],),
+                phase="outcome_recorded",
+                waiting_reason=None,
+                salad_evidence_digest=evidence,
+            )
+            runner._touch(
+                connection,
+                "campaign_stage_attempts",
+                "id=? AND status='unknown'",
+                (attempt["id"],),
+                status="exited",
+                operation_id=row["operation_id"],
+                salad_verdict="failed",
+                salad_evidence_digest=evidence,
+                manifest_id=None,
+                manifest_digest=None,
+                failure_class=None,
+                failure_detail=detail[:500],
+            )
+            runner._touch(
+                connection,
+                "campaign_stages",
+                "campaign_id=? AND stage_key=? AND status='blocked_unknown'",
+                (ctx.campaign["id"], attempt["stage_key"]),
+                status="running",
+            )
+            runner.store.record_runner_event(
+                connection,
+                ctx.campaign,
+                "campaign.salad_reconciled_no_output",
+                {
+                    "stage_key": attempt["stage_key"],
+                    "attempt": attempt["attempt"],
+                    "attempt_id": attempt["id"],
+                    "reason": RECONCILED_NO_OUTPUT_REASON,
+                    "failure_class": INFRA_SALAD_RECONCILED_NO_OUTPUT,
+                    "salad_evidence_digest": evidence,
+                },
+            )
+
+    def _resume_guarded(self, ctx: _Ctx, attempt: dict[str, Any], row: dict[str, Any]) -> None:
+        """``_resume_reconciled_no_output`` inside a guard: a blocked campaign has no runner
+        breaker, so an unexpected error here is recorded once per (attempt, error class) and the
+        pass goes on; the attempt stays held and is re-read on the next pass. Control flow (a
+        lost lease, a lapsed delegation, waiting), a refused step and contention propagate."""
+        from .campaign_runner import _LeaseLost
+        from .campaign_steps import DelegationLapsed
+
+        try:
+            self._resume_reconciled_no_output(ctx, attempt, row)
+        except (StepFailed, _LeaseLost, DelegationLapsed, sqlite3.OperationalError, _waiting()):
+            raise
+        except Exception as error:  # noqa: BLE001 - classified and recorded, never silent
+            try:
+                self._emit_once(
+                    ctx,
+                    RECONCILED_NO_OUTPUT_ERROR_EVENT,
+                    {"attempt_id": attempt["id"], "error_class": type(error).__name__[:80]},
+                    {"stage_key": attempt["stage_key"], "attempt": attempt["attempt"]},
+                )
+            except (sqlite3.Error, _LeaseLost):
+                pass
+
+    def _held_code(self, attempt: dict[str, Any], row: dict[str, Any], verdict: str) -> str:
+        """The closed code of why the re-read attempt is still held (pure read)."""
+        state = self.route_state(row["route_id"])
+        if state is None:
+            return "route_state_missing"
+        if row.get("live_receipt_json") is None:
+            return "live_receipt_missing"
+        if verdict != "unknown":
+            return f"verdict_{verdict}"[:40]
+        with self.runner.store.runner_connection() as connection:
+            refusal = reconciled_no_output_refusal(connection, attempt, row, state)
+        return refusal or "verify_unknown"
+
+    def _note_held(self, ctx: _Ctx, attempt: dict[str, Any], code: str) -> None:
+        """One ``campaign.salad_reconciled_no_output_held`` event each time the held code
+        changes (never one per pass); the waiting reason is never rewritten."""
+        runner = self.runner
+        with runner.store.runner_connection() as connection:
+            last = connection.execute(
+                """SELECT json_extract(payload_json,'$.refusal') AS refusal FROM events
+                WHERE project_id=? AND event_type=?
+                AND json_extract(payload_json,'$.campaign_id')=?
+                AND json_extract(payload_json,'$.attempt_id')=? ORDER BY cursor DESC LIMIT 1""",
+                (
+                    ctx.campaign["project_id"],
+                    RECONCILED_NO_OUTPUT_HELD_EVENT,
+                    ctx.campaign["id"],
+                    attempt["id"],
+                ),
+            ).fetchone()
+            if last is not None and last["refusal"] == code:
+                return
+            runner._hold_lease(connection)
+            runner.store.record_runner_event(
+                connection,
+                ctx.campaign,
+                RECONCILED_NO_OUTPUT_HELD_EVENT,
+                {
+                    "stage_key": attempt["stage_key"],
+                    "attempt": attempt["attempt"],
+                    "attempt_id": attempt["id"],
+                    "refusal": code,
+                },
+            )
+
+    def _refresh_guardian_final(
+        self, ctx: _Ctx, attempt: dict[str, Any], row: dict[str, Any]
+    ) -> tuple[dict[str, Any], str | None]:
+        """ADR 0212: ``(row, code)``. The executor records the guardian final once; when that
+        copy is missing or not terminal (not ``stopped``/``reconciled``), control reads the
+        guardian's status itself over its own authenticated read (``read_final``), at most once
+        per ``GUARDIAN_FINAL_REFRESH_SECONDS`` per attempt. Only a terminal fresh final replaces
+        the stored one (one row write and one event, in one transaction), so a stored terminal
+        final is never overwritten. ``code`` names why nothing was refreshed when control
+        could not read (``guardian_final_unreadable``) or has no reader
+        (``guardian_final_unrefreshable``); None otherwise. Fail closed: a failed read changes
+        nothing."""
+        stored = _recorded_final(row)
+        if stored is not None and stored.get("status") in _TERMINAL_FINAL:
+            return row, None
+        key = attempt["id"]
+        now = self.runner.now()
+        due = self._final_refresh_at.get(key)
+        if due is not None and now < due:
+            return row, self._final_refresh_code.get(key)
+        self._final_refresh_at[key] = now + timedelta(seconds=GUARDIAN_FINAL_REFRESH_SECONDS)
+        read = getattr(self._guardian_reader, "read_final", None)
+        if read is None or row.get("route_id") is None or row.get("proposal_digest") is None:
+            self._final_refresh_code[key] = "guardian_final_unrefreshable"
+            return row, "guardian_final_unrefreshable"
+        try:
+            fresh = read(canonical_digest([row["route_id"], row["proposal_digest"]]))
+            if fresh is not None:
+                _GuardianFinal.model_validate(fresh)
+        except Exception:  # noqa: BLE001 - an unreadable guardian holds (fail closed)
+            fresh = None
+        if type(fresh) is not dict:
+            self._final_refresh_code[key] = "guardian_final_unreadable"
+            return row, "guardian_final_unreadable"
+        self._final_refresh_code[key] = None
+        if fresh.get("status") not in _TERMINAL_FINAL:
+            return row, None
+        runner = self.runner
+        with runner.store.runner_connection() as connection:
+            runner._touch(
+                connection,
+                "campaign_salad_attempts",
+                "attempt_id=? AND phase='unknown'",
+                (key,),
+                guardian_final_json=json.dumps(fresh, sort_keys=True),
+            )
+            runner.store.record_runner_event(
+                connection,
+                ctx.campaign,
+                GUARDIAN_FINAL_REFRESHED_EVENT,
+                {
+                    "stage_key": attempt["stage_key"],
+                    "attempt": attempt["attempt"],
+                    "attempt_id": key,
+                    "previous_status": None if stored is None else stored.get("status"),
+                    "status": fresh["status"],
+                    "reason": str(fresh.get("reason") or "")[:80],
+                },
+            )
+        return self.row(key), None
+
+    def reconcile_closed_no_output(
+        self, ctx: _Ctx, attempt: dict[str, Any], settlement: int, basis: str
+    ) -> bool:
+        """ADR 0212: reconcile the grant of a reconciled-without-output attempt at ``settlement``
+        (the guardian-bounded estimate ``settlement_for`` derived) when no worker ever reported
+        a confirmed exit, so the grant route's exit-observation check cannot pass. The
+        termination evidence is the guardian's recorded provider-confirmed close, re-checked
+        here (``reconciled_no_output_refusal``) in the same transaction as the reconcile, the
+        attempt's ``reconciled`` state, its settlement and one event.
+
+        False when the ordinary ``reconcile_grant`` step applies (a confirmed exit exists, or the
+        grant is no longer unresolved). When the rule no longer holds the attempt goes back to
+        ``unknown`` for a person (True: the step ran) and nothing is reconciled."""
+        runner = self.runner
+        row = self.row(attempt["id"])
+        state = self.route_state(row["route_id"])
+        with runner.store.runner_connection() as connection:
+            reconciliation = current_operation_reconciliation(connection, row["operation_id"])
+            if (
+                reconciliation is not None
+                and reconciliation["observed_state"] == "exited"
+                and reconciliation["termination_confirmed"]
+            ):
+                return False
+            grant = connection.execute(
+                "SELECT * FROM execution_grants WHERE id=?", (attempt["grant_id"],)
+            ).fetchone()
+            if grant is None or grant["status"] not in ("active", "cancel_requested"):
+                return False
+            refusal = (
+                "route_state_missing"
+                if state is None
+                else reconciled_no_output_refusal(connection, attempt, row, state)
+            )
+            if refusal is None:
+                runner._hold_lease(connection)
+                now = self._stamp()
+                actor = runner._actor_principal(connection, ctx.campaign["id"])
+                if (
+                    reconcile_grant_row(
+                        connection, grant, settlement_cents=settlement, principal_id=actor, now=now
+                    )
+                    is None
+                ):
+                    raise StepFailed(
+                        "reconcile_grant",
+                        "settlement_unavailable",
+                        "execution reservation ledger is inconsistent; authority remains held",
+                    )
+                runner._touch(
+                    connection,
+                    "campaign_stage_attempts",
+                    "id=?",
+                    (attempt["id"],),
+                    status="reconciled",
+                )
+                runner._settle(connection, attempt["id"], settlement, basis)
+                runner.store.record_runner_event(
+                    connection,
+                    ctx.campaign,
+                    "execution.reconciled_no_output_grant_reconciled",
+                    {
+                        "grant_id": grant["id"],
+                        "stage_key": attempt["stage_key"],
+                        "attempt": attempt["attempt"],
+                        "attempt_id": attempt["id"],
+                        "settlement_cents": settlement,
+                        "settlement_basis": basis,
+                        # The amount is the guardian's recorded estimate rounded up, not a bill.
+                        "settlement_is_estimate": True,
+                        "termination_evidence": "guardian_provider_confirmed_close",
+                        "reason": RECONCILED_NO_OUTPUT_REASON,
+                        "operational_only": True,
+                    },
+                    task_id=grant["task_id"],
+                )
+                return True
+        # The waiting reason stays the one the blocked re-read keys on (a temporary refusal is
+        # re-checked on the next pass); the refusal code is recorded on its own event.
+        self._unknown(attempt, ROUTE_UNCONFIRMED)
+        self._note_held(ctx, attempt, f"reconcile_{refusal}"[:60])
+        return True
 
     def _late_imported(self, attempt: dict[str, Any]) -> bool:
         """An unknown attempt's outcome is verified only after the sanctioned late import: the
@@ -2260,7 +2763,26 @@ class SaladStageDriver:
             or state["provider_status"] != "stopped"
             or not provider
         ):
-            return "unknown", "route termination is not confirmed by provider receipts", None
+            with self.runner.store.runner_connection() as connection:
+                refusal = reconciled_no_output_refusal(connection, attempt, row, state)
+            if refusal is None:
+                # ADR 0212: the guardian's own provider-confirmed close of an uncertain
+                # allocation, with nothing retained: retryable infrastructure, never accepted.
+                return (
+                    "failed",
+                    f"{INFRA_SALAD_RECONCILED_NO_OUTPUT}: reason={RECONCILED_NO_OUTPUT_REASON}; "
+                    "the route never confirmed termination; the safety service confirmed the "
+                    "exact group stopped after the allocation became uncertain; no output "
+                    "retained; settles at the guardian's recorded estimate",
+                    # The route's evidence plus the guardian final the verdict rests on.
+                    canonical_digest(
+                        {
+                            "route": self._evidence(row, state, provider, None),
+                            "guardian_final": json.loads(row["guardian_final_json"]),
+                        }
+                    ),
+                )
+            return "unknown", ROUTE_UNCONFIRMED, None
         with self.runner.store.runner_connection() as connection:
             reconciliation = current_operation_reconciliation(connection, row["operation_id"])
         if (

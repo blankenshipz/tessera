@@ -24,12 +24,14 @@ the executor's route width. Three rules combined:
 **Admission width (M1).** The operator may record the executor's width for control as
 `salad_max_concurrent_routes` (1 to 4) in the campaign-providers file. When recorded, the Salad
 provider answers the runner's existing `slot_free` / `free_slots` hooks: a slot is occupied by every
-Salad attempt, of any campaign, that holds a grant and is in `awaiting_lease` (or has no Salad row
-yet) through `executing`: status `reserved` up to `route_proposed`, then `running` from
-`route_started` (the start flips the status in the same transaction as the phase), until the
-attempt reaches a terminal status. `outcome_recorded`, `awaiting_charge` and `unknown` no longer
-occupy a route. The stage waits at `campaign.stage_waiting_slot` with no grant (the grant lifetime
-starts when it is issued), so no lease clock starts for work that cannot start. The slot wait is not
+Salad attempt, of any campaign, that holds a grant, whose status is not terminal, and that is in
+`awaiting_lease` (or has no Salad row yet) through `executing`. Status is read by exclusion from the
+terminal set (`succeeded`, `failed_transient`, `failed_permanent`, `unknown`, `refused_budget`,
+`cancelled`), not from a list: `granted` after `issue_grant`, `admitted` after `admit_attempt` (held
+through every pre-route phase), `running` from `route_started`, and any other non-terminal status
+all count. The Salad provider keeps this as one definition (`ROUTE_SLOT_SQL`) that every count
+reads. `outcome_recorded`, `awaiting_charge` and `unknown` no longer occupy a route. The stage waits
+at `campaign.stage_waiting_slot` with no grant (the grant lifetime starts when it is issued), so no lease clock starts for work that cannot start. The slot wait is not
 FIFO: when a slot frees, the first waiting stage the runner reaches takes it (the FIFO order of
 `waiters_ahead` applies only to project limits). Placement counts the same slots for a
 stage with candidates. Unrecorded means unbounded, as before; an operator whose executor is narrower

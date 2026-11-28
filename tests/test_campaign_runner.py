@@ -652,7 +652,17 @@ def test_reconcile_refuses_a_replayed_amount_that_disagrees_with_the_basis(tmp_p
     monkeypatch.setattr(
         runner, "_settle", lambda *a: pytest.fail("a mismatched amount must not settle")
     )
-    attempt = {"id": "a1", "grant_id": "g1", "attempt": 1}
+    # Attempt rows always carry failure_class/failure_detail; the ADR 0212 branch reads them.
+    monkeypatch.setattr(
+        runner, "_provider", lambda *a: pytest.fail("a non-0212 attempt must not take that path")
+    )
+    attempt = {
+        "id": "a1",
+        "grant_id": "g1",
+        "attempt": 1,
+        "failure_class": "observed_unknown",
+        "failure_detail": None,
+    }
     assert runner._do_reconcile(None, {"stage_key": "s1"}, None, attempt) is True
     assert calls == [attempt]
 
