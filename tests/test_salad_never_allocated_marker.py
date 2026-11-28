@@ -63,6 +63,37 @@ def test_begun_or_unknown_custody_is_never_reported_never_allocated(guardian_wor
     assert "never_allocated" not in status
 
 
+def test_reads_with_no_definite_count_never_give_the_marker(guardian_world):  # noqa: F811
+    """N1: an adapter that cannot say how many instances exist says nothing about placement."""
+    clock, seen, stops, make = guardian_world
+    seen.update(count=None, started=None)
+    guardian = make(provisioning_seconds=None)
+    status = _provider_ends_the_group(seen, clock, guardian)
+    assert status["status"] in {"stopped", "reconciled"}
+    assert "never_allocated" not in status
+
+
+def test_one_read_without_a_count_disqualifies_the_marker(guardian_world):  # noqa: F811
+    clock, seen, stops, make = guardian_world
+    guardian = make(provisioning_seconds=None)
+    step(guardian, clock, 10)  # definite zero counts
+    seen.update(count=None)
+    step(guardian, clock, 10)  # one read with no count
+    seen.update(count=0)
+    status = _provider_ends_the_group(seen, clock, guardian)
+    assert "never_allocated" not in status
+
+
+def test_reads_that_all_failed_give_no_marker(guardian_world):  # noqa: F811
+    clock, seen, stops, make = guardian_world
+    guardian = make(provisioning_seconds=None)
+    seen["fail"] = True
+    step(guardian, clock, 20)
+    seen.update(fail=False, count=None)
+    status = _provider_ends_the_group(seen, clock, guardian)
+    assert "never_allocated" not in status
+
+
 def test_the_allocation_timeout_keeps_its_own_record(guardian_world):  # noqa: F811
     clock, seen, stops, make = guardian_world
     guardian = make()

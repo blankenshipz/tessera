@@ -376,6 +376,11 @@ class SaladGuardian:
             # Set once, permanently, when any instance appeared in the group (even one still
             # pulling its image) or ran: the allocation deadline can never fire afterwards.
             self.db.execute("ALTER TABLE assignments ADD COLUMN instance_seen INTEGER DEFAULT 0")
+        if "count_reads" not in columns:
+            # ADR 0225: reads that gave a definite instance count / reads that did not. The
+            # never-allocated marker needs the first and none of the second.
+            self.db.execute("ALTER TABLE assignments ADD COLUMN count_reads INTEGER DEFAULT 0")
+            self.db.execute("ALTER TABLE assignments ADD COLUMN count_unknown INTEGER DEFAULT 0")
         if "read_fail_since" not in columns:
             self.db.execute("ALTER TABLE assignments ADD COLUMN read_fail_since REAL")
         if "armed_at" not in columns:
@@ -630,6 +635,7 @@ class SaladGuardian:
             and row[0] in {"stopped", "reconciled"}
             and result["stop_cause"] in NEVER_ALLOCATED_CAUSES
             and self._never_ran(operation) is not None
+            and self._counts_definite(operation)
         ):
             # Additive (ADR 0225): the frame is closed, ended at the route limit or by the provider
             # (no stop cause of the guardian's own), and its own database says no machine was
@@ -931,6 +937,28 @@ class SaladGuardian:
             return None
         return max(0.0, now - found[1])
 
+    def _note_count(self, operation: str, o) -> None:
+        """Record whether a read gave a definite instance count (ADR 0225). A read with no count
+        (no instance list and incomplete group counts) says nothing about whether a machine was
+        placed, so it permanently disqualifies the never-allocated marker. Never raises."""
+        if not isinstance(o, ProviderObservation):
+            return
+        try:
+            column = "count_unknown" if o.instance_count is None else "count_reads"
+            with self.db:
+                self.db.execute(
+                    f"UPDATE assignments SET {column}=1 WHERE operation=?", (operation,)
+                )
+        except Exception:
+            pass
+
+    def _counts_definite(self, operation: str) -> bool:
+        """At least one read gave a definite instance count and none lacked one."""
+        found = self.db.execute(
+            "SELECT count_reads,count_unknown FROM assignments WHERE operation=?", (operation,)
+        ).fetchone()
+        return found is not None and bool(found[0]) and not found[1]
+
     def _never_ran(self, operation: str) -> tuple[float, float] | None:
         """``(clock start, armed_at)`` when the operation never showed a placed machine (no
         instance latch), never bound an allocation, was never seen running and the adapter says
@@ -1163,6 +1191,7 @@ class SaladGuardian:
         try:
             o = self.observe(a)
             fail_since = None  # a read answered: the failure window is over
+            self._note_count(operation, o)
             # Real callbacks finish after poll entry. Compare their receipt to
             # the completion clock, not the earlier frozen poll-start time.
             now = self.clock()

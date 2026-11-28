@@ -24,6 +24,7 @@ from .campaign_infra_retry import (
     INFRA_SALAD_EXECUTOR_LOST,
     INFRA_SALAD_GUARDIAN_UNAVAILABLE,
     INFRA_SALAD_NEVER_ALLOCATED,
+    INFRA_SALAD_PROVIDER_READ_FAILED,
     INFRA_SALAD_PROVISIONING_OVERRUN,
     INFRA_SALAD_REALLOCATED,
     INFRA_SALAD_RECONCILED_NO_OUTPUT,
@@ -175,6 +176,79 @@ def _runtime_exit_on_moved_frame(final: Any, receipt: Any) -> str | None:
     return (
         f"{INFRA_SALAD_REALLOCATED}: signal={RUNTIME_EXIT_SIGNAL}; the container exited non-zero "
         f"after the provider moved the allocation ({cause}); the stage's own code did not fail"
+    )[:500]
+
+
+# Runtime reasons a refused input read or custody call ends with (ADR 0227 safety stops).
+RUNTIME_READ_REFUSAL_REASONS = frozenset({"input_fetch", "input_unavailable", "custody"})
+# Runtime reasons of the input read itself: the only calls whose read failures the guardian
+# records (``workload_read_failures``), so the only ones a read failure can explain.
+RUNTIME_INPUT_READ_REASONS = frozenset({"input_fetch", "input_unavailable"})
+READ_FAILURE_SIGNAL = "workload_read_failed"
+
+
+def _runtime_exit_on_read_failures(final: Any) -> str | None:
+    """``infra_salad_provider_read_failed`` detail for a recorded non-zero exit on a frame the
+    provider did not move, when the guardian refused the run's calls on its own failed provider
+    reads; else None (the exit stays permanent).
+
+    Needs the guardian's own final to record at least one authenticated input read it refused
+    because its fresh provider read failed or timed out (``workload_read_failures``) and that the
+    last call it refused was such a read (``last_refusal_read_failure``: no refusal for another
+    reason since), and the runtime's last failed status line in the log tail to name the input
+    read (``RUNTIME_INPUT_READ_REASONS``) with no status line naming ``entry``/``entry_timeout``.
+    A ``custody`` exit (claim, output plan, upload, failure report, or a runtime-local deadline)
+    is never explained by it and stays permanent.
+    The tail is untrusted, so it only narrows the guardian's record. No status line (unavailable,
+    unread, sealed or cut) is an unknown cause and stays permanent; exit codes are never read."""
+    from .salad_container_log import runtime_status_lines
+
+    if type(final) is not dict:
+        return None
+    count = final.get("workload_read_failures")
+    if type(count) is not int or count < 1 or final.get("last_refusal_read_failure") is not True:
+        return None
+    lines = runtime_status_lines(final.get("container_log"))
+    if any(line.get("reason") in RUNTIME_ENTRY_REASONS for line in lines):
+        return None
+    failed = [line for line in lines if line.get("status") == "failed"]
+    if not failed or failed[-1].get("reason") not in RUNTIME_INPUT_READ_REASONS:
+        return None
+    last = failed[-1]
+    if last.get("step") not in (None, "manifest", "chunk"):
+        return None
+    step = f", step {last['step']}" if "step" in last else ""
+    return (
+        f"{INFRA_SALAD_PROVIDER_READ_FAILED}: signal={READ_FAILURE_SIGNAL}; the container exited "
+        f"non-zero after the guardian refused {count} workload call(s) on failed provider reads "
+        f"(the runtime reported {last['reason']}{step}); the stage's own code did not fail"
+    )[:500]
+
+
+def _runtime_exit_after_safety_stop(final: Any) -> str | None:
+    """``infra_salad_safety_stop`` detail for a recorded non-zero exit that followed the safety
+    plane's own stop (ADR 0227 item 3), else None (the exit stays permanent).
+
+    The guardian's first stop cause on the recorded final is a safety-plane cause
+    (``SAFETY_STOP_CAUSES``, e.g. ``provider_unavailable`` after its post-start read window), and
+    the runtime's last failed status line names an input or custody refusal: once the frame is
+    stopping every workload call is refused, and the runtime exits 1 before the platform's kill
+    (start events ``[1, 143]``). No status line naming ``entry``/``entry_timeout`` anywhere; no
+    status line at all is an unknown cause and stays permanent."""
+    from .salad_container_log import runtime_status_lines
+
+    if type(final) is not dict or final.get("safety_stop_cause") not in SAFETY_STOP_CAUSES:
+        return None
+    lines = runtime_status_lines(final.get("container_log"))
+    if any(line.get("reason") in RUNTIME_ENTRY_REASONS for line in lines):
+        return None
+    failed = [line for line in lines if line.get("status") == "failed"]
+    if not failed or failed[-1].get("reason") not in RUNTIME_READ_REFUSAL_REASONS:
+        return None
+    return (
+        f"{INFRA_SALAD_SAFETY_STOP}: the Salad safety plane stopped the route "
+        f"({final['safety_stop_cause']}); the container then exited non-zero on a refused "
+        f"{failed[-1]['reason']} call; not evidence about the stage"
     )[:500]
 
 
@@ -988,7 +1062,9 @@ class SaladRouteProvider:
                 manifest_id=attempt.get("manifest_id"),
             )
         exited = exit_failure_detail(self._guardian_record(rt, attempt, "start_events"))
-        moved = None if exited is None else self._moved_runtime_exit(rt, attempt)
+        # One read of the recorded final and receipt serves every exit rule below.
+        final, receipt = (None, None) if exited is None else self._final_and_receipt(rt, attempt)
+        moved = None if exited is None else _runtime_exit_on_moved_frame(final, receipt)
         if moved is not None:
             # A provider move broke the run's custody calls, not the stage's own code: the
             # guardian's own final shows the move, and either the run never began custody or
@@ -999,6 +1075,33 @@ class SaladRouteProvider:
                 "failed_transient",
                 failure_class=INFRA_SALAD_REALLOCATED,
                 detail=moved,
+                evidence_kind="salad_live_receipt",
+                evidence_digest=evidence,
+                manifest_id=attempt.get("manifest_id"),
+            )
+        read_failed = None if exited is None else _runtime_exit_on_read_failures(final)
+        stopped_first = None if exited is None else _runtime_exit_after_safety_stop(final)
+        if stopped_first is not None:
+            # ADR 0227 item 3: the safety plane stopped the run for its own health first; the
+            # runtime's refused custody call after that stop is not the stage's failure. Same
+            # class, retry bound and settlement (the whole hold) as any safety stop.
+            return Observation(
+                "failed_transient",
+                failure_class=INFRA_SALAD_SAFETY_STOP,
+                detail=stopped_first,
+                evidence_kind="salad_live_receipt",
+                evidence_digest=evidence,
+                manifest_id=attempt.get("manifest_id"),
+            )
+        if read_failed is not None:
+            # ADR 0227: no move, but the guardian refused the run's input or custody calls on
+            # its own failed provider reads, and the runtime failed at exactly such a call (never
+            # ``entry``). Infrastructure, retried within ``retry.infra_retries``; settlement is
+            # unchanged (the whole bounded hold on a clean final).
+            return Observation(
+                "failed_transient",
+                failure_class=INFRA_SALAD_PROVIDER_READ_FAILED,
+                detail=read_failed,
                 evidence_kind="salad_live_receipt",
                 evidence_digest=evidence,
                 manifest_id=attempt.get("manifest_id"),
@@ -1255,8 +1358,9 @@ class SaladRouteProvider:
             return found  # a declared-run cap overrun is the workload's, not the route's
         return None
 
-    def _moved_runtime_exit(self, rt: RunnerServices, attempt: Mapping[str, Any]) -> str | None:
-        """The retryable detail for a non-zero exit on a provider-moved frame, else None."""
+    def _final_and_receipt(self, rt: RunnerServices, attempt: Mapping[str, Any]) -> tuple[Any, Any]:
+        """The executor's recorded guardian final and live receipt for this attempt (dicts), or
+        None for each that is missing or unreadable; one row read."""
         row = None
         if rt is not None and attempt.get("id") is not None:
             row = rt._one(
@@ -1265,7 +1369,7 @@ class SaladRouteProvider:
                 (attempt["id"],),
             )
         if row is None:
-            return None
+            return None, None
 
         def parsed(name: str) -> Any:
             try:
@@ -1274,9 +1378,7 @@ class SaladRouteProvider:
             except (IndexError, KeyError, TypeError, ValueError):
                 return None
 
-        return _runtime_exit_on_moved_frame(
-            parsed("guardian_final_json"), parsed("live_receipt_json")
-        )
+        return parsed("guardian_final_json"), parsed("live_receipt_json")
 
     @staticmethod
     def _guardian_record(rt: RunnerServices, attempt: Mapping[str, Any], key: str) -> Any:

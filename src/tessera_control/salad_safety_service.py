@@ -66,6 +66,7 @@ from .salad_guardian import (
     ProviderObservation,
     SaladGuardian,
     is_deterministic_read_failure,
+    is_transient_read_failure,
 )
 from .salad_http import CREATE_DEADLINE_SECONDS, REQUEST_TIMEOUT_SECONDS, SaladHTTPTransport
 from .salad_input_delivery import GuardianInputs
@@ -806,6 +807,13 @@ class SaladSafetyService(ContainerExitWatch):
             # partition): its container log is never read or stored. Only ever set, never
             # cleared.
             "data_class_sealed": "INTEGER DEFAULT 0",
+            # Authenticated staged-input calls refused because this service's own fresh
+            # provider read failed or timed out (``_workload``); only ever increases.
+            "workload_read_failures": "INTEGER DEFAULT 0",
+            # Whether the last refused bound-workload call (its binding matched this frame)
+            # was such an input read failure: 1, or 0 for a refusal for any other reason;
+            # NULL before any refusal. A later refusal for another reason resets it to 0.
+            "last_refusal_read_failure": "INTEGER",
         }.items():
             if name not in columns:
                 self.db.execute(f"ALTER TABLE reservations ADD COLUMN {name} {declaration}")
@@ -1626,6 +1634,12 @@ class SaladSafetyService(ContainerExitWatch):
             rate_unknown=bool(row["rate_unknown"]),
             rate_read_retries=row["rate_read_retries"] or 0,
             provider_read_retries=row["provider_read_retries"] or 0,
+            workload_read_failures=row["workload_read_failures"] or 0,
+            last_refusal_read_failure=(
+                None
+                if row["last_refusal_read_failure"] is None
+                else bool(row["last_refusal_read_failure"])
+            ),
             last_workload_refusal=self._last_workload_refusal(row["reservation"]),
             # Most recent ever (never cleared by later successful reads), with its time.
             last_rate_read_failure=self._last_event_detail(row["reservation"], "rate_read_failed"),
@@ -3192,6 +3206,29 @@ class SaladSafetyService(ContainerExitWatch):
             self._record_workload_refusal(body, refusal_code(error))
             raise
 
+    def _note_workload_read_failure(self, row):
+        """Count one bound-workload call refused on a failed provider read. Never raises."""
+        try:
+            with self.db:
+                self.db.execute(
+                    "UPDATE reservations SET workload_read_failures="
+                    "COALESCE(workload_read_failures,0)+1 WHERE reservation=?",
+                    (row["reservation"],),
+                )
+        except Exception:  # noqa: BLE001 - a diagnostic write never masks the refusal
+            self.diagnostic_write_failures += 1
+
+    def _note_last_refusal(self, reservation, read_failure):
+        """Record whether the frame's latest refused bound call was an input read failure."""
+        try:
+            with self.db:
+                self.db.execute(
+                    "UPDATE reservations SET last_refusal_read_failure=? WHERE reservation=?",
+                    (1 if read_failure else 0, reservation),
+                )
+        except Exception:  # noqa: BLE001 - a diagnostic write never masks the refusal
+            self.diagnostic_write_failures += 1
+
     def _last_workload_refusal(self, reservation):
         last = self.db.execute(
             "SELECT detail FROM events WHERE reservation=? AND kind='workload_refused' "
@@ -3237,6 +3274,18 @@ class SaladSafetyService(ContainerExitWatch):
             self.diagnostic_write_failures += 1
 
     def _workload(self, path, body, token, accepted_at=None):
+        """Bound-workload request (``_bound_workload``); a refusal of a call whose binding
+        matched the frame records whether it was an input read refused on a failed provider
+        read (``last_refusal_read_failure``), so control can tell the run's last refusal."""
+        mark: dict = {}
+        try:
+            return self._bound_workload(path, body, token, accepted_at, mark)
+        except BaseException:
+            if "reservation" in mark:
+                self._note_last_refusal(mark["reservation"], mark.get("read_failure", False))
+            raise
+
+    def _bound_workload(self, path, body, token, accepted_at, mark):
         """Bound-workload request. ``accepted_at`` is the service clock when the
         listener accepted the connection, before the TLS handshake and body read.
 
@@ -3263,6 +3312,7 @@ class SaladSafetyService(ContainerExitWatch):
             or accepted - self.loop_at > 2
         ):
             raise ValueError("workload_rejected")
+        mark["reservation"] = row["reservation"]
         status = self.guardian.status(row["operation"])
         # Once every output is retained the guardian is stopping; only an exact
         # replay of an already stored chunk may still be acknowledged (read-only).
@@ -3297,7 +3347,17 @@ class SaladSafetyService(ContainerExitWatch):
             self._charge_input_request(row, proposal, token)
         # A container may call right after start, before the next loop tick binds
         # its allocation; this fresh read binds a running instance first.
-        observation, group, allocation, machine = self._provider(row)
+        try:
+            observation, group, allocation, machine = self._provider(row)
+        except (ValueError, TimeoutError) as error:
+            if path == INPUT_PATH and is_transient_read_failure(error):
+                # An input read (its token already verified for the bound machine by the
+                # charge above) refused because the provider could not be read, not because
+                # anything about the frame changed: recorded so control can tell it from the
+                # workload's own failure. The refusal itself is unchanged.
+                mark["read_failure"] = True
+                self._note_workload_read_failure(row)
+            raise
         row = self._row(row["reservation"])
         instances = observation.get("instances") or []
 

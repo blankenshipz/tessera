@@ -143,6 +143,12 @@ RETRYABLE_RECONCILE_EVENT = "execution.grant_reconciled_retryable_infra"
 # route_lost_no_output_refusal`` holds the fail-closed conditions.
 INFRA_SALAD_EXECUTOR_LOST = "infra_salad_executor_lost"
 EXECUTOR_LOST_REASON = "live_check_lost_no_receipt"
+# ADR 0227: the GPU runtime exited non-zero at its input read or a custody call on a frame the
+# provider did not move, and the guardian recorded that it refused bound-workload calls because its
+# own fresh provider read failed or timed out (``workload_read_failures``). The stage's code did
+# not fail; a fresh attempt may retry within ``retry.infra_retries``. Settlement is unchanged (the
+# whole bounded hold on a clean final, or a recorded charge).
+INFRA_SALAD_PROVIDER_READ_FAILED = "infra_salad_provider_read_failed"
 # The ADR 0212 family: attempts settled at the guardian's bound with no worker-confirmed exit.
 GUARDIAN_CLOSED_NO_OUTPUT_CLASSES = (INFRA_SALAD_RECONCILED_NO_OUTPUT, INFRA_SALAD_EXECUTOR_LOST)
 
@@ -157,6 +163,7 @@ PLACEMENT_RETRY_CLASSES = frozenset(
         INFRA_SALAD_SAFETY_STOP,
         INFRA_SALAD_RECONCILED_NO_OUTPUT,
         INFRA_SALAD_EXECUTOR_LOST,
+        INFRA_SALAD_PROVIDER_READ_FAILED,
         INFRA_SALAD_NEVER_ALLOCATED,
     }
 )

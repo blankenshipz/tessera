@@ -2784,6 +2784,13 @@ def project_guardian_final(
     container_log = closed_container_log(status.get("container_log"))
     if container_log is not None:
         projected["container_log"] = container_log
+    read_failures = status.get("workload_read_failures")
+    if type(read_failures) is int and 1 <= read_failures <= 1_000_000:
+        # Additive: workload calls the guardian refused on its own failed provider read.
+        projected["workload_read_failures"] = read_failures
+        if status.get("last_refusal_read_failure") is True:
+            # Additive: the last refused call was one of them (nothing refused it since).
+            projected["last_refusal_read_failure"] = True
     try:
         _GuardianFinal.model_validate(projected)
     except ValidationError:

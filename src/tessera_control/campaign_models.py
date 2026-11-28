@@ -2239,6 +2239,7 @@ FAILURE_CLASSES = (
     "infra_salad_reconciled_no_output",
     "infra_reconciled_retryable",
     "infra_salad_executor_lost",
+    "infra_salad_provider_read_failed",
     "infra_salad_never_allocated",
     "start_failure_suspected",
     "salad_container_exited_nonzero",

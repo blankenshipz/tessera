@@ -24,7 +24,7 @@ against a small estimate. Nothing ran, so this is provider capacity, not the sta
    the reallocation rules of ADR 0179 and ADR 0221 decide); it carries no `allocation_timeout` or
    `route_deadline` record (those keep their own classes); and its own database shows no machine
    ever placed (no instance latch, no bound allocation), none seen running, and the adapter says
-   positively that no custody of any kind began. An unknown or raising adapter, or any sighting,
+   positively that no custody of any kind began. At least one read must have given a definite instance count and none may have lacked one (a read with no count says nothing about placement). An unknown or raising adapter, or any sighting,
    reports nothing. The safety service passes the marker through only when the reservation's own
    record also shows no sighting (no bound allocation or machine, no run seen, no accrual, no
    uncertain allocation).

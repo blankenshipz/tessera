@@ -185,6 +185,12 @@ class _GuardianFinal(BaseModel):
     # Present only after a non-zero container exit: the one bounded, sanitized, untrusted-marked
     # container-log tail (``salad_container_log``), re-checked here.
     container_log: dict | None = None
+    # Present only when the guardian refused at least one bound-workload call because its own
+    # fresh provider read failed or timed out (``workload_read_failures``).
+    workload_read_failures: Annotated[int, Field(strict=True, ge=1, le=1_000_000)] | None = None
+    # Present (True) only when the last bound-workload call the guardian refused was such an
+    # input read failure (a later refusal for any other reason clears it).
+    last_refusal_read_failure: Literal[True] | None = None
 
     @field_validator("container_log")
     @classmethod
@@ -225,6 +231,8 @@ def _stored_final(final: _GuardianFinal) -> str:
                 "retained_before_move",
                 "never_allocated",
                 "container_log",
+                "workload_read_failures",
+                "last_refusal_read_failure",
             )
             or value is not None
         },
