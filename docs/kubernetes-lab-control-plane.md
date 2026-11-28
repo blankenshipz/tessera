@@ -109,7 +109,9 @@ replica; do not scale it or attach its volume to another writer.
 
 `/health/live` is a process liveness endpoint. `/health/ready` is a readiness
 endpoint: it returns HTTP 503 for recovery hold, schema mismatch, or unavailable
-state and exposes only profile, public origin, and an opaque persisted backend
+state, and, under `tessera serve`, until the in-process campaign runner has completed a
+tick since the process started (`runner_not_ticked`; not with `--no-campaign-runner`) and
+the providers file has been registered (`providers_unregistered`). It exposes only profile, public origin, and an opaque persisted backend
 identity. It does not authenticate a caller or disclose a bearer credential.
 Readiness being true is not proof that TLS, NetworkPolicy enforcement, storage
 durability, or research execution is working.

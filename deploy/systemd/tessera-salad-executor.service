@@ -20,7 +20,9 @@ WorkingDirectory=/var/lib/tessera
 ExecStart=/opt/tessera/.venv/bin/python -m tessera_control.campaign_salad_executor --config /etc/tessera/salad-executor.json --health-file /var/lib/tessera/health/salad-executor.json
 Restart=on-failure
 RestartSec=10
-# Exit 2 means configuration or prerequisites were refused; it will not fix itself.
+# Exit 2 means the operator's configuration (config file, profiles, worker credential) was
+# refused; it will not fix itself, so it is not restarted. Any other failure, including a
+# database that was briefly unavailable at start, exits 1 and is restarted.
 RestartPreventExitStatus=2
 TimeoutStopSec=30
 NoNewPrivileges=yes

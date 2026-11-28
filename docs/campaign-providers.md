@@ -561,7 +561,9 @@ deployment's real file is not kept in the repository.
 once than that many routes can run: an attempt holds a slot from its grant until its route ends
 or it reaches a terminal status, whatever its status in between (`granted`, `admitted`,
 `running`, ...), and a stage that finds every slot taken waits at `campaign.stage_waiting_slot` before any grant or
-lease. Unset means unbounded, as before; record it whenever the executor is narrower than the
+lease. An `unknown` attempt with a route keeps its slot until control's route record confirms the
+route stopped (the route may still be running). A blocked or paused campaign gives back the grants
+no executor leased, so they free their slots at once. Unset means unbounded, as before; record it whenever the executor is narrower than the
 project concurrency. Any other value refuses the file.
 
 ### Registering providers and profiles

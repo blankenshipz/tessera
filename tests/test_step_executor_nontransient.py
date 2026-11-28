@@ -9,6 +9,7 @@ Real stores and executor; the slot's kwargs are captured from a real runner pass
 from __future__ import annotations
 
 import dataclasses
+import errno
 import sqlite3
 
 import pytest
@@ -167,7 +168,9 @@ def test_reduce_only_step_stays_transient_for_any_error(tmp_path, monkeypatch):
         (sqlite3.OperationalError("no such table: nope"), False),
         (TimeoutError("slow"), True),
         (ConnectionError("reset"), True),
-        (OSError("disk"), True),
+        # An OSError without an errno is deterministic (ADR 0210); a listed errno replays.
+        (OSError("disk"), False),
+        (OSError(errno.EAGAIN, "again"), True),
         (ValueError("bad"), False),
         (KeyError("missing"), False),
     ],

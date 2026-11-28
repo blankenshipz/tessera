@@ -31,6 +31,7 @@ from .campaign_models import (
     topological_order,
 )
 from .campaign_salad_adapter import expand_with_registered
+from .campaign_salad_retry_default import with_salad_infra_retry_default
 from .store import Conflict, Forbidden, NotFound, StoreError, _connect, utc_now
 
 Reason = Annotated[str, StringConstraints(min_length=1, max_length=1000)]
@@ -120,8 +121,13 @@ class CampaignSteeringCommands:
                 raise Forbidden("This credential cannot submit campaigns.")
             # ADR 0076/0077: the same expansion submit performs; the identity without an adapter.
             # ADR 0123: image_from becomes the built image before expansion and the digest.
+            # ADR 0215: the same Salad infra_retries default submit writes, so the digests agree.
             image_spec, used_predecessors = self._resolve_image_refs(
-                connection, live, project_id, body.spec, body.predecessors
+                connection,
+                live,
+                project_id,
+                with_salad_infra_retry_default(body.spec),
+                body.predecessors,
             )
             spec = expand_with_registered(
                 image_spec,

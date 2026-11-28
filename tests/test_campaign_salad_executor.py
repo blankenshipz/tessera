@@ -828,7 +828,7 @@ def test_main_once_writes_health_and_bad_config_exits_2(tmp_path, monkeypatch, c
     assert stat.S_IMODE(os.stat(health).st_mode) == 0o600
     monkeypatch.undo()
     assert module.main(["--config", str(tmp_path / "missing.json"), "--once"]) == 2
-    assert "executor_setup_unavailable" in capsys.readouterr().out
+    assert "executor_config_refused" in capsys.readouterr().out
 
 
 def test_main_max_cycles_bounds_the_loop(tmp_path, monkeypatch):

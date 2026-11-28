@@ -148,7 +148,7 @@ def test_executor_startup_takes_the_shared_lock_before_opening_the_database(monk
         seen.append("built")
         raise RuntimeError("stop here")
 
-    assert _executor_main(monkeypatch, state, build) == 2
+    assert _executor_main(monkeypatch, state, build) == 1
     assert seen == ["built"]
     with pytest.raises(MaintenanceBusy):  # held for the process lifetime
         with exclusive(state):

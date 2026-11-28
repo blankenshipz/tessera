@@ -63,6 +63,7 @@ from .campaign_rerun import (
     plan_rerun,
 )
 from .campaign_salad_adapter import expand_with_registered
+from .campaign_salad_retry_default import with_salad_infra_retry_default
 from .campaign_standing import MAX_WINDOW_DAYS, _headroom, insert_approved_campaign
 from .campaign_store import CampaignStore
 from .store import (
@@ -469,8 +470,9 @@ class CampaignSubmissionStore(CampaignStore):
                         "An approved submission cannot use image_from: pin the built image with "
                         "a literal image (name@sha256:...) instead."
                     )
+                # ADR 0215: the same Salad infra_retries default submit writes.
                 spec = expand_with_registered(
-                    body.spec,
+                    with_salad_infra_retry_default(body.spec),
                     self.adapter_entries(connection, live, project_id),
                     tenant=(live["org_id"], project_id),
                 )

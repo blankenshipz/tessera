@@ -84,10 +84,13 @@ def run_service(
     clock: Callable[[], float] = time.time,
     wait: Callable[[float], bool] | None = None,
     max_cycles: int | None = None,
+    health_extra: Callable[[], dict[str, Any]] | None = None,
 ) -> int:
     """Call ``step`` until stopped, once, or ``max_cycles`` steps; return 0.
 
     Step errors never end the loop. ``max_cycles`` counts every step, failed or not.
+    ``health_extra`` (optional) adds the service's own counters under ``"service"`` (for a step
+    that handles its errors itself, such as the Salad executor); a failing callback is skipped.
     """
     if max_cycles is not None and (type(max_cycles) is not int or max_cycles < 1):
         raise ValueError("max_cycles must be a positive integer")
@@ -101,10 +104,17 @@ def run_service(
     def health() -> None:
         if health_file is None:
             return
+        extra: dict[str, Any] = {}
+        if health_extra is not None:
+            try:
+                extra = {"service": dict(health_extra())}
+            except Exception as error:  # noqa: BLE001 - class name only; health still written
+                extra = {"service_error_class": type(error).__name__}
         try:
             write_health(
                 health_file,
                 {
+                    **extra,
                     "schema": HEALTH_SCHEMA,
                     "name": name,
                     "pid": os.getpid(),

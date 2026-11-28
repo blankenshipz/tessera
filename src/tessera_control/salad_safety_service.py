@@ -31,6 +31,10 @@ from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+from tessera_worker.provider_inputs import _origin
+from tessera_worker.service_loop import HEALTH_SCHEMA, write_health
+
+from .exit_codes import CONFIG_CHECK_SCHEMA, CONFIG_REFUSED, OK, RUNTIME_FAILURE
 from .models import ExecutionSpec
 from .remote_execution_models import (
     SALAD_PROVISIONING_ALLOWANCE_SECONDS,
@@ -43,9 +47,12 @@ from .salad_custody import CustodyBinding, SaladCustody, private_database
 from .salad_events import empty_record
 from .salad_exit_watch import ContainerExitWatch, nonzero_exit_codes
 from .salad_guardian import (
+    ACCOUNTING_UNAVAILABLE_CAUSE,
     DEFAULT_ALLOCATION_SECONDS,
     DEFAULT_PRESTART_READ_DEADLINE_SECONDS,
     MAX_ALLOCATION_SECONDS,
+    MAX_PRESTART_READ_DEADLINE_SECONDS,
+    MAX_PRESTART_REBINDS_LIMIT,
     MAX_PROVISIONING_SECONDS,
     MIN_ALLOCATION_SECONDS,
     MIN_PROVISIONING_SECONDS,
@@ -121,6 +128,16 @@ def read_admin_frame(connection):
     return raw
 
 
+def _private_file_info_ok(info, cap):
+    return not (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_nlink != 1
+        or info.st_size > cap
+    )
+
+
 def private_read(path, cap=16384):
     path = Path(path).absolute()
     for parent in path.parents:
@@ -128,16 +145,24 @@ def private_read(path, cap=16384):
             raise ValueError("unsafe_file")
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     try:
-        info = os.fstat(fd)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_uid != os.getuid()
-            or stat.S_IMODE(info.st_mode) != 0o600
-            or info.st_nlink != 1
-            or info.st_size > cap
-        ):
+        if not _private_file_info_ok(os.fstat(fd), cap):
             raise ValueError("unsafe_file")
         return os.read(fd, cap + 1)
+    finally:
+        os.close(fd)
+
+
+def private_file_check(path, cap=16384):
+    """The checks of ``private_read`` (symlinks, type, owner, mode 0600, link count, size)
+    without reading a byte of the file."""
+    path = Path(path).absolute()
+    for parent in path.parents:
+        if parent.is_symlink():
+            raise ValueError("unsafe_file")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        if not _private_file_info_ok(os.fstat(fd), cap):
+            raise ValueError("unsafe_file")
     finally:
         os.close(fd)
 
@@ -600,6 +625,69 @@ def frame_verdict(status, reason):
     return "open"
 
 
+def validate_service_parameters(
+    *,
+    allocation_deadline_seconds=DEFAULT_ALLOCATION_SECONDS,
+    provisioning_deadline_seconds=None,
+    max_open_billable_frames=1,
+    total_cap_cents=None,
+    max_prestart_rebinds=3,
+    prestart_read_deadline_seconds=DEFAULT_PRESTART_READ_DEADLINE_SECONDS,
+):
+    """Refuse (ValueError, a closed message naming the setting) a service parameter out of range.
+
+    The one validator of SaladSafetyService.__init__ and of the config check, so both agree.
+    Returns the provisioning deadline with its default resolved.
+    """
+    # Allocation deadline (60..3600 seconds, default 600): a container group that gets no instance
+    # by then is cancelled as ``allocation_timeout`` instead of burning the whole route window. It
+    # never moves the route deadline, run cap or total cap.
+    if (
+        type(allocation_deadline_seconds) is not int
+        or not MIN_ALLOCATION_SECONDS <= allocation_deadline_seconds <= MAX_ALLOCATION_SECONDS
+    ):
+        raise ValueError("invalid_allocation_deadline")
+    # Provisioning bound (seconds from arming, 120..7200, never below the allocation deadline): a
+    # group never placed, never seen running and never served by custody is cancelled as
+    # ``allocation_timeout`` by then, whatever its reads said. Default: the route window's
+    # provisioning allowance (or the allocation deadline when that is longer).
+    if provisioning_deadline_seconds is None:
+        provisioning_deadline_seconds = max(
+            SALAD_PROVISIONING_ALLOWANCE_SECONDS, allocation_deadline_seconds
+        )
+    if (
+        type(provisioning_deadline_seconds) is not int
+        or not MIN_PROVISIONING_SECONDS <= provisioning_deadline_seconds <= MAX_PROVISIONING_SECONDS
+        or provisioning_deadline_seconds < allocation_deadline_seconds
+    ):
+        raise ValueError("invalid_provisioning_deadline")
+    # ADR 0041 resolved question 4b: an operator setting, an integer 1..4 (bool refused).
+    # Every per-frame invariant holds per frame; the total cap is checked in aggregate with
+    # the insert, and the unseen-run gap grows with the number of frames a pass may read.
+    if (
+        type(max_open_billable_frames) is not int
+        or not 1 <= max_open_billable_frames <= MAX_OPEN_BILLABLE_FRAMES_LIMIT
+    ):
+        raise ValueError("invalid_max_open_billable_frames")
+    if total_cap_cents is not None and (
+        type(total_cap_cents) is not int or not 1 <= total_cap_cents <= 1_000_000
+    ):
+        raise ValueError("invalid_total_cap")
+    # The guardian applies the same two rules to its own copy (salad_guardian.SaladGuardian).
+    if (
+        type(max_prestart_rebinds) is not int
+        or not 0 <= max_prestart_rebinds <= MAX_PRESTART_REBINDS_LIMIT
+    ):
+        raise ValueError("invalid_max_prestart_rebinds")
+    if (
+        type(prestart_read_deadline_seconds) not in {int, float}
+        or not math.isfinite(prestart_read_deadline_seconds)
+        or not 0 <= prestart_read_deadline_seconds <= MAX_PRESTART_READ_DEADLINE_SECONDS
+    ):
+        raise ValueError("invalid_prestart_read_deadline")
+    return provisioning_deadline_seconds
+
+
 class SaladSafetyService(ContainerExitWatch):
     """Single-thread service owns all SQLite connections and guardian execution."""
 
@@ -624,46 +712,20 @@ class SaladSafetyService(ContainerExitWatch):
         prestart_read_deadline_seconds=DEFAULT_PRESTART_READ_DEADLINE_SECONDS,
         provisioning_deadline_seconds=None,
     ):
-        # Named, validated setting (60..3600 seconds, default 600): a container group that gets
-        # no instance by then is cancelled as ``allocation_timeout`` instead of burning the whole
-        # route window. It never moves the route deadline, run cap or total cap.
-        if (
-            type(allocation_deadline_seconds) is not int
-            or not MIN_ALLOCATION_SECONDS <= allocation_deadline_seconds <= MAX_ALLOCATION_SECONDS
-        ):
-            raise ValueError("invalid_allocation_deadline")
+        # Named, validated settings, one validator shared with ``--check-config``: see
+        # validate_service_parameters for each range.
+        provisioning_deadline_seconds = validate_service_parameters(
+            allocation_deadline_seconds=allocation_deadline_seconds,
+            provisioning_deadline_seconds=provisioning_deadline_seconds,
+            max_open_billable_frames=max_open_billable_frames,
+            total_cap_cents=total_cap_cents,
+            max_prestart_rebinds=max_prestart_rebinds,
+            prestart_read_deadline_seconds=prestart_read_deadline_seconds,
+        )
         self.allocation_deadline_seconds = allocation_deadline_seconds
-        # Provisioning bound (seconds from arming, 120..7200, never below the allocation
-        # deadline): a group never placed, never seen running and never served by custody is
-        # cancelled as ``allocation_timeout`` by then, whatever its reads said. Default: the
-        # route window's provisioning allowance (or the allocation deadline when that is longer).
-        if provisioning_deadline_seconds is None:
-            provisioning_deadline_seconds = max(
-                SALAD_PROVISIONING_ALLOWANCE_SECONDS, allocation_deadline_seconds
-            )
-        if (
-            type(provisioning_deadline_seconds) is not int
-            or not MIN_PROVISIONING_SECONDS
-            <= provisioning_deadline_seconds
-            <= MAX_PROVISIONING_SECONDS
-            or provisioning_deadline_seconds < allocation_deadline_seconds
-        ):
-            raise ValueError("invalid_provisioning_deadline")
         self.provisioning_deadline_seconds = provisioning_deadline_seconds
-        # ADR 0041 resolved question 4b: an operator setting, an integer 1..4 (bool refused).
-        # Every per-frame invariant holds per frame; the total cap is checked in aggregate with
-        # the insert, and the unseen-run gap grows with the number of frames a pass may read.
-        if (
-            type(max_open_billable_frames) is not int
-            or not 1 <= max_open_billable_frames <= MAX_OPEN_BILLABLE_FRAMES_LIMIT
-        ):
-            raise ValueError("invalid_max_open_billable_frames")
         self.max_open_billable_frames = max_open_billable_frames
         self.unseen_run_gap_seconds = unseen_run_gap_seconds(max_open_billable_frames)
-        if total_cap_cents is not None and (
-            type(total_cap_cents) is not int or not 1 <= total_cap_cents <= 1_000_000
-        ):
-            raise ValueError("invalid_total_cap")
         self.total_cap_cents = total_cap_cents
         # Optional: where the guardian pulls input snapshots from (loopback HTTP or HTTPS).
         self.inputs = (
@@ -1395,12 +1457,21 @@ class SaladSafetyService(ContainerExitWatch):
         before its own accrual passes its hold, so this fires only on an overshoot (a frame's
         accrual past its hold, or a cap lowered across a restart). Then every frame that may
         still bill is fenced and stopped, not only the one that overshot: no frame's accrual
-        can ever be offset against another frame's hold. An unreadable total fails closed."""
+        can ever be offset against another frame's hold.
+
+        An unreadable total still fails closed (every frame that may bill is fenced), but under
+        its own cause ``accounting_unavailable`` (event ``accounting_unavailable``): the cap was
+        not shown to be breached, the service could not read its own accounting, so control may
+        retry the stage within ``retry.infra_retries``. Only a total read and found over the cap
+        is ``total_cap`` (never retried)."""
         try:
             # Outside any transaction, so every frame is accounted up to now first.
             breached = self._committed() > self.total_cap_cents
-        except Exception:
+            cause, kind, detail = "total_cap", "total_cap_breached", str(self.total_cap_cents)
+        except Exception as error:
             breached = True
+            cause, kind = ACCOUNTING_UNAVAILABLE_CAUSE, ACCOUNTING_UNAVAILABLE_CAUSE
+            detail = type(error).__name__  # the exception type name only, never its text
         if not breached:
             return
         for (name,) in self.db.execute("SELECT reservation FROM reservations").fetchall():
@@ -1411,11 +1482,11 @@ class SaladSafetyService(ContainerExitWatch):
                 with self.db:
                     self.db.execute(
                         "INSERT INTO events(reservation,operation,at,kind,detail) "
-                        "VALUES(?,?,?,'total_cap_breached',?)",
-                        (name, row["operation"], self.clock(), str(self.total_cap_cents)),
+                        "VALUES(?,?,?,?,?)",
+                        (name, row["operation"], self.clock(), kind, detail),
                     )
-                    self._frame_note(name, "total_cap_breached", once=True)
-                self._exposure_fence(row, cause="total_cap")
+                    self._frame_note(name, kind, once=True)
+                self._exposure_fence(row, cause=cause)
             except Exception:
                 # Never let one frame's failure skip the others; the next pass retries.
                 self.diagnostic_write_failures += 1
@@ -3776,9 +3847,68 @@ class SafetyHTTPSClient:
             connection.close()
 
 
-def serve(service, server, *, shutdown=lambda: False, unix_listener=None, proxy_uid=None):
+HEALTH_NAME = "salad-guardian"
+HEALTH_INTERVAL_SECONDS = 5.0
+
+
+class GuardianHealth:
+    """Optional health file (the executor's shape, ``tessera.service-health.v1``).
+
+    ``tick`` is called once per serve pass and writes at most once per ``interval`` seconds. A
+    failed write is reported as a closed line and never stops the guardian.
+    """
+
+    def __init__(
+        self, path, *, interval=HEALTH_INTERVAL_SECONDS, wall=time.time, tick=time.monotonic
+    ):
+        self.path, self.interval, self.wall, self.monotonic = Path(path), interval, wall, tick
+        self.started_at = wall()
+        self.loops = 0
+        self.last_loop_at = self.started_at
+        self.consecutive_errors = 0
+        self.last_error_class = None
+        self._last_write = None
+
+    def write(self, state):
+        self._last_write = self.monotonic()
+        try:
+            write_health(
+                self.path,
+                {
+                    "schema": HEALTH_SCHEMA,
+                    "name": HEALTH_NAME,
+                    "pid": os.getpid(),
+                    "state": state,
+                    "started_at": self.started_at,
+                    "last_loop_at": self.last_loop_at,
+                    "loops": self.loops,
+                    "consecutive_errors": self.consecutive_errors,
+                    "last_error_class": self.last_error_class,
+                },
+            )
+        except Exception:  # noqa: BLE001 - a health file never stops the guardian
+            print('{"service":"salad-guardian","action":"health_write_failed"}', file=sys.stderr)
+
+    def tick(self):
+        self.loops += 1
+        self.last_loop_at = self.wall()
+        if self._last_write is None or self.monotonic() - self._last_write >= self.interval:
+            self.write("running")
+
+    def stop(self, error=None):
+        if error is not None:
+            self.consecutive_errors += 1
+            self.last_error_class = type(error).__name__
+        self.write("stopped")
+
+
+def serve(
+    service, server, *, shutdown=lambda: False, unix_listener=None, proxy_uid=None, health=None
+):
     while not shutdown():
         service.loop()
+        if health is not None:
+            health.tick()
         if unix_listener is not None:
             try:
                 connection, _ = unix_listener.accept()
@@ -3810,20 +3940,236 @@ def serve(service, server, *, shutdown=lambda: False, unix_listener=None, proxy_
         server.handle_request()
 
 
+# The closed set of configuration keys: key -> kind. A key outside this table, a missing required
+# key or a value of the wrong type refuses the whole file, so a misspelt setting can never be
+# silently ignored (a typo in ``total_cap_cents`` must not remove the aggregate cap).
+GUARDIAN_CONFIG_REQUIRED = {
+    "state_directory": "path",
+    "credential_directory": "path",
+    "credential_reference": "text",
+    "credential_version": "int",
+    "organization_ids": "organizations",
+    "destination": "text",
+    "listen_host": "text",
+    "listen_port": "port",
+    "tls_certificate": "path",
+    "tls_key": "path",
+    "admin_token_file": "path",
+}
+GUARDIAN_CONFIG_OPTIONAL = {
+    "total_cap_cents": "int",
+    "allocation_deadline_seconds": "int",
+    "provisioning_deadline_seconds": "int",
+    "control_origin": "text",
+    "max_open_billable_frames": "int",
+    "max_prestart_rebinds": "int",
+    "prestart_read_deadline_seconds": "number",
+    "unix_socket": "path",
+    "proxy_uid": "uid",
+}
+# Optional keys whose JSON null means "not set" (the service accepted null for these).
+GUARDIAN_CONFIG_NULLABLE = frozenset(
+    {"total_cap_cents", "provisioning_deadline_seconds", "control_origin", "unix_socket"}
+)
+
+
+class GuardianConfigRefused(ValueError):
+    """The operator's own configuration (arguments, config file, files it names) is refused.
+    The message is closed and names a key or a check, never a value."""
+
+
+def _config_value_ok(kind, value):
+    if kind in {"path", "text"}:
+        return type(value) is str and 0 < len(value) <= 4096 and "\x00" not in value
+    if kind == "int":
+        return type(value) is int
+    if kind == "uid":
+        return type(value) is int and value >= 0
+    if kind == "port":
+        return type(value) is int and 1 <= value <= 65535
+    if kind == "number":
+        return type(value) in {int, float}
+    if kind == "organizations":
+        return (
+            type(value) is dict
+            and bool(value)
+            and all(type(k) is str and type(v) is str and k and v for k, v in value.items())
+        )
+    return False
+
+
+def validate_guardian_config(cfg):
+    """Validate a parsed guardian configuration; return the SaladSafetyService keyword arguments.
+
+    Raises ValueError naming the key (never its value). Pure: no file is touched.
+    """
+    if type(cfg) is not dict:
+        raise ValueError("config_not_an_object")
+    known = {**GUARDIAN_CONFIG_REQUIRED, **GUARDIAN_CONFIG_OPTIONAL}
+    for key in sorted(cfg, key=str):
+        if key not in known:
+            raise ValueError("unknown_config_key: " + str(key)[:64])
+    for key in GUARDIAN_CONFIG_REQUIRED:
+        if key not in cfg:
+            raise ValueError("missing_config_key: " + key)
+    for key, kind in known.items():
+        if key not in cfg or (cfg[key] is None and key in GUARDIAN_CONFIG_NULLABLE):
+            continue
+        if not _config_value_ok(kind, cfg[key]):
+            raise ValueError("invalid_config_value: " + key)
+    if not 1 <= cfg["credential_version"] <= 2**31 - 1:
+        raise ValueError("invalid_config_value: credential_version")
+    try:
+        PrivateFileSecretResolver._name(cfg["credential_reference"])
+    except Exception:
+        raise ValueError("invalid_config_value: credential_reference") from None
+    if cfg.get("control_origin"):
+        try:
+            _origin(cfg["control_origin"])
+        except Exception:
+            raise ValueError("invalid_config_value: control_origin") from None
+    if bool(cfg.get("unix_socket")) != (cfg.get("proxy_uid") is not None):
+        raise ValueError("invalid_config_value: unix_socket_and_proxy_uid_go_together")
+    params = {
+        "allocation_deadline_seconds": cfg.get(
+            "allocation_deadline_seconds", DEFAULT_ALLOCATION_SECONDS
+        ),
+        "provisioning_deadline_seconds": cfg.get("provisioning_deadline_seconds"),
+        "max_open_billable_frames": cfg.get("max_open_billable_frames", 1),
+        "total_cap_cents": cfg.get("total_cap_cents"),
+        "max_prestart_rebinds": cfg.get("max_prestart_rebinds", 3),
+        "prestart_read_deadline_seconds": cfg.get(
+            "prestart_read_deadline_seconds", DEFAULT_PRESTART_READ_DEADLINE_SECONDS
+        ),
+    }
+    try:
+        validate_service_parameters(**params)
+    except ValueError as error:
+        # The setting's own closed message ("invalid_total_cap", ...), never its value.
+        raise ValueError(str(error)) from None
+    return params
+
+
+def _check_state_directory(path):
+    """The directory rules of ``private_database``, without creating or opening any state."""
+    path = Path(path).absolute()
+    for parent in (path, *path.parents):
+        if parent.is_symlink():
+            raise ValueError("unsafe_state_path")
+    info = path.stat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("state_directory_not_private")
+
+
+def _check_socket_directory(socket_path):
+    if not hasattr(socket, "SO_PEERCRED"):
+        raise ValueError("linux_peer_credentials_required")
+    info = Path(socket_path).parent.stat()
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise ValueError("unsafe_socket")
+
+
+def prepare_guardian_startup(config_path):
+    """Everything startup checks about the operator's configuration, without any effect.
+
+    Reads and validates the config file, then runs the non-secret checks on what it names:
+    private mode/owner of the TLS key and the admin token (never read), the certificate file,
+    the state and credential directories and the unix-socket directory. Nothing is created,
+    bound or fetched. Returns (cfg, service keyword arguments, resolver); the caller owns the
+    resolver (an open directory descriptor). Raises GuardianConfigRefused.
+    """
+    try:
+        cfg = strict_json(private_read(config_path, 16384))
+    except (ValueError, OSError):
+        raise GuardianConfigRefused("config_file_unreadable_or_not_strict_json") from None
+    try:
+        params = validate_guardian_config(cfg)
+    except ValueError as error:
+        raise GuardianConfigRefused(str(error)) from None
+    resolver = None
+    try:
+        try:
+            resolver = PrivateFileSecretResolver(cfg["credential_directory"])
+        except (ValueError, OSError):
+            raise GuardianConfigRefused("credential_directory_unusable") from None
+        for key, check in (
+            ("state_directory", _check_state_directory),
+            ("tls_key", private_file_check),
+            ("admin_token_file", lambda path: private_file_check(path, 256)),
+            ("tls_certificate", lambda path: Path(path).stat()),
+        ):
+            try:
+                check(cfg[key])
+            except (ValueError, OSError):
+                raise GuardianConfigRefused("unusable_config_path: " + key) from None
+        if cfg.get("unix_socket"):
+            try:
+                _check_socket_directory(cfg["unix_socket"])
+            except (ValueError, OSError):
+                raise GuardianConfigRefused("unusable_config_path: unix_socket") from None
+    except BaseException:
+        if resolver is not None:
+            resolver.close()
+        raise
+    return cfg, params, resolver
+
+
+def _refused(error):
+    print(str(error), file=sys.stderr)
+    print('{"state":"unavailable","reason":"config_refused"}')
+    return CONFIG_REFUSED
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", action="store_true")
     parser.add_argument("--config")
+    parser.add_argument("--check-config", action="store_true")
+    parser.add_argument("--health-file")
     args = parser.parse_args(argv)
+    if args.check_config:
+        if not args.config:
+            print("config_required", file=sys.stderr)
+            return CONFIG_REFUSED
+        try:
+            _, params, resolver = prepare_guardian_startup(args.config)
+        except GuardianConfigRefused as error:
+            print(str(error), file=sys.stderr)
+            return CONFIG_REFUSED
+        except Exception as error:  # noqa: BLE001 - the check itself failed; class only
+            print("check_failed: " + type(error).__name__, file=sys.stderr)
+            return RUNTIME_FAILURE
+        resolver.close()
+        print(
+            json.dumps(
+                {
+                    "schema": CONFIG_CHECK_SCHEMA,
+                    "program": "salad-guardian",
+                    "status": "ok",
+                    "widths": {"max_open_billable_frames": params["max_open_billable_frames"]},
+                    "notes": [
+                        "jwks_not_fetched",
+                        "key_and_token_contents_not_read",
+                        "state_not_opened",
+                        "listener_not_bound",
+                    ],
+                },
+                separators=(",", ":"),
+            )
+        )
+        return OK
     if not args.run:
         print('{"state":"disabled","effects":0}')
-        return 0
+        return OK
     if not args.config:
-        return 2
-    service = None
+        return CONFIG_REFUSED
+    service = resolver = health = None
+    failure = None
     try:
-        cfg = strict_json(private_read(args.config, 16384))
-        resolver = PrivateFileSecretResolver(cfg["credential_directory"])
+        try:
+            cfg, params, resolver = prepare_guardian_startup(args.config)
+        except GuardianConfigRefused as error:
+            return _refused(error)
         jwt = SaladWorkloadJWT()
         with alarm_budget(2):
             jwt.refresh()  # Explicit run only; fixed public JWKS, never provider effect.
@@ -3835,52 +4181,54 @@ def main(argv=None):
             version=cfg["credential_version"],
             destination=cfg["destination"],
             verifier=jwt,
-            total_cap_cents=cfg.get("total_cap_cents"),
-            allocation_deadline_seconds=cfg.get(
-                "allocation_deadline_seconds", DEFAULT_ALLOCATION_SECONDS
-            ),
-            provisioning_deadline_seconds=cfg.get("provisioning_deadline_seconds"),
             control_origin=cfg.get("control_origin"),
-            max_open_billable_frames=cfg.get("max_open_billable_frames", 1),
-            max_prestart_rebinds=cfg.get("max_prestart_rebinds", 3),
-            prestart_read_deadline_seconds=cfg.get(
-                "prestart_read_deadline_seconds", DEFAULT_PRESTART_READ_DEADLINE_SECONDS
-            ),
+            **params,
         )
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_3
-        private_read(cfg["tls_key"], 16384)
-        context.load_cert_chain(cfg["tls_certificate"], cfg["tls_key"])
+        try:
+            context.load_cert_chain(cfg["tls_certificate"], cfg["tls_key"])
+        except (ssl.SSLError, OSError):
+            return _refused(GuardianConfigRefused("unusable_config_path: tls_certificate_or_key"))
         token = private_read(cfg["admin_token_file"], 256).strip()
         server = SafetyHTTPServer(
             (cfg["listen_host"], cfg["listen_port"]), service, token, context=context
         )
         listener = None
         if cfg.get("unix_socket"):
-            if not hasattr(socket, "SO_PEERCRED"):
-                raise ValueError("linux_peer_credentials_required")
             socket_path = Path(cfg["unix_socket"])
-            info = socket_path.parent.stat()
-            if (
-                info.st_uid != os.getuid()
-                or stat.S_IMODE(info.st_mode) != 0o700
-                or socket_path.exists()
-            ):
+            # A stale socket left by a crash is a runtime failure (an operator removes it).
+            if socket_path.exists():
                 raise ValueError("unsafe_socket")
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             listener.bind(str(socket_path))
             os.chmod(socket_path, 0o600)
             listener.listen(8)
             listener.settimeout(0.01)
-        serve(service, server, unix_listener=listener, proxy_uid=cfg.get("proxy_uid"))
+        if args.health_file:
+            health = GuardianHealth(args.health_file)
+            health.write("running")
+        serve(
+            service,
+            server,
+            unix_listener=listener,
+            proxy_uid=cfg.get("proxy_uid"),
+            health=health,
+        )
+        return OK
     except KeyboardInterrupt:
-        return 0
-    except Exception:
+        return OK
+    except Exception as error:
+        failure = error
         print('{"state":"unavailable","reason":"service_prerequisite_or_runtime_failure"}')
-        return 2
+        return RUNTIME_FAILURE
     finally:
+        if health is not None:
+            health.stop(failure)
         if service:
             service.close()
+        if resolver is not None:
+            resolver.close()
 
 
 if __name__ == "__main__":

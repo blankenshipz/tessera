@@ -601,3 +601,12 @@ def configure_providers(config: dict[str, Any] | None) -> None:
     for name, section_ in sorted(((config or {}).get("plugins") or {}).items()):
         load_plugin(name, section_)
     campaign_placement_preference.configure(section, provider_ids())
+    _CONFIGURED.append(True)
+
+
+_CONFIGURED: list[bool] = []
+
+
+def providers_configured() -> bool:
+    """True once ``configure_providers`` has completed in this process (in-memory read)."""
+    return bool(_CONFIGURED)

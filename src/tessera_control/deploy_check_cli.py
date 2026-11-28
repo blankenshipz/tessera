@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 from . import deploy_check
 from .deploy_check import Finding
+from .startup_checks import StartupCheck
 
 AUTOMATIC_FIXES = ("drop_removed_keys", "refresh_source_pin", "migrate")
 
@@ -21,8 +24,11 @@ def add_parser(subcommands: argparse._SubParsersAction) -> None:
         description=(
             "Read-only unless --apply names a fix. Checks the control database schema, the backup "
             "size bound, executor and live-check config keys a release removed, the providers file "
-            "and the executor's profiles, and (with --smoke) runs a synthetic networkless CPU "
-            "container. Nothing here reads a secret, contacts a provider or spends anything."
+            "and the executor's profiles, re-reads stored non-terminal campaigns with this "
+            "release, runs each named service's own --check-config under this release, and "
+            "(with --smoke) runs "
+            "a synthetic networkless CPU container. Nothing here reads a secret, contacts a "
+            "provider or spends anything."
         ),
     )
     command.add_argument("--state-dir", type=Path, help="control state directory (schema, backup)")
@@ -33,6 +39,25 @@ def add_parser(subcommands: argparse._SubParsersAction) -> None:
         "--live-config", type=Path, action="append", default=[], help="absolute; repeatable"
     )
     command.add_argument("--providers-file", type=Path, help="absolute operator providers file")
+    command.add_argument(
+        "--serve-args",
+        help=(
+            "the exact arguments the control unit passes to tessera serve, as one shell-quoted "
+            "string: runs tessera serve --check-config with them under this release (ADR 0214)"
+        ),
+    )
+    command.add_argument(
+        "--executor-args",
+        action="append",
+        default=[],
+        help="a Salad executor unit's arguments (one shell-quoted string); repeatable",
+    )
+    command.add_argument(
+        "--guardian-args",
+        action="append",
+        default=[],
+        help="a Salad guardian unit's arguments (one shell-quoted string); repeatable",
+    )
     command.add_argument(
         "--guardian-status-file",
         type=Path,
@@ -78,14 +103,29 @@ def gather(
     max_backup_bytes: int | None,
     smoke: bool,
     guardian_status_file: Path | None = None,
+    startup_checks: Sequence[StartupCheck] = (),
 ) -> list[Finding]:
-    """Every check for the areas given, in a stable order (shared with ``deploy-upgrade``)."""
-    from . import deploy_config, deploy_smoke, deploy_state
+    """Every check for the areas given, in a stable order (shared with ``deploy-upgrade``).
+
+    ``startup_checks`` run each service's own ``--check-config`` under this release (ADR 0214);
+    with a state directory, the stored non-terminal campaigns and attempts are re-read with this
+    release's parsers (read-only)."""
+    from . import (
+        deploy_config,
+        deploy_smoke,
+        deploy_state,
+        deploy_stored_state,
+    )
+    from . import (
+        startup_checks as sc,
+    )
 
     findings: list[Finding] = []
     if state_dir is not None:
         findings.append(deploy_state.check_schema(state_dir))
         findings.append(deploy_state.check_backup_cap(state_dir, max_backup_bytes))
+        findings.extend(deploy_stored_state.check_stored_state(state_dir))
+    findings.extend(sc.check_all(list(startup_checks)))
     for index, path in enumerate([*executor_configs, *live_configs], start=1):
         findings.extend(deploy_config.check_config(path, label=str(index)))
     if providers_file is not None:
@@ -94,6 +134,21 @@ def gather(
         findings.extend(deploy_state.check_executor_profiles(path))
     findings.append(deploy_smoke.run_smoke() if smoke else deploy_smoke.smoke_skipped())
     return findings
+
+
+def startup_checks_from(arguments: argparse.Namespace) -> list[StartupCheck]:
+    """The ``--serve-args``/``--executor-args``/``--guardian-args`` strings as checks."""
+    checks: list[StartupCheck] = []
+    try:
+        if arguments.serve_args is not None:
+            checks.append(StartupCheck("serve", tuple(shlex.split(arguments.serve_args))))
+        for value in arguments.executor_args:
+            checks.append(StartupCheck("salad-executor", tuple(shlex.split(value))))
+        for value in arguments.guardian_args:
+            checks.append(StartupCheck("salad-guardian", tuple(shlex.split(value))))
+    except ValueError as error:
+        raise ValueError(f"startup arguments: {error}") from None
+    return checks
 
 
 def _gather(arguments: argparse.Namespace) -> list[Finding]:
@@ -105,6 +160,7 @@ def _gather(arguments: argparse.Namespace) -> list[Finding]:
         max_backup_bytes=arguments.max_backup_bytes,
         smoke=arguments.smoke,
         guardian_status_file=arguments.guardian_status_file,
+        startup_checks=startup_checks_from(arguments),
     )
 
 
@@ -173,6 +229,7 @@ def run(arguments: argparse.Namespace) -> int:
         # Everything that can refuse is checked before any fix changes anything.
         if arguments.report_file is not None:
             deploy_check.require_report_path(arguments.report_file)
+        startup_checks_from(arguments)  # a malformed argument string refuses before any fix
         if arguments.apply:
             if arguments.receipt_dir is None:
                 raise ValueError("--apply needs --receipt-dir (an existing absolute directory).")

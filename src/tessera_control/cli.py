@@ -10,12 +10,13 @@ import stat
 import sys
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 import uvicorn
 
-from . import maintenance_lock
+from . import exit_codes, maintenance_lock
 from .api import create_app
 from .deployment import serving_config
 from .recovery import backup_state, restore_state
@@ -289,6 +290,16 @@ def _add_campaign_commands(subcommands: argparse._SubParsersAction) -> None:
         "--dry-run", action="store_true", help="list each unknown attempt's verdict; change nothing"
     )
     common(unclaimed, mutating=True, label=True, optional_key=True)
+    retryable = actions.add_parser(
+        "reconcile-retryable",
+        help="a person's reconcile of an unknown Salad attempt as retryable infrastructure: "
+        "settled at the guardian's bound (never an amount you name), refused unless the "
+        "guardian closed the frame and no output was kept; the stage retries within "
+        "retry.infra_retries",
+    )
+    retryable.add_argument("--grant-id", required=True)
+    retryable.add_argument("--expected-revision", type=int, required=True)
+    common(retryable, mutating=True)
     _add_standing_commands(actions, common)
 
 
@@ -548,6 +559,10 @@ def run_campaign(arguments: argparse.Namespace, transport_factory=None) -> int:
             )
             body = approve_payload(body)
             call = ("POST", f"/campaigns/{campaign}/approve", body, key)
+        elif action == "reconcile-retryable":
+            grant = quote(arguments.grant_id, safe="")
+            body = {"expected_revision": arguments.expected_revision}
+            call = ("POST", f"/execution-grants/{grant}/reconcile-retryable-salad", body, key)
         elif action == "cancel":
             body = CancelCampaign(
                 expected_revision=arguments.expected_revision, reason=arguments.reason
@@ -676,6 +691,14 @@ def parser() -> argparse.ArgumentParser:
     )
     serve = subcommands.add_parser("serve")
     serve.add_argument("--state-dir", required=True, type=Path)
+    serve.add_argument(
+        "--check-config",
+        action="store_true",
+        help=(
+            "run the startup validation of the operator's files and arguments, print one JSON "
+            "line and exit (0 ok, 2 refused, 1 check failed); binds nothing and writes no state"
+        ),
+    )
     serve.add_argument("--port", required=True, type=int, choices=range(1, 65_536))
     serve.add_argument("--bind-host", default="127.0.0.1")
     serve.add_argument("--trusted-host", action="append")
@@ -703,8 +726,9 @@ def parser() -> argparse.ArgumentParser:
         default=2,
         metavar="0-10",
         help=(
-            "automatic zero reconciles per campaign of unknown attempts whose provider proves "
-            "no create was claimed, 0 disables (default 2; ADR 0157)"
+            "automatic zero reconciles per stage of unknown attempts whose provider proves "
+            "no create was claimed; a campaign may apply this times its stage count, 0 "
+            "disables (default 2; ADR 0157, ADR 0216)"
         ),
     )
     serve.add_argument(
@@ -1240,6 +1264,297 @@ def _run_astra_namespace(arguments: argparse.Namespace) -> int:
         return 1
 
 
+class _ServeStop(Exception):
+    """Startup validation ended the serve command: print already done, exit with ``code``."""
+
+    def __init__(self, code: int) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass
+class _ServeSetup:
+    deployment: Any
+    remotes_file: Path | None
+    review_tiers: Any
+    review_destinations: Any
+    runner_interval: float | None
+    trust_policy: Any
+    sandbox_backend: Any
+    monitor_service: Any
+    owner: Any
+    adapter: Any
+    notes: list[str]
+
+
+def _check_agent_sandbox_config(config_reference: Path | None, approved_sha256: str | None) -> None:
+    """The pure part of ``load_agent_sandbox_backend``: both inputs, the digest and the schema.
+
+    The token reference and the authenticated witness (a network call) are not touched."""
+    import hashlib
+
+    from .agent_sandbox_configuration import SandboxOperatorConfig, private_bytes
+
+    try:
+        if not config_reference or not approved_sha256:
+            raise ValueError("config and its approval digest are both required")
+        encoded = private_bytes(config_reference, 128 * 1024)
+        if hashlib.sha256(encoded).hexdigest() != approved_sha256:
+            raise ValueError("operator config digest mismatch")
+        SandboxOperatorConfig.model_validate_json(encoded)
+    except Exception:
+        raise ValueError(
+            "Sandbox operator configuration or authenticated witness rejected"
+        ) from None
+
+
+def _serve_startup(arguments: argparse.Namespace, *, check_only: bool) -> _ServeSetup:
+    """The serve startup validation, in order; real start and ``--check-config`` share it.
+
+    Prints the refusal and raises ``_ServeStop(code)`` when startup must not go on. With
+    ``check_only`` the steps that act on the world (the runtime owner, the monitor service,
+    the sandbox witness) are not run; everything that only reads and validates is."""
+    notes: list[str] = []
+    try:
+        require_sqlite_runtime()
+    except StoreError as error:
+        print(f"serve failed: {error}", file=sys.stderr)
+        raise _ServeStop(exit_codes.RUNTIME_FAILURE) from None
+    owner = None
+    monitor_service = None
+    if not 0.2 <= arguments.campaign_tick_seconds <= 60:
+        print("serve configuration error: --campaign-tick-seconds is 0.2-60", file=sys.stderr)
+        raise _ServeStop(exit_codes.CONFIG_REFUSED)
+    remotes_file = arguments.code_review_git_remotes
+    if remotes_file is None and os.environ.get("TESSERA_CODE_REVIEW_GIT_REMOTES"):
+        remotes_file = Path(os.environ["TESSERA_CODE_REVIEW_GIT_REMOTES"])
+    if remotes_file is not None:
+        from .code_review_git import load_git_remotes
+
+        try:
+            load_git_remotes(remotes_file)
+        except (ValueError, OSError):
+            print(
+                "serve configuration error: code review git remotes file is unreadable "
+                "or malformed",
+                file=sys.stderr,
+            )
+            raise _ServeStop(exit_codes.CONFIG_REFUSED) from None
+    tiers_file = arguments.review_tiers
+    if tiers_file is None and os.environ.get("TESSERA_REVIEW_TIERS"):
+        tiers_file = Path(os.environ["TESSERA_REVIEW_TIERS"])
+    review_tiers = None
+    if tiers_file is not None:
+        from .review_tiers import load_review_tiers
+
+        try:
+            review_tiers = load_review_tiers(tiers_file)
+        except (ValueError, OSError):
+            print(
+                "serve configuration error: review tiers file is unreadable or malformed",
+                file=sys.stderr,
+            )
+            raise _ServeStop(exit_codes.CONFIG_REFUSED) from None
+    runner_interval = None if arguments.no_campaign_runner else arguments.campaign_tick_seconds
+    if arguments.agent_submissions and arguments.agent_submission_kill_switch is None:
+        print(
+            "serve configuration error: --agent-submissions needs --agent-submission-kill-switch",
+            file=sys.stderr,
+        )
+        raise _ServeStop(exit_codes.CONFIG_REFUSED)
+    try:
+        deployment = serving_config(
+            arguments.bind_host, arguments.trusted_host, arguments.public_origin
+        )
+        from .review_destination_policy import (
+            ENVIRONMENT_VARIABLE,
+            load_review_destination_policy,
+        )
+
+        # Like the trust file below: a refused file is a ValueError, so serve exits 2.
+        review_destinations_file = arguments.review_destinations
+        if review_destinations_file is None and os.environ.get(ENVIRONMENT_VARIABLE):
+            review_destinations_file = Path(os.environ[ENVIRONMENT_VARIABLE])
+        review_destinations = (
+            load_review_destination_policy(review_destinations_file)
+            if review_destinations_file is not None
+            else None
+        )
+        from . import operator_config_freshness
+
+        if arguments.salad_executor_config is not None and (
+            not arguments.salad_executor_config.is_absolute()
+        ):
+            raise ValueError("--salad-executor-config must be an absolute path")
+        # Fingerprint before loading: a file edited after this point is loaded as the
+        # new bytes but compared with the old digest, so a later launch refuses.
+        # A launch refuses when any of these files changes before the next start.
+        # (In memory only: digests of the files, nothing is written.)
+        operator_config_freshness.record(
+            [
+                arguments.campaign_providers,
+                arguments.salad_campaign_profiles,
+                arguments.provider_trust,
+            ],
+            executor_config=arguments.salad_executor_config,
+        )
+        from .provider_trust import builtin_policy, load_policy_file
+
+        # A symlink, foreign owner, group/world-writable or malformed file is a
+        # TrustPolicyRefused (a ValueError): serve exits 2 below.
+        trust_policy = (
+            load_policy_file(arguments.provider_trust)
+            if arguments.provider_trust is not None
+            else builtin_policy()
+        )
+        from .campaign_providers import configure_providers, load_providers_file
+
+        provider_config = (
+            load_providers_file(arguments.campaign_providers)
+            if arguments.campaign_providers is not None
+            else {}
+        )
+        if arguments.salad_campaign_profiles is not None:
+            if provider_config.get("salad_profiles") is not None:
+                raise ValueError(
+                    "salad profiles come from either --campaign-providers or "
+                    "--salad-campaign-profiles, not both"
+                )
+            from .salad_campaign_profiles import load_profiles
+
+            provider_config["salad_profiles"] = load_profiles(
+                arguments.salad_campaign_profiles
+            ).model_dump(mode="json", by_alias=True)
+        if arguments.salad_guardian_read is not None:
+            if provider_config.get("salad_guardian_read") is not None:
+                raise ValueError(
+                    "the guardian read config comes from either --campaign-providers or "
+                    "--salad-guardian-read, not both"
+                )
+            if not arguments.salad_guardian_read.is_absolute():
+                raise ValueError("--salad-guardian-read must be an absolute path")
+            provider_config["salad_guardian_read"] = str(arguments.salad_guardian_read)
+        if arguments.salad_credential_directory is not None:
+            if provider_config.get("salad_credential_directory") is not None:
+                raise ValueError(
+                    "the salad credential directory comes from either --campaign-providers "
+                    "or --salad-credential-directory, not both"
+                )
+            if not arguments.salad_credential_directory.is_absolute():
+                raise ValueError("--salad-credential-directory must be an absolute path")
+            provider_config["salad_credential_directory"] = str(
+                arguments.salad_credential_directory
+            )
+        configure_providers(provider_config or None)
+        from . import program_budget
+        from .campaign_gates import configure_go_authority
+
+        configure_go_authority(accept_automation_labelled=bool(arguments.accept_automation_gate_go))
+        program_budget.configure(
+            program_budget.load_program_budget_file(arguments.program_budget)
+            if arguments.program_budget is not None
+            else None
+        )
+        sandbox_backend = None
+        if arguments.agent_sandbox_config is not None or arguments.agent_sandbox_sha256:
+            if check_only:
+                _check_agent_sandbox_config(
+                    arguments.agent_sandbox_config, arguments.agent_sandbox_sha256
+                )
+                notes.append("agent sandbox witness not exercised")
+            else:
+                from .agent_sandbox_configuration import load_agent_sandbox_backend
+
+                sandbox_backend = load_agent_sandbox_backend(
+                    arguments.agent_sandbox_config, arguments.agent_sandbox_sha256
+                )
+        if arguments.monitor_enrollments is not None:
+            from .monitor_service import MonitorService, load_enrollments
+
+            # Refuse a malformed file before any effect; start() re-validates it.
+            load_enrollments(arguments.monitor_enrollments)
+            if check_only:
+                notes.append("monitor listener not constructed")
+            else:
+                monitor_service = MonitorService(arguments.monitor_enrollments, arguments.state_dir)
+        adapter = None
+        if arguments.runtime_owner_config is not None or arguments.runtime_owner_sha256:
+            if check_only:
+                # Opening the owner executes its adapter and takes its resources.
+                notes.append("runtime owner config not exercised")
+            else:
+                from .runtime_composition import load_runtime_owner
+
+                owner = load_runtime_owner(
+                    arguments.runtime_owner_config,
+                    arguments.runtime_owner_sha256,
+                    state_dir=arguments.state_dir,
+                )
+                adapter = owner.control_adapter()
+    except ValueError as error:
+        print(f"serve configuration error: {error}", file=sys.stderr)
+        raise _ServeStop(exit_codes.CONFIG_REFUSED) from None
+    except Exception:
+        if owner is not None:
+            try:
+                owner.close()
+            except Exception:
+                pass
+        if check_only:
+            print("serve configuration check failed", file=sys.stderr)
+            raise _ServeStop(exit_codes.RUNTIME_FAILURE) from None
+        print("serve runtime owner configuration blocked", file=sys.stderr)
+        raise _ServeStop(78) from None
+    return _ServeSetup(
+        deployment,
+        remotes_file,
+        review_tiers,
+        review_destinations,
+        runner_interval,
+        trust_policy,
+        sandbox_backend,
+        monitor_service,
+        owner,
+        adapter,
+        notes,
+    )
+
+
+def _salad_route_width() -> int | None:
+    """The route width control's registered Salad provider will use (None: unbounded)."""
+    from .campaign_provider_salad import PROVIDER_ID
+    from .campaign_providers import get_provider
+
+    try:
+        width = get_provider(PROVIDER_ID).route_width  # type: ignore[attr-defined]
+    except (KeyError, AttributeError):
+        return None
+    return width
+
+
+def _serve_check_config(arguments: argparse.Namespace) -> int:
+    try:
+        setup = _serve_startup(arguments, check_only=True)
+        width = _salad_route_width()
+    except _ServeStop as stop:
+        return stop.code
+    except Exception:
+        print("serve configuration check failed", file=sys.stderr)
+        return exit_codes.RUNTIME_FAILURE
+    print(
+        json.dumps(
+            {
+                "schema": exit_codes.CONFIG_CHECK_SCHEMA,
+                "program": "serve",
+                "status": "ok",
+                "widths": {"salad_max_concurrent_routes": width},
+                "notes": setup.notes,
+            }
+        )
+    )
+    return exit_codes.OK
+
+
 def main(argv: list[str] | None = None) -> int:
     words = sys.argv[1:] if argv is None else argv
     if words[:1] == ["credentials"]:
@@ -1412,183 +1727,22 @@ def main(argv: list[str] | None = None) -> int:
         print(header_path)
         return 0
     if arguments.command == "serve":
+        if arguments.check_config:
+            return _serve_check_config(arguments)
         try:
-            require_sqlite_runtime()
-        except StoreError as error:
-            print(f"serve failed: {error}", file=sys.stderr)
-            return 1
-        owner = None
-        monitor_service = None
-        if not 0.2 <= arguments.campaign_tick_seconds <= 60:
-            print("serve configuration error: --campaign-tick-seconds is 0.2-60", file=sys.stderr)
-            return 2
-        remotes_file = arguments.code_review_git_remotes
-        if remotes_file is None and os.environ.get("TESSERA_CODE_REVIEW_GIT_REMOTES"):
-            remotes_file = Path(os.environ["TESSERA_CODE_REVIEW_GIT_REMOTES"])
-        if remotes_file is not None:
-            from .code_review_git import load_git_remotes
-
-            try:
-                load_git_remotes(remotes_file)
-            except (ValueError, OSError):
-                print(
-                    "serve configuration error: code review git remotes file is unreadable "
-                    "or malformed",
-                    file=sys.stderr,
-                )
-                return 2
-        tiers_file = arguments.review_tiers
-        if tiers_file is None and os.environ.get("TESSERA_REVIEW_TIERS"):
-            tiers_file = Path(os.environ["TESSERA_REVIEW_TIERS"])
-        review_tiers = None
-        if tiers_file is not None:
-            from .review_tiers import load_review_tiers
-
-            try:
-                review_tiers = load_review_tiers(tiers_file)
-            except (ValueError, OSError):
-                print(
-                    "serve configuration error: review tiers file is unreadable or malformed",
-                    file=sys.stderr,
-                )
-                return 2
-        runner_interval = None if arguments.no_campaign_runner else arguments.campaign_tick_seconds
-        if arguments.agent_submissions and arguments.agent_submission_kill_switch is None:
-            print(
-                "serve configuration error: --agent-submissions needs "
-                "--agent-submission-kill-switch",
-                file=sys.stderr,
-            )
-            return 2
-        try:
-            deployment = serving_config(
-                arguments.bind_host, arguments.trusted_host, arguments.public_origin
-            )
-            from .review_destination_policy import (
-                ENVIRONMENT_VARIABLE,
-                load_review_destination_policy,
-            )
-
-            # Like the trust file below: a refused file is a ValueError, so serve exits 2.
-            review_destinations_file = arguments.review_destinations
-            if review_destinations_file is None and os.environ.get(ENVIRONMENT_VARIABLE):
-                review_destinations_file = Path(os.environ[ENVIRONMENT_VARIABLE])
-            review_destinations = (
-                load_review_destination_policy(review_destinations_file)
-                if review_destinations_file is not None
-                else None
-            )
-            from . import operator_config_freshness
-
-            if arguments.salad_executor_config is not None and (
-                not arguments.salad_executor_config.is_absolute()
-            ):
-                raise ValueError("--salad-executor-config must be an absolute path")
-            # Fingerprint before loading: a file edited after this point is loaded as the
-            # new bytes but compared with the old digest, so a later launch refuses.
-            # A launch refuses when any of these files changes before the next start.
-            operator_config_freshness.record(
-                [
-                    arguments.campaign_providers,
-                    arguments.salad_campaign_profiles,
-                    arguments.provider_trust,
-                ],
-                executor_config=arguments.salad_executor_config,
-            )
-            from .provider_trust import builtin_policy, load_policy_file
-
-            # A symlink, foreign owner, group/world-writable or malformed file is a
-            # TrustPolicyRefused (a ValueError): serve exits 2 below.
-            trust_policy = (
-                load_policy_file(arguments.provider_trust)
-                if arguments.provider_trust is not None
-                else builtin_policy()
-            )
-            from .campaign_providers import configure_providers, load_providers_file
-
-            provider_config = (
-                load_providers_file(arguments.campaign_providers)
-                if arguments.campaign_providers is not None
-                else {}
-            )
-            if arguments.salad_campaign_profiles is not None:
-                if provider_config.get("salad_profiles") is not None:
-                    raise ValueError(
-                        "salad profiles come from either --campaign-providers or "
-                        "--salad-campaign-profiles, not both"
-                    )
-                from .salad_campaign_profiles import load_profiles
-
-                provider_config["salad_profiles"] = load_profiles(
-                    arguments.salad_campaign_profiles
-                ).model_dump(mode="json", by_alias=True)
-            if arguments.salad_guardian_read is not None:
-                if provider_config.get("salad_guardian_read") is not None:
-                    raise ValueError(
-                        "the guardian read config comes from either --campaign-providers or "
-                        "--salad-guardian-read, not both"
-                    )
-                if not arguments.salad_guardian_read.is_absolute():
-                    raise ValueError("--salad-guardian-read must be an absolute path")
-                provider_config["salad_guardian_read"] = str(arguments.salad_guardian_read)
-            if arguments.salad_credential_directory is not None:
-                if provider_config.get("salad_credential_directory") is not None:
-                    raise ValueError(
-                        "the salad credential directory comes from either --campaign-providers "
-                        "or --salad-credential-directory, not both"
-                    )
-                if not arguments.salad_credential_directory.is_absolute():
-                    raise ValueError("--salad-credential-directory must be an absolute path")
-                provider_config["salad_credential_directory"] = str(
-                    arguments.salad_credential_directory
-                )
-            configure_providers(provider_config or None)
-            from . import program_budget
-            from .campaign_gates import configure_go_authority
-
-            configure_go_authority(
-                accept_automation_labelled=bool(arguments.accept_automation_gate_go)
-            )
-            program_budget.configure(
-                program_budget.load_program_budget_file(arguments.program_budget)
-                if arguments.program_budget is not None
-                else None
-            )
-            sandbox_backend = None
-            if arguments.agent_sandbox_config is not None or arguments.agent_sandbox_sha256:
-                from .agent_sandbox_configuration import load_agent_sandbox_backend
-
-                sandbox_backend = load_agent_sandbox_backend(
-                    arguments.agent_sandbox_config, arguments.agent_sandbox_sha256
-                )
-            if arguments.monitor_enrollments is not None:
-                from .monitor_service import MonitorService, load_enrollments
-
-                # Refuse a malformed file before any effect; start() re-validates it.
-                load_enrollments(arguments.monitor_enrollments)
-                monitor_service = MonitorService(arguments.monitor_enrollments, arguments.state_dir)
-            if arguments.runtime_owner_config is not None or arguments.runtime_owner_sha256:
-                from .runtime_composition import load_runtime_owner
-
-                owner = load_runtime_owner(
-                    arguments.runtime_owner_config,
-                    arguments.runtime_owner_sha256,
-                    state_dir=arguments.state_dir,
-                )
-                adapter = owner.control_adapter()
-            else:
-                adapter = None
-        except ValueError as error:
-            print(f"serve configuration error: {error}", file=sys.stderr)
-            return 2
-        except Exception:
-            if owner is not None:
-                try:
-                    owner.close()
-                except Exception:
-                    pass
-            print("serve runtime owner configuration blocked", file=sys.stderr)
-            return 78
+            setup = _serve_startup(arguments, check_only=False)
+        except _ServeStop as stop:
+            return stop.code
+        deployment = setup.deployment
+        remotes_file = setup.remotes_file
+        review_tiers = setup.review_tiers
+        review_destinations = setup.review_destinations
+        runner_interval = setup.runner_interval
+        trust_policy = setup.trust_policy
+        sandbox_backend = setup.sandbox_backend
+        monitor_service = setup.monitor_service
+        owner = setup.owner
+        adapter = setup.adapter
         cleanup_failed = False
 
         def close_owner():
@@ -1625,6 +1779,7 @@ def main(argv: list[str] | None = None) -> int:
             # The state is initialized and current (create_app checked it): audit the load.
             record_at_start(_database_path(arguments.state_dir), trust_policy)
             app.state.provider_trust_path = arguments.provider_trust
+            app.state.providers_required = True
             if review_tiers is not None:
                 app.state.review_jobs.tiers = review_tiers
             from .campaign_submissions import AgentSubmissionConfig
@@ -1697,3 +1852,7 @@ def main(argv: list[str] | None = None) -> int:
             close_owner()
         return 78 if cleanup_failed else 0
     raise AssertionError("unreachable")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

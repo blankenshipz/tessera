@@ -1,7 +1,8 @@
 """Operator recovery of unknown attempts that provably claimed no provider create (ADR 0205).
 
 The runner reconciles such an attempt on its own (ADR 0157), at most
-``--campaign-unclaimed-autoreconcile-limit`` times per campaign; past that, or for an attempt
+``--campaign-unclaimed-autoreconcile-limit`` times per stage (and that times the stage count per
+campaign, ADR 0216); past that, or for an attempt
 that became ``unknown`` under an earlier build, the campaign stays ``blocked``. The operator
 route for the grant (``reconcile-unclaimed-salad``) releases the hold, but the runner then
 settles the attempt ``failed_permanent``, which ends the stage.

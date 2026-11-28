@@ -37,14 +37,16 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from . import deploy_check, deploy_check_cli, deploy_services, deploy_state, recovery
 from . import deploy_config as config_fixes
 from .migrations import LATEST_SCHEMA_VERSION
-from .store import DATABASE_NAME
+from .startup_checks import StartupCheck
+from .store import DATABASE_NAME, _parse_utc
 
 RECEIPT_SCHEMA = "tessera.deploy-receipt.v1"
 # Fixes this command makes itself; every other failing check blocks the upgrade.
@@ -184,6 +186,13 @@ def preflight(plan: Any, *, smoke: bool) -> tuple[list[deploy_check.Finding], li
         providers_file=None if plan.providers_file is None else Path(plan.providers_file),
         max_backup_bytes=plan.max_backup_bytes,
         smoke=smoke,
+        # Each service's own ``--check-config`` under this release; after the install the same
+        # checks validate the installed release (the smoke pass calls this again).
+        startup_checks=[
+            StartupCheck(s.config_check.program, tuple(s.config_check.args))
+            for s in getattr(plan, "services", ())
+            if s.config_check
+        ],
     )
     # The pin is refreshed only with the plan's commit; without one a stale pin blocks.
     fixed = SELF_FIXED if plan.source_revision is not None else SELF_FIXED - {"refresh_source_pin"}
@@ -493,30 +502,154 @@ def _service_rows(results: list[deploy_services.StepResult]) -> list[dict[str, A
     ]
 
 
-def executing_salad_attempts(state_dir: Path) -> int:
-    """How many Salad campaign attempts are ``executing`` in the plan's state (a read-only
-    read; 0 when there is no database or no Salad table yet).
+# Phases of a started, unfinished provider route (``route_started`` is the executor's
+# launch-pending state; ``executing`` has a running child).
+ROUTE_HOLDING_PHASES = ("route_started", "executing")
+# Phases in which the attempt holds an execution lease the executor must keep renewing
+# (the executor's LEASE_HELD_PHASES plus the two route phases).
+LEASE_HOLDING_PHASES = (
+    "leased",
+    "awaiting_review",
+    "reviewed",
+    "capability_ready",
+    "route_proposed",
+    "route_started",
+    "executing",
+)
 
-    Restarting the Salad executor while a route's child runs loses that run by design: after a
-    restart the executor finishes only from a receipt already on disk (ADR 0160), so the attempt
-    ends ``unknown`` and the campaign blocks. A restart while stages are only reserved,
-    preparing or queued (``route_started``) is safe (v0.104.0)."""
+_ROUTE_SQL = (
+    "SELECT COUNT(*) FROM campaign_salad_attempts WHERE phase IN ("
+    + ",".join(f"'{p}'" for p in ROUTE_HOLDING_PHASES)
+    + ")"
+)
+# A lease is held when a Salad attempt in a lease-holding phase names it and its grant is
+# still unresolved. Leases are never deleted or flagged released; the grant status and the
+# lease's own expires_at are what say whether it is live.
+_LEASE_SQL = (
+    "SELECT l.expires_at FROM campaign_salad_attempts a "
+    "JOIN execution_leases l ON l.id = a.lease_id "
+    "JOIN execution_grants g ON g.id = l.grant_id "
+    "WHERE a.phase IN ("
+    + ",".join(f"'{p}'" for p in LEASE_HOLDING_PHASES)
+    + ") AND g.status IN ('active','cancel_requested')"
+)
+
+
+@dataclass(frozen=True)
+class LeaseSnapshot:
+    """A read-only picture of what an executor stop would interrupt."""
+
+    executing: int = 0
+    route_holding: int = 0
+    lease_holding: int = 0
+    leases_lapsing: int = 0
+    unreadable: bool = False
+    notes: tuple[str, ...] = field(default_factory=tuple)
+
+
+def salad_lease_snapshot(state_dir: Path, *, now: datetime, downtime_seconds: int) -> LeaseSnapshot:
+    """Count the Salad attempts a stop would hurt, read-only (``mode=ro``).
+
+    * ``executing``: attempts in phase ``executing`` (a restart loses the run, ADR 0160).
+    * ``route_holding``: ``ROUTE_HOLDING_PHASES`` (a started route not yet ended).
+    * ``lease_holding``: attempts in ``LEASE_HOLDING_PHASES`` whose execution lease is live
+      (``expires_at`` in the future, grant active or cancel_requested).
+    * ``leases_lapsing``: live leases with ``expires_at <= now + downtime_seconds``. The
+      executor renews them and a stopped executor cannot, so each lapses during the stop.
+
+    A missing database file is zero; a missing table (an older schema) is no data, noted; any
+    other failure to read is ``unreadable`` (a blocking finding), never zero."""
     database = Path(state_dir) / DATABASE_NAME
     if not database.exists():
-        return 0
+        return LeaseSnapshot()
     try:
         connection = sqlite3.connect(database.absolute().as_uri() + "?mode=ro", uri=True, timeout=5)
     except sqlite3.Error:
-        return 0
+        return LeaseSnapshot(unreadable=True)
     try:
-        row = connection.execute(
+        executing = connection.execute(
             "SELECT COUNT(*) FROM campaign_salad_attempts WHERE phase='executing'"
-        ).fetchone()
+        ).fetchone()[0]
+        routes = connection.execute(_ROUTE_SQL).fetchone()[0]
+        expiries = [row[0] for row in connection.execute(_LEASE_SQL)]
+    except sqlite3.OperationalError as error:
+        if "no such table" in str(error) or "no such column" in str(error):
+            return LeaseSnapshot(notes=("no Salad lease tables in this schema: nothing to count",))
+        return LeaseSnapshot(unreadable=True)
     except sqlite3.Error:
-        return 0
+        return LeaseSnapshot(unreadable=True)
     finally:
         connection.close()
-    return int(row[0]) if row else 0
+    horizon = now + timedelta(seconds=downtime_seconds)
+    held = 0
+    lapsing = 0
+    for value in expiries:
+        try:
+            expiry = _parse_utc(value)
+        except (TypeError, ValueError):
+            held += 1  # an unreadable expiry cannot be called safe
+            lapsing += 1
+            continue
+        if expiry <= now:
+            continue  # already lapsed: nothing a stop can make worse
+        held += 1
+        if expiry <= horizon:
+            lapsing += 1
+    return LeaseSnapshot(int(executing), int(routes), held, lapsing)
+
+
+def executing_salad_attempts(state_dir: Path) -> int:
+    """How many Salad campaign attempts are ``executing`` (0 when there is no database)."""
+    return salad_lease_snapshot(state_dir, now=datetime.now(UTC), downtime_seconds=0).executing
+
+
+def lease_guard(
+    plan: Any,
+    now: datetime,
+    *,
+    allow_executing_salad: bool,
+    allow_lease_lapse: bool,
+) -> tuple[LeaseSnapshot, list[str], list[str]]:
+    """The snapshot, the blocking ids and the warnings for the stop about to happen.
+
+    Restarting the Salad executor while a route's child runs loses that run by design: it ends
+    ``unknown`` and the campaign blocks (v0.104.0 rule). Separately, leases last 150 s past
+    their last renewal and the stopped executor renews none, so a stop of
+    ``expected_downtime_seconds`` or longer lapses every lease that expires within it, and each
+    lapse burns a requeue of its stage."""
+    downtime = plan.expected_downtime_seconds
+    snap = salad_lease_snapshot(Path(plan.state_dir), now=now, downtime_seconds=downtime)
+    blocking: list[str] = []
+    warnings: list[str] = []
+    if snap.unreadable:
+        blocking.append(
+            "salad.lease_state (cannot read lease state from the database; a stop cannot be "
+            "shown safe)"
+        )
+    if snap.executing and not allow_executing_salad:
+        blocking.append(
+            f"salad.executing ({snap.executing} Salad attempt(s) executing: a restart loses the "
+            "run; wait for it to finish or pass --allow-executing-salad)"
+        )
+    elif snap.executing:
+        warnings.append(
+            f"{snap.executing} Salad attempt(s) executing; restart allowed by "
+            "--allow-executing-salad"
+        )
+    if snap.leases_lapsing and not allow_lease_lapse:
+        blocking.append(
+            f"salad.lease_lapse ({snap.leases_lapsing} active execution lease(s) expire within "
+            f"the expected downtime of {downtime}s and the stopped executor cannot renew them; "
+            "leases are renewed to about 150 s, so a downtime of 150 s or more refuses "
+            "whenever a lease is held; wait for the leases to end, shorten "
+            "expected_downtime_seconds, or pass --allow-lease-lapse)"
+        )
+    elif snap.leases_lapsing:
+        warnings.append(
+            f"{snap.leases_lapsing} execution lease(s) will lapse during the stop; allowed by "
+            "--allow-lease-lapse"
+        )
+    return snap, blocking, warnings
 
 
 def run_upgrade(
@@ -524,6 +657,8 @@ def run_upgrade(
     *,
     execute: bool,
     allow_executing_salad: bool = False,
+    allow_lease_lapse: bool = False,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
     runner: deploy_services.Runner = deploy_services.default_runner,
     probe: Callable[..., tuple[bool, str]] = deploy_services.probe_health,
     sleep: Callable[[float], None] = time.sleep,
@@ -552,18 +687,22 @@ def run_upgrade(
     for venv in plan.venvs:
         if not os.access(deploy_services.venv_python(venv), os.X_OK):
             blocking.append(f"service venv {venv} (no executable bin/python)")
-    executing = executing_salad_attempts(Path(plan.state_dir))
-    run.document["salad_executing"] = executing
-    if executing and not allow_executing_salad:
-        # v0.104.0 operator rule: no restart while a Salad route runs (the run would be lost).
-        blocking.append(
-            f"salad.executing ({executing} Salad attempt(s) executing: a restart loses the run; "
-            "wait for it to finish or pass --allow-executing-salad)"
-        )
-    elif executing:
-        run.document.setdefault("warnings", []).append(
-            f"{executing} Salad attempt(s) executing; restart allowed by --allow-executing-salad"
-        )
+    snap, lease_blocking, lease_warnings = lease_guard(
+        plan,
+        now(),
+        allow_executing_salad=allow_executing_salad,
+        allow_lease_lapse=allow_lease_lapse,
+    )
+    run.document["salad_executing"] = snap.executing
+    run.document["salad_route_holding"] = snap.route_holding
+    run.document["salad_lease_holding"] = snap.lease_holding
+    run.document["salad_leases_lapsing"] = snap.leases_lapsing
+    run.document["expected_downtime_seconds"] = plan.expected_downtime_seconds
+    if snap.notes:
+        run.document["salad_notes"] = list(snap.notes)
+    blocking.extend(lease_blocking)
+    if lease_warnings:
+        run.document.setdefault("warnings", []).extend(lease_warnings)
     unsafe = _unsafe_unstopped(plan)
     run.document["not_stopped"] = _not_stopped(plan)
     if execute:
@@ -604,6 +743,22 @@ def run_upgrade(
         return run.finish()
     if not execute:
         run.document["planned"] = _planned(plan, findings)
+        return run.finish()
+
+    # The focused tests and every other preflight step can take minutes; read the lease state
+    # again right before the stop so a lease taken or nearing expiry meanwhile still refuses.
+    _snap, recheck_blocking, _warnings = lease_guard(
+        plan,
+        now(),
+        allow_executing_salad=allow_executing_salad,
+        allow_lease_lapse=allow_lease_lapse,
+    )
+    if recheck_blocking:
+        run.step(
+            "preflight:lease_recheck",
+            False,
+            "blocked by: " + ", ".join(recheck_blocking) + "; nothing was stopped",
+        )
         return run.finish()
 
     services = list(plan.services)

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from . import runner_faults as faults
 from .artifact_custody import ArtifactCustodyReleaseRequest, ArtifactCustodyStore
 from .artifact_dispositions import ArtifactDispositionRequest, ArtifactDispositionStore
 from .artifact_lineage import ArtifactLineageStore, LineageEdgeRequest, LineageNodeRequest
@@ -133,14 +135,22 @@ class StepTransient(Exception):
 
     ``deterministic`` marks a replay that the same error will refuse again (a reduce-only
     step's store call raised something other than contention or I/O): it is still replayed,
-    but the runner counts ``error_class`` toward its breaker (ADR 0210)."""
+    but the runner counts ``error_class`` toward its breaker (ADR 0210). ``kind`` is the
+    ``runner_faults`` class of the underlying error (``io`` feeds the runner's host I/O
+    streak); a plain deferral is ``contention``."""
 
     def __init__(
-        self, message: str = "", *, deterministic: bool = False, error_class: str | None = None
+        self,
+        message: str = "",
+        *,
+        deterministic: bool = False,
+        error_class: str | None = None,
+        kind: str | None = None,
     ) -> None:
         super().__init__(message)
         self.deterministic = deterministic
         self.error_class = error_class
+        self.kind = kind or (faults.DETERMINISTIC if deterministic else faults.CONTENTION)
 
 
 class DelegationLapsed(Exception):
@@ -148,13 +158,12 @@ class DelegationLapsed(Exception):
 
 
 def is_transient_error(error: BaseException) -> bool:
-    """Contention or I/O that a replay of the same pending intent may get past: a busy or
-    locked database, a timeout, an OS or connection error. Anything else a store call raises
-    is deterministic for the same request."""
-    if isinstance(error, sqlite3.OperationalError):
-        text = str(error).lower()
-        return "locked" in text or "busy" in text or "disk i/o" in text
-    return isinstance(error, (TimeoutError, OSError))
+    """A fault a replay of the same pending intent may get past (``runner_faults``): a busy
+    or locked database, a timeout or dropped connection, a short list of errnos (``EAGAIN``,
+    ``EINTR``, ``EBUSY``, ``ETIMEDOUT``), a brief I/O error, or a host fault such as a full
+    disk. A missing file (``ENOENT``), any unlisted errno or none, and anything else a store
+    call raises is deterministic for the same request."""
+    return faults.classify(error) in faults.REPLAYABLE
 
 
 @dataclass(frozen=True)
@@ -420,9 +429,20 @@ def prepare(
 
 
 class StepExecutor:
-    def __init__(self, store: CampaignStore, state_dir: Path) -> None:
+    def __init__(
+        self,
+        store: CampaignStore,
+        state_dir: Path,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.store = store
+        self.state_dir = Path(state_dir)
         self.stores = Stores(state_dir)
+        self.monotonic = monotonic
+        # Intent -> monotonic time before which its transient replay is not retried. In
+        # memory: the count it derives from is persisted on the intent.
+        self._replay_not_before: dict[str, float] = {}
 
     @staticmethod
     def _slot(
@@ -535,6 +555,10 @@ class StepExecutor:
                 intent = None
         if intent is None:
             raise StepFailed(step, "step_refused", "intent no longer matches request")
+        replays = faults.replay_count(intent.get("error_class"))
+        if self.monotonic() < self._replay_not_before.get(intent["id"], 0.0):
+            # A replay that keeps failing transiently backs off (ADR 0210 addendum).
+            raise StepTransient(f"{step}: replay backing off", kind=faults.TRANSIENT)
         principal = delegated_principal(approval, campaign, intent["id"])
         if before_call is not None:
             before_call()  # the runner lease is re-checked right before the write
@@ -561,7 +585,24 @@ class StepExecutor:
                 self._fail_intent(connection, campaign, intent["id"], type(error).__name__, step)
             raise StepFailed(step, type(error).__name__, str(error)[:300]) from None
         except Exception as error:
-            transient = is_transient_error(error)
+            kind = faults.classify(error, self.state_dir)
+            bounded = False
+            if kind == faults.ENVIRONMENT:
+                # The host cannot do work: the intent stays pending, the runner pauses and no
+                # campaign is counted (ADR 0210 addendum).
+                raise faults.HostFault(faults.fault_kind(error), type(error).__name__) from None
+            if kind in (faults.TRANSIENT, faults.IO):
+                replays += 1
+                self._record_replay(intent["id"], replays, type(error).__name__)
+                if replays > faults.TRANSIENT_REPLAY_LIMIT:
+                    if kind == faults.IO:
+                        # A brief I/O error that never clears is the host's, not the step's.
+                        raise faults.HostFault(
+                            faults.fault_kind(error), type(error).__name__
+                        ) from None
+                    # Past its persisted bound a transient error is deterministic.
+                    kind, bounded = faults.DETERMINISTIC, True
+            transient = kind in faults.REPLAYABLE
             if step in REDUCE_ONLY_STEPS or transient:
                 # Contention or I/O may or may not have committed: the intent stays pending
                 # and is replayed. A reduce-only step (cancel, revoke, reconcile, release)
@@ -574,6 +615,7 @@ class StepExecutor:
                     f"{step}: {type(error).__name__}",
                     deterministic=not transient,
                     error_class=type(error).__name__,
+                    kind=kind,
                 ) from None
             with self.store.runner_connection() as connection:
                 row = connection.execute(
@@ -588,7 +630,13 @@ class StepExecutor:
                 # A deterministic error of a forward step: recorded and fail-closed, so it is
                 # not replayed forever as if it were contention.
                 self._fail_intent(connection, campaign, intent["id"], type(error).__name__, step)
-            raise StepFailed(step, type(error).__name__, "store call raised") from None
+            self._replay_not_before.pop(intent["id"], None)
+            raise StepFailed(
+                step,
+                type(error).__name__,
+                "transient replay bound reached" if bounded else "store call raised",
+            ) from None
+        self._replay_not_before.pop(intent["id"], None)
         with self.store.runner_connection() as connection:
             row = connection.execute(
                 "SELECT * FROM campaign_step_intents WHERE id=?", (intent["id"],)
@@ -596,6 +644,22 @@ class StepExecutor:
         if row is None or row["status"] != "done":
             raise StepTransient(f"{step}: intent not completed")
         return StepResult(row["response_status"], json.loads(row["response_json"]), row["id"], True)
+
+    def _record_replay(self, intent_id: str, count: int, error_class: str) -> None:
+        """Persist a pending intent's transient replay count and set its backoff. Best effort:
+        a write that fails (contention, or the same fault) leaves the last recorded count."""
+        delay = faults.replay_backoff_seconds(count)
+        if delay:
+            self._replay_not_before[intent_id] = self.monotonic() + delay
+        try:
+            with self.store.runner_connection() as connection:
+                connection.execute(
+                    """UPDATE campaign_step_intents SET error_class=?
+                    WHERE id=? AND status='pending'""",
+                    (faults.replay_marker(count, error_class), intent_id),
+                )
+        except sqlite3.Error:
+            return
 
     @staticmethod
     def _authority_current(

@@ -123,7 +123,8 @@ class RetryPolicy(_Strict):
     ] = []
     # ADR 0058: extra attempts, beyond max_attempts, that an infrastructure failure (the
     # container killed, an infra exit code) may use. Off unless the spec says so, so an
-    # approval never covers spend its approver did not see: when enabled it is in the digest
+    # approval never covers spend its approver did not see (ADR 0215: submit writes 2 into a
+    # Salad stage that leaves it unset, before the digest): when enabled it is in the digest
     # and counted in the stage's worst-case exposure. Never for a task failure, a policy
     # refusal or a budget refusal. Each is a new attempt with its own hold and receipt.
     infra_retries: Annotated[int, Field(strict=True, ge=0, le=3)] = DEFAULT_INFRA_RETRIES
@@ -2236,6 +2237,8 @@ FAILURE_CLASSES = (
     "infra_salad_guardian_unavailable",
     "infra_salad_safety_stop",
     "infra_salad_reconciled_no_output",
+    "infra_reconciled_retryable",
+    "infra_salad_executor_lost",
     "start_failure_suspected",
     "salad_container_exited_nonzero",
     "provider_reallocated_before_custody",

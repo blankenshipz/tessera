@@ -34,6 +34,15 @@ def add_parser(subcommands: argparse._SubParsersAction) -> None:
             "attempt ends unknown; default: refuse)"
         ),
     )
+    command.add_argument(
+        "--allow-lease-lapse",
+        action="store_true",
+        help=(
+            "upgrade even though an active execution lease would expire within the plan's "
+            "expected_downtime_seconds (the attempt's lease lapses and it is requeued; "
+            "default: refuse)"
+        ),
+    )
 
 
 def add_rollback_parser(subcommands: argparse._SubParsersAction) -> None:
@@ -99,6 +108,7 @@ def run(arguments: argparse.Namespace) -> int:
             plan,
             execute=arguments.execute,
             allow_executing_salad=getattr(arguments, "allow_executing_salad", False),
+            allow_lease_lapse=getattr(arguments, "allow_lease_lapse", False),
         )
         if arguments.execute:
             deploy_upgrade.write_receipt(plan, document)

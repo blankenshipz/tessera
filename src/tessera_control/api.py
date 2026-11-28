@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
@@ -19,8 +20,9 @@ from .approval_trust import (
     DELEGATION_KEY,
     valid_automation_label,
 )
+from .campaign_providers import providers_configured
 from .concurrency_ceiling import operator_concurrency_ceiling
-from .deployment import DeploymentConfig, backend_status
+from .deployment import DeploymentConfig, backend_status, readiness_status
 from .models import (
     ApproveTask,
     CreateCredential,
@@ -171,6 +173,11 @@ def create_app(
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.add_middleware(RequestLimitsMiddleware)
     app.state.deployment = deployment
+    # Readiness (not the request gate) also waits for the first completed runner tick; set by
+    # the runner thread. Without an in-process runner there is no tick to wait for.
+    app.state.runner_ticked = threading.Event() if campaign_runner_interval is not None else None
+    # ``tessera serve`` sets this once provider registration completed; plain apps leave None.
+    app.state.providers_required = False
 
     @app.middleware("http")
     async def readiness_gate(request: Request, call_next: Any) -> Any:
@@ -195,7 +202,12 @@ def create_app(
 
     @app.get("/health/ready")
     def readiness() -> JSONResponse:
-        status = backend_status(state_dir)
+        ticked = app.state.runner_ticked
+        status = readiness_status(
+            state_dir,
+            runner_ticked=None if ticked is None else ticked.is_set(),
+            providers_registered=(providers_configured() if app.state.providers_required else None),
+        )
         payload = {
             **status,
             "deployment_profile": deployment.profile,
@@ -409,6 +421,12 @@ def create_app(
 
     app.state.salad_unclaimed = SaladUnclaimedStore(state_dir)
     app.include_router(salad_unclaimed_router)
+    from .salad_retryable_reconcile import SaladRetryableReconcileStore
+    from .salad_retryable_reconcile_api import router as salad_retryable_router
+
+    # ADR 0216: a person's reconcile of an unknown attempt as retryable infrastructure.
+    app.state.salad_retryable_reconcile = SaladRetryableReconcileStore(state_dir)
+    app.include_router(salad_retryable_router)
     app.include_router(artifact_router)
     app.include_router(large_artifact_router)
     app.include_router(artifact_disposition_router)
@@ -668,6 +686,7 @@ def create_app(
                 campaign_runner_interval,
                 scheduler=campaign_scheduler,
                 unclaimed_autoreconcile_limit=campaign_unclaimed_autoreconcile_limit,
+                on_tick=application.state.runner_ticked.set,
             )
             try:
                 async with previous_lifespan(application) as state:

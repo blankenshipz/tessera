@@ -144,7 +144,9 @@ def test_a_claimed_grant_without_a_confirmed_exit_keeps_the_slot(tmp_path):
     )
 
 
-def test_a_live_unclaimed_grant_keeps_the_slot(tmp_path):
+def test_a_live_unclaimed_grant_of_a_blocked_campaign_is_given_back(tmp_path):
+    # ADR 0208 addendum: a blocked campaign gives back a live grant no worker took, as a
+    # paused one does (ADR 0167); before, it kept the slot until the grant expired.
     world = World(tmp_path)
     holder = world.campaign(_spec(world))
     admit(world, holder["id"])
@@ -154,9 +156,11 @@ def test_a_live_unclaimed_grant_keeps_the_slot(tmp_path):
     fresh = world.campaign(_spec(world))
     for _ in range(15):
         world.runner.tick()
-    assert not _granted(world, fresh["id"])
-    assert not _freed(world, holder["id"])
-    assert world.attempts(holder["id"])[0]["status"] == "admitted"
+    assert _granted(world, fresh["id"])
+    (event,) = _freed(world, holder["id"])
+    assert event["reason"] == "blocked_unleased_grant"
+    closed = world.attempts(holder["id"])[0]
+    assert closed["status"] == "failed_transient" and closed["failure_class"] == "not_started"
 
 
 def test_pause_then_resume_retries_without_double_running(tmp_path):

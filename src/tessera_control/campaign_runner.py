@@ -39,6 +39,7 @@ from . import campaign_salad_fallback as salad_fallback
 from . import campaign_salad_lease_cap as lease_cap
 from . import execution_frames as frames
 from . import late_bound_inputs as late_bound
+from . import runner_faults as faults
 from .artifact_manifests import grant_manifest_is_partial
 from .campaign_autoreconcile import (
     MAX_AUTO_REQUEUES,
@@ -69,13 +70,15 @@ from .campaign_exited_resolve import (
 )
 from .campaign_exited_resolve import assess as assess_exited
 from .campaign_infra_retry import (
+    GUARDIAN_CLOSED_NO_OUTPUT_CLASSES,
     INFRA_ALLOCATION_TIMEOUT,
     INFRA_CONTAINER_KILLED,
+    INFRA_RECONCILED_RETRYABLE,
     INFRA_RESOURCE_LIMIT,
-    INFRA_SALAD_RECONCILED_NO_OUTPUT,
     PLACEMENT_RETRY_CLASSES,
     REALLOCATED_PRECUSTODY,
     RESOURCE_LIMIT_CLASSES,
+    RETRYABLE_RECONCILE_EVENT,
     SALAD_INTERRUPTED,
     infra_attempts,
     is_infra_class,
@@ -101,6 +104,7 @@ from .campaign_models import (
     EXPERIMENT_CEILING_CENTS,
     FAILURE_CLASSES,
     GRANT_SETTLE_MARGIN_SECONDS,
+    TERMINAL_CAMPAIGN,
     NormalSpec,
     NormalStage,
     custody_inputs,
@@ -142,16 +146,18 @@ from .campaign_settlement import (
 from .campaign_slot_reclaim import (
     EXPIRED_UNCLAIMED_GRANT,
     NOT_STARTED_EVIDENCE,
-    PAUSED_RELEASE_DETAIL,
     PAUSED_UNLEASED_GRANT,
     SLOT_REACQUIRED_EVENT,
     STUCK_CAMPAIGN,
+    UNLEASED_RELEASE_DETAILS,
+    UNLEASED_RELEASE_KINDS,
     idle_slot_holders,
     record_freed_slots,
     record_slot_freed,
-    releasable_paused_grant,
+    releasable_unleased_grant,
     unclaimed_candidates,
     unclaimed_expired_grant,
+    unleased_release_reason,
     waiters_ahead,
 )
 from .campaign_stage_failure_stop import is_stage_failure_stop, keeps_retry
@@ -200,6 +206,25 @@ RUNNER_ERROR_THRESHOLD = 10
 # One per (campaign, class): a cancelling campaign that keeps raising one error class. It is
 # never blocked (the cancel keeps replaying its reduce-only steps); this only makes it visible.
 CANCEL_RUNNER_ERROR_EVENT = "campaign.cancel_runner_error"
+# A stored spec the current code cannot read, or that no longer re-digests to the approved
+# digest, blocks a running campaign (``campaign.blocked`` with one of these reasons) instead
+# of failing it: every attempt, grant and hold stays for a person and nothing new starts. A
+# campaign in another live status keeps its status and gets one ``STORED_SPEC_EVENT``.
+STORED_SPEC_UNREADABLE = "stored_spec_unreadable"
+STORED_SPEC_DIGEST_MISMATCH = "spec_digest_mismatch"
+STORED_SPEC_REASONS = (STORED_SPEC_UNREADABLE, STORED_SPEC_DIGEST_MISMATCH)
+STORED_SPEC_EVENT = "campaign.stored_spec_unverified"
+_STORED_SPEC_MAX_LOCATIONS = 5
+# A blocked or paused campaign that keeps raising one error class: recorded once per
+# (campaign, status, class); a blocked one's drive also backs off. Its status is not changed.
+STUCK_RUNNER_ERROR_EVENT = "campaign.stuck_runner_error"
+# A provider's pre-stage hook (``after_tick``, ``evidence_pass``) raised: recorded once per
+# (campaign, hook, provider, class); the stages of the pass still run.
+HOOK_RUNNER_ERROR_EVENT = "campaign.hook_runner_error"
+# The back-off of an already blocked campaign that keeps raising one error class: doubling,
+# bounded. A cancelling campaign is never backed off (its cancel runs every pass).
+STUCK_BACKOFF_SECONDS = 30.0
+MAX_STUCK_BACKOFF_SECONDS = 300.0
 # Step slot of a snapshot release renewed before its grant is issued (ADR 0048).
 RELEASE_RENEWAL_ORDINAL = 2
 RELEASE_SLACK_SECONDS = 120
@@ -221,6 +246,13 @@ TERMINAL_ATTEMPT = frozenset(
         "cancelled",
     }
 )
+# The stage status a stranded ``blocked_unknown`` stage takes from its latest ended attempt;
+# any other ended attempt hands the stage back to ``_advance_stage`` as ``preparing``.
+_REPAIR_TARGET = {
+    "failed_permanent": "failed",
+    "refused_budget": "refused_budget",
+    "cancelled": "skipped",
+}
 ACTIVE_ATTEMPT = frozenset(
     {
         "reserved",
@@ -270,10 +302,67 @@ class _Ctx:
     generation: int
 
 
+@dataclass(frozen=True)
+class StoredSpecVerdict:
+    """Whether a stored spec reads and re-digests under the current code.
+
+    ``detail`` is closed: an error class, a count, pydantic error types and field locations
+    (integers and field names only), never a value from the spec."""
+
+    spec: NormalSpec | None
+    reason: str | None
+    detail: dict[str, Any]
+
+
+def _location(loc: tuple[Any, ...]) -> str:
+    parts = [
+        str(part)
+        for part in loc
+        if isinstance(part, int) or (isinstance(part, str) and part.isidentifier())
+    ]
+    return ".".join(parts)[:120]
+
+
+def verify_stored_spec(spec_json: Any, stored_digest: Any) -> StoredSpecVerdict:
+    """Parse, re-digest and normalize a stored spec exactly as the runner does.
+
+    Pure and read-only; shared by the runner's load and the read-only deploy check so both
+    apply the same rule. Any parse failure is ``stored_spec_unreadable``; a spec that parses
+    but hashes to another digest is ``spec_digest_mismatch``."""
+    try:
+        model = parse_spec_json(spec_json)
+        digest = spec_digest(model)
+        spec = normalize(model)
+    except ValidationError as error:
+        errors = error.errors(include_url=False, include_input=False, include_context=False)
+        return StoredSpecVerdict(
+            None,
+            STORED_SPEC_UNREADABLE,
+            {
+                "error_class": "ValidationError",
+                "error_count": len(errors),
+                "error_types": sorted({str(item.get("type", ""))[:40] for item in errors})[
+                    :_STORED_SPEC_MAX_LOCATIONS
+                ],
+                "locations": [
+                    _location(tuple(item.get("loc", ())))
+                    for item in errors[:_STORED_SPEC_MAX_LOCATIONS]
+                ],
+            },
+        )
+    except Exception as error:  # noqa: BLE001 - any parse failure is an unreadable spec
+        return StoredSpecVerdict(
+            None, STORED_SPEC_UNREADABLE, {"error_class": type(error).__name__[:80]}
+        )
+    if digest != stored_digest:
+        return StoredSpecVerdict(None, STORED_SPEC_DIGEST_MISMATCH, {})
+    return StoredSpecVerdict(spec, None, {})
+
+
 def _is_busy(error: sqlite3.OperationalError) -> bool:
-    """Lock contention is transient; any other operational error is a real fault."""
-    text = str(error).lower()
-    return "locked" in text or "busy" in text
+    """Lock contention is transient; any other operational error is classified by the tick
+    (``runner_faults``): a brief I/O error or a host fault is never a campaign's."""
+    return faults.classify(error) == faults.CONTENTION
 
 
 def _iso(value: datetime) -> str:
@@ -341,10 +430,68 @@ class CampaignRunner:
         self._error_streaks: dict[str, dict[str, int]] = {}
         # Error classes the stages of the current drive raised (isolated per stage).
         self._drive_errors: set[str] = set()
+        # Already blocked campaigns that keep raising one error class: campaign ->
+        # (not before, current delay, (status, revision) when it was set). Any change to the
+        # campaign row (a person's re-approval or cancel) lifts it.
+        self._stuck_backoff: dict[str, tuple[datetime, float, tuple[Any, Any]]] = {}
+        # The host-fault pause (``runner_faults``): no campaign is driven before it ends.
+        self._host_paused_until: datetime | None = None
+        self._host_pause_seconds = faults.HOST_PAUSE_SECONDS
+        self._host_alarmed = False
+        self._io_streak = 0
+        self._tick_io = False
 
     # -- tick -----------------------------------------------------------------------
 
     def tick(self) -> TickReport:
+        """One runner pass, under the host-fault classification (``runner_faults``): a host
+        fault pauses every campaign without counting toward any breaker, a streak of ticks
+        that each saw a brief I/O error becomes one, and a clean tick clears the alarm."""
+        now = self.now()
+        if self._host_paused_until is not None and now < self._host_paused_until:
+            return TickReport(("host_paused",), 0)
+        self._tick_io = False
+        try:
+            report = self._tick()
+        except faults.HostFault as fault:
+            return self._host_fault(fault.kind, fault.error_class)
+        except (sqlite3.OperationalError, OSError) as error:
+            kind = self._classify(error)
+            if kind == faults.ENVIRONMENT:
+                return self._host_fault(faults.fault_kind(error), type(error).__name__)
+            if kind not in (faults.IO, faults.TRANSIENT):
+                raise
+            log.warning("campaign runner tick deferred: %s", faults.fault_kind(error))
+            self._tick_io = self._tick_io or kind == faults.IO
+            report = TickReport((*self._actions, f"deferred:{faults.fault_kind(error)}"), 0)
+        if self._tick_io:
+            self._io_streak += 1
+            if self._io_streak >= faults.IO_STREAK_LIMIT:
+                return self._host_fault("disk_io_error", "OperationalError", report)
+            return report
+        self._io_streak = 0
+        self._host_paused_until = None
+        self._host_pause_seconds = faults.HOST_PAUSE_SECONDS
+        if self._host_alarmed and faults.HOST_ALARM.clear():
+            report = TickReport((*report.actions, "host_fault_cleared"), report.campaigns)
+        self._host_alarmed = False
+        return report
+
+    def _host_fault(
+        self, kind: str, error_class: str, report: TickReport | None = None
+    ) -> TickReport:
+        """Raise the host alarm (once per spell) and pause all work; no campaign is touched,
+        counted or blocked, so nothing needs re-approval when the host recovers."""
+        now = self.now()
+        faults.HOST_ALARM.raise_alarm(kind, error_class, now)
+        self._host_alarmed = True
+        self._io_streak = 0
+        self._host_paused_until = now + timedelta(seconds=self._host_pause_seconds)
+        self._host_pause_seconds = min(self._host_pause_seconds * 2, faults.MAX_HOST_PAUSE_SECONDS)
+        actions = report.actions if report is not None else tuple(self._actions)
+        return TickReport((*actions, f"host_fault:{kind}"), 0)
+
+    def _tick(self) -> TickReport:
         self._actions = []
         self._budget = MAX_STEPS_PER_TICK
         try:
@@ -365,9 +512,14 @@ class CampaignRunner:
             return TickReport(tuple(self._actions), len(ids))
         for stale in set(self._error_streaks) - set(ids):
             del self._error_streaks[stale]
+        for stale in set(self._stuck_backoff) - set(ids):
+            del self._stuck_backoff[stale]
         for campaign_id in ids:
             if self._budget <= 0:
                 break
+            if self._backing_off(campaign_id):
+                self._actions.append(f"backoff:{campaign_id}")
+                continue
             self._drive_errors = set()
             raised: str | None = None
             try:
@@ -378,13 +530,36 @@ class CampaignRunner:
             except _LeaseLost:
                 self._actions.append("lease_lost")
                 break
-            except (StepTransient, sqlite3.OperationalError) as error:
-                if isinstance(error, sqlite3.OperationalError) and not _is_busy(error):
+            except faults.HostFault:
+                raise  # the host cannot do work: no campaign is counted (``tick``)
+            except (StepTransient, sqlite3.OperationalError, OSError) as error:
+                kind = error.kind if isinstance(error, StepTransient) else self._classify(error)
+                if kind == faults.ENVIRONMENT:
+                    raise faults.HostFault(faults.fault_kind(error), type(error).__name__) from None
+                if isinstance(error, sqlite3.OperationalError) and kind == faults.DETERMINISTIC:
                     # A schema or SQL fault is not contention: record it, never defer it.
                     log.error("campaign %s database error: %s", campaign_id, error)
                     self._actions.append(f"error:{campaign_id}:OperationalError")
                     raised = "OperationalError"
+                elif isinstance(error, OSError) and kind in (
+                    faults.DETERMINISTIC,
+                    faults.TRANSIENT,
+                ):
+                    # A filesystem error the drive's preamble raised (a step's comes wrapped as
+                    # a StepTransient or StepFailed) has no replay bound here: counted, never
+                    # deferred uncounted, so a repeating one blocks the campaign.
+                    log.error(
+                        "campaign %s runner error: %s (%s)",
+                        campaign_id,
+                        type(error).__name__,
+                        faults.fault_kind(error),
+                    )
+                    self._actions.append(f"error:{campaign_id}:{type(error).__name__}")
+                    raised = type(error).__name__
                 else:
+                    # A brief I/O error is the host's (its streak is counted per tick), never
+                    # the campaign's.
+                    self._tick_io = self._tick_io or kind == faults.IO
                     # A deferral is not a clean drive and clears no streak. Contention counts
                     # nothing; a deterministic replay (a reduce-only step's non-transient
                     # error) counts its class, and errors earlier stages recorded in this
@@ -575,16 +750,56 @@ class CampaignRunner:
             count = connection.execute(
                 "SELECT count(*) FROM campaign_approvals WHERE campaign_id=?", (campaign_id,)
             ).fetchone()[0]
-        try:
-            model = parse_spec_json(campaign["spec_json"])
-            valid = spec_digest(model) == campaign["spec_digest"]
-            spec = normalize(model)
-        except ValidationError:
-            valid = False
-        if not valid:
-            self._finish(campaign, "failed", reason="spec_digest_mismatch")
+        verdict = verify_stored_spec(campaign["spec_json"], campaign["spec_digest"])
+        if verdict.spec is None:
+            assert verdict.reason is not None
+            self._block_stored_spec(campaign["id"], verdict.reason, verdict.detail)
             return None
-        return _Ctx(campaign, spec, None if approval is None else dict(approval), max(count - 1, 0))
+        return _Ctx(
+            campaign, verdict.spec, None if approval is None else dict(approval), max(count - 1, 0)
+        )
+
+    def _block_stored_spec(self, campaign_id: str, reason: str, detail: dict[str, Any]) -> None:
+        """Fail closed on a stored spec the current code cannot verify, without failing it.
+
+        A running or stopping campaign blocks through the ordinary block path (reduce-only:
+        no stage or attempt row changes; attempts, grants and holds stay for a person) with
+        one ``campaign.blocked`` event. A campaign in another live status (already blocked,
+        cancelling, paused) keeps its status and gets one ``STORED_SPEC_EVENT``. Later passes
+        find either and write nothing. Once the spec verifies again (a fix or a rollback of
+        the code) ``_drive_blocked`` resumes it and clears this stop reason."""
+        with self.store.runner_connection() as connection:
+            self._hold_lease(connection)
+            row = connection.execute(
+                "SELECT * FROM campaigns WHERE id=?", (campaign_id,)
+            ).fetchone()
+            if row is None or row["status"] in TERMINAL_CAMPAIGN:
+                return
+            campaign = dict(row)
+            blocked = connection.execute(
+                """UPDATE campaigns SET status='blocked',
+                stop_reason=COALESCE(stop_reason, ?), updated_at=?
+                WHERE id=? AND status IN ('running','stopping')""",
+                (reason, _iso(self.now()), campaign_id),
+            ).rowcount
+            if blocked:
+                self.store.record_runner_event(
+                    connection, campaign, "campaign.blocked", {"reason": reason, **detail}
+                )
+                self._free_campaign_releases(connection, campaign_id, "campaign_blocked")
+            elif not (campaign["status"] == "blocked" and campaign["stop_reason"] == reason):
+                # Not this block's own later passes: those wrote their one event already.
+                ctx = _Ctx(campaign, None, None, 0)  # type: ignore[arg-type]
+                self._emit_once_in(
+                    connection,
+                    ctx,
+                    STORED_SPEC_EVENT,
+                    {"reason": reason, "status": campaign["status"]},
+                    detail,
+                )
+        if blocked:
+            log.error("campaign %s blocked: %s", campaign_id, reason)
+            self._actions.append(f"blocked:{campaign_id}:{reason}")
 
     def _campaign(self, campaign_id: str) -> dict[str, Any]:
         with self.store.runner_connection() as connection:
@@ -630,8 +845,8 @@ class CampaignRunner:
             # Reduce-only (ADR 0153): an expired grant no worker ever claimed cannot run, so a
             # stuck campaign stops holding its project slot; it needs no live approval.
             self._reclaim_unclaimed_grants(ctx)
-        if self._paused_for_release(ctx):
-            self._release_paused_grants(ctx)
+        if self._unleased_release(ctx) is not None:
+            self._release_unleased_grants(ctx)
         if ctx.approval is None:
             return
         status = ctx.campaign["status"]
@@ -656,6 +871,8 @@ class CampaignRunner:
             self._actions.append(f"waiting:{campaign_id}:{campaign_hold.REASON}")
             return
         try:
+            if status in {"running", "stopping", "blocked", "cancel_requested"}:
+                self._repair_stranded_stages(ctx)
             if status == "cancel_requested":
                 self._drive_cancel(ctx)
             elif status == "blocked":
@@ -666,37 +883,121 @@ class CampaignRunner:
             if status in {"running", "stopping"}:
                 self._pause(ctx, "approver_not_live")
 
-    def _paused_for_release(self, ctx: _Ctx) -> bool:
-        """The campaign is paused: delegation lapsed, or an agent's or person's pause (ADR 0061)."""
-        status = ctx.campaign["status"]
-        if status == "paused_delegation_lapsed":
-            return True
-        if status != "running":
-            return False
-        steering = self._one(
-            "SELECT paused FROM campaign_steering WHERE campaign_id=?", (ctx.campaign["id"],)
-        )
-        return bool(steering and steering["paused"])
+    def _repair_stranded_stages(self, ctx: _Ctx) -> None:
+        """A stage never stays ``blocked_unknown`` once none of its attempts is live or unknown.
 
-    def _release_paused_grants(self, ctx: _Ctx) -> None:
-        """A paused campaign gives back each grant no worker ever took (ADR 0167).
+        ``blocked_unknown`` means "an attempt's outcome is unknown" (or a held decision about it).
+        It is final for ``_advance_stage``, so a stage left there after its attempt ended (the
+        ADR 0169 hold on a terminal attempt, or any path that settled the attempt without moving
+        the stage) was never advanced again. Each such stage follows its latest attempt, in one
+        transaction with one event: ``failed_permanent`` makes the stage ``failed`` (the
+        stage-failure stop applies, dependants are skipped, a ``failed_stages`` rerun picks it
+        up); ``refused_budget`` makes it ``refused_budget`` and ``cancelled`` makes it ``skipped``
+        (both are final for ``_advance_stage``, so ``preparing`` would strand it again); any
+        other ended attempt hands the stage back to ``_advance_stage`` (``preparing``), which
+        retries or finishes it by its own rules. Runs for a cancel-requested campaign too (it
+        only moves a stage toward a final state, so the cancel can finish). A stage with an
+        ``unknown`` or live attempt, with no attempt, or whose latest ended attempt is not
+        settled yet is left alone. Idempotent; a lost lease aborts the transaction."""
+        stranded = self._rows(
+            "SELECT stage_key FROM campaign_stages "
+            "WHERE campaign_id=? AND status='blocked_unknown'",
+            (ctx.campaign["id"],),
+        )
+        for entry in stranded:
+            key = entry["stage_key"]
+            attempts = self._attempts(ctx, key)
+            if not attempts or any(
+                a["status"] == "unknown" or a["status"] in ACTIVE_ATTEMPT for a in attempts
+            ):
+                continue
+            latest = attempts[-1]
+            if latest["settled_cents"] is None and latest["status"] not in {
+                "cancelled",
+                "refused_budget",
+            }:
+                continue  # the settlement path has not finished: nothing to follow yet
+            permanent = latest["status"] == "failed_permanent"
+            target = _REPAIR_TARGET.get(latest["status"], "preparing")
+            with self.store.runner_connection() as connection:
+                self._hold_lease(connection)
+                held = connection.execute(
+                    "SELECT 1 FROM campaign_stages WHERE campaign_id=? AND stage_key=? "
+                    "AND status='blocked_unknown'",
+                    (ctx.campaign["id"], key),
+                ).fetchone()
+                if held is None:
+                    continue
+                self._touch(
+                    connection,
+                    "campaign_stages",
+                    "campaign_id=? AND stage_key=? AND status='blocked_unknown'",
+                    (ctx.campaign["id"], key),
+                    status=target,
+                )
+                if permanent:
+                    connection.execute(
+                        "UPDATE campaigns SET stop_reason=? WHERE id=? AND stop_reason IS NULL",
+                        (
+                            f"stage_failed:{key}:{latest['failure_class']}"[:300],
+                            ctx.campaign["id"],
+                        ),
+                    )
+                self.store.record_runner_event(
+                    connection,
+                    ctx.campaign,
+                    "campaign.stage_status_repaired",
+                    {
+                        "stage_key": key,
+                        "attempt": latest["attempt"],
+                        "attempt_id": latest["id"],
+                        "attempt_status": latest["status"],
+                        "failure_class": latest["failure_class"],
+                        "from_status": "blocked_unknown",
+                        "to_status": target,
+                    },
+                )
+            self._actions.append(f"stage_repaired:{key}")
+
+    def _unleased_release(self, ctx: _Ctx) -> tuple[str, str] | None:
+        """``(reason, detail)`` when the campaign gives back grants no worker took: paused
+        (delegation lapsed, or an agent's or person's pause; ADR 0061, ADR 0167) or blocked
+        (ADR 0208 addendum). The shared condition is ``unleased_release_reason``."""
+        status = ctx.campaign["status"]
+        steering = None
+        if status == "running":
+            steering = self._one(
+                "SELECT paused FROM campaign_steering WHERE campaign_id=?", (ctx.campaign["id"],)
+            )
+        return unleased_release_reason(status, bool(steering and steering["paused"]))
+
+    def _release_unleased_grants(self, ctx: _Ctx) -> None:
+        """A paused or blocked campaign gives back each grant no worker ever took (ADR 0167;
+        blocked: ADR 0208 addendum).
 
         Reduce-only and fail closed. A grant with any lease, operation, a recorded attempt
         operation or ``cancel_requested`` status is kept, as is any grant of a holdout stage
-        or of a provider that is not a registered worker-grant provider. The release is the
-        shared reconcile accounting (hold moved to settled at zero); the attempt ends
+        or of a provider that is not a registered worker-grant or Salad route provider (a
+        Salad attempt must still be ``awaiting_lease``). The release is the shared reconcile
+        accounting (hold moved to settled at zero); the attempt ends
         ``failed_transient``/``not_started``, so it uses an attempt number but no scientific
-        retry (ADR 0046). Resuming places a new attempt through the normal admission path."""
+        retry (ADR 0046). Resuming or unblocking places a new attempt through the normal
+        admission path."""
         with self.store.runner_connection() as connection:
             candidates = unclaimed_candidates(connection, ctx.campaign["id"])
         for attempt_id in candidates:
             attempt = self._attempt(attempt_id)
             try:
                 spec_stage = self._spec_stage(ctx, attempt["stage_key"])
-                kind = self._provider(spec_stage).descriptor.kind
+                provider = (
+                    stage_provider(attempt["provider_id"])
+                    if attempt.get("provider_id")
+                    else self._provider(spec_stage)
+                )
+                kind = provider.descriptor.kind
             except KeyError:
                 continue  # unregistered provider: fail closed, the grant stays
-            if kind != "worker_grant" or spec_stage.holdout is not None:
+            if kind not in UNLEASED_RELEASE_KINDS or spec_stage.holdout is not None:
                 continue
             with self.store.runner_connection() as connection:
                 self._hold_lease(connection)
@@ -707,12 +1008,13 @@ class CampaignRunner:
                     "SELECT paused FROM campaign_steering WHERE campaign_id=?",
                     (campaign["id"],),
                 ).fetchone()
-                paused = campaign["status"] == "paused_delegation_lapsed" or (
-                    campaign["status"] == "running" and bool(steering and steering["paused"])
+                found = unleased_release_reason(
+                    campaign["status"], bool(steering and steering["paused"])
                 )
-                if not paused:
+                if found is None:
                     return
-                grant = releasable_paused_grant(connection, attempt_id)
+                reason, detail = found
+                grant = releasable_unleased_grant(connection, attempt_id)
                 if grant is None:
                     continue
                 now = _iso(self.now())
@@ -724,6 +1026,9 @@ class CampaignRunner:
                     is None
                 ):
                     continue  # the reservation ledger cannot cover it: a person reconciles
+                mark = getattr(provider, "mark_unclaimed", None)
+                if kind == "salad_route" and callable(mark):
+                    mark(connection, attempt_id, now)  # the Salad row leaves awaiting_lease
                 self._touch(
                     connection,
                     "campaign_stage_attempts",
@@ -731,7 +1036,7 @@ class CampaignRunner:
                     (attempt_id,),
                     status="failed_transient",
                     failure_class=NOT_STARTED,
-                    failure_detail=PAUSED_RELEASE_DETAIL,
+                    failure_detail=detail,
                 )
                 self._settle(connection, attempt_id, 0, "unclaimed_zero")
                 released = connection.execute(
@@ -740,7 +1045,7 @@ class CampaignRunner:
                 self.store.record_runner_event(
                     connection,
                     campaign,
-                    "execution.paused_unleased_grant_released",
+                    f"execution.{reason}_released",
                     {
                         "grant_id": grant["id"],
                         "lease_count": 0,
@@ -757,13 +1062,15 @@ class CampaignRunner:
                     connection,
                     campaign,
                     released,
-                    reason=PAUSED_UNLEASED_GRANT,
-                    trigger="paused_campaign_release",
+                    reason=reason,
+                    trigger=reason.replace("_unleased_grant", "_campaign_release"),
                     record_event=self.store.record_runner_event,
                     grant_id=grant["id"],
                 )
-            self._actions.append(f"slot_freed:{attempt_id}:{PAUSED_UNLEASED_GRANT}")
-        self._free_paused_releases(ctx)
+            self._actions.append(f"slot_freed:{attempt_id}:{reason}")
+        found = self._unleased_release(ctx)
+        if found is not None and found[0] == PAUSED_UNLEASED_GRANT:
+            self._free_paused_releases(ctx)  # a blocked campaign's releases follow ADR 0153
 
     def _free_paused_releases(self, ctx: _Ctx) -> None:
         """Give back the input releases a paused campaign no longer needs (ADR 0167).
@@ -1707,7 +2014,10 @@ class CampaignRunner:
     def _drive_running(self, ctx: _Ctx) -> None:
         providers = self._providers(ctx)
         for provider in providers:
-            provider.after_tick(self, ctx)
+            # Isolated like a stage: one provider's upkeep error never stops the stages.
+            self._guard_hook(
+                ctx, provider, "after_tick", lambda p=provider: p.after_tick(self, ctx)
+            )
         if providers and self._campaign(ctx.campaign["id"])["status"] not in {
             "running",
             "stopping",
@@ -1746,15 +2056,125 @@ class CampaignRunner:
                 _Waiting,
                 StepTransient,
                 sqlite3.OperationalError,
+                faults.HostFault,
             ):
-                # Control flow (lease, delegation, waiting, contention) and database faults
-                # end the pass exactly as before.
+                # Control flow (lease, delegation, waiting, contention), database faults and
+                # host faults end the pass exactly as before.
                 raise
             except StepFailed as error:
                 self._stage_step_failed(ctx, key, error)
+            except OSError as error:
+                kind = self._unit_os_error(error)
+                if kind == faults.IO:
+                    self._actions.append(f"io_deferred:{ctx.campaign['id']}:{key}")
+                elif faults.is_missing_blob(error):
+                    self._stage_os_failed(ctx, key, error)
+                else:
+                    # Any other filesystem error (unlisted errno, transient, a missing or
+                    # unreadable file) is counted toward the breaker; the stage is not failed.
+                    self._stage_runner_error(
+                        ctx, key, type(error).__name__, errno=faults.fault_kind(error)
+                    )
             except Exception as error:  # noqa: BLE001 - one stage must not starve the others
                 self._stage_runner_error(ctx, key, type(error).__name__)
         self._maybe_complete(ctx)
+
+    def _classify(self, error: BaseException) -> str:
+        """``runner_faults.classify`` against this runner's state directory."""
+        return faults.classify(error, self.state_dir)
+
+    def _unit_os_error(self, error: OSError) -> str:
+        """The class of a filesystem error one stage or hook raised outside a step: a host
+        fault becomes ``HostFault`` (the runner pauses, nothing is counted), a brief I/O error
+        feeds the tick's host I/O streak and counts nothing; any other class is returned for
+        the caller to count toward the campaign's breaker."""
+        kind = self._classify(error)
+        if kind == faults.ENVIRONMENT:
+            raise faults.HostFault(faults.fault_kind(error), type(error).__name__) from None
+        if kind == faults.IO:
+            self._tick_io = True
+        return kind
+
+    def _guard_hook(self, ctx: _Ctx, provider: Any, hook: str, call: Callable[[], None]) -> None:
+        """Run one provider's pre-stage hook under the same per-unit guard as a stage."""
+        try:
+            call()
+        except (
+            _LeaseLost,
+            DelegationLapsed,
+            _Waiting,
+            StepTransient,
+            sqlite3.OperationalError,
+            faults.HostFault,
+        ):
+            raise
+        except StepFailed as error:
+            self._hook_runner_error(
+                ctx,
+                provider,
+                hook,
+                "StepFailed",
+                step=error.step,
+                step_error_class=error.error_class,
+            )
+        except OSError as error:
+            if self._unit_os_error(error) == faults.IO:
+                return
+            self._hook_runner_error(
+                ctx, provider, hook, type(error).__name__, errno=faults.fault_kind(error)
+            )
+        except Exception as error:  # noqa: BLE001 - one hook must not starve the stages
+            self._hook_runner_error(ctx, provider, hook, type(error).__name__)
+
+    def _hook_runner_error(
+        self, ctx: _Ctx, provider: Any, hook: str, error_class: str, **detail: str
+    ) -> None:
+        """Log a pre-stage hook's error by class, record it once per (campaign, hook,
+        provider, class) and count it toward the breaker; the pass goes on. Descriptive
+        only: no exception text or payload is stored."""
+        descriptor = getattr(provider, "descriptor", None)
+        provider_id = str(getattr(descriptor, "provider_id", "") or "")[:80]
+        log.error(
+            "campaign %s %s hook (%s) runner error: %s",
+            ctx.campaign["id"],
+            hook,
+            provider_id,
+            error_class,
+        )
+        self._actions.append(f"hook_error:{ctx.campaign['id']}:{hook}:{error_class}")
+        self._drive_errors.add(error_class)
+        try:
+            with self.store.runner_connection() as connection:
+                self._hold_lease(connection)
+                self._emit_once_in(
+                    connection,
+                    ctx,
+                    HOOK_RUNNER_ERROR_EVENT,
+                    {"hook": hook, "provider": provider_id, "error_class": error_class[:80]},
+                    {name: str(value)[:80] for name, value in detail.items()},
+                )
+        except (sqlite3.Error, _LeaseLost):  # descriptive only: the pass goes on
+            return
+
+    def _stage_os_failed(self, ctx: _Ctx, key: str, error: OSError) -> None:
+        """A recorded blob that is gone (``runner_faults.is_missing_blob``, for example one
+        retention removed) under one stage: the one filesystem error that may fail a stage. As
+        for an escaped refused step: with no attempt that may be running or holding a live grant
+        the stage fails closed with ``os_error:<errno>``; otherwise it is recorded and counted,
+        never failing a started attempt."""
+        name = faults.fault_kind(error)
+        stage = self._stage_row(ctx, key)
+        live = any(
+            attempt["status"] in ACTIVE_ATTEMPT or attempt["status"] == "unknown"
+            for attempt in self._attempts(ctx, key)
+        )
+        if stage["status"] in TERMINAL_STAGE or live:
+            self._stage_runner_error(ctx, key, type(error).__name__, errno=name)
+            return
+        reason = f"os_error:{name}"[:300]
+        log.warning("campaign %s stage %s failed closed: %s", ctx.campaign["id"], key, reason)
+        self._stage_failed(ctx, key, reason)
+        self._actions.append(f"stage_failed:{key}:{reason}")
 
     def _stage_step_failed(self, ctx: _Ctx, key: str, error: StepFailed) -> None:
         """A refused step that escaped one stage's non-attempt paths (placement, success,
@@ -1811,6 +2231,7 @@ class CampaignRunner:
         if not classes:
             if complete:
                 self._error_streaks.pop(campaign_id, None)
+                self._stuck_backoff.pop(campaign_id, None)
             return
         streaks = {name: previous.get(name, 0) + 1 for name in classes}
         if not complete:
@@ -1824,8 +2245,16 @@ class CampaignRunner:
         """Block a running campaign that keeps raising one error class, through the ordinary
         block path: reduce-only, every attempt, grant and hold left as they are for a person
         to reconcile; nothing settled and no stage failed. It stays blocked until a person
-        re-approves it (``_drive_blocked``) or cancels it."""
+        re-approves it (``_drive_blocked``) or cancels it.
+
+        A campaign the breaker cannot block (already blocked, paused, cancelling) gets one
+        event per (campaign, status, class) instead, so the loop is visible, never silent; its
+        status is unchanged. Only an already blocked campaign's drive also backs off (doubling,
+        bounded): a cancelling one keeps its every-pass cancel, settlement of exited attempts
+        and release of grants."""
         reason = f"{RUNNER_ERROR_PREFIX}{error_class}"[:300]
+        blocked = 0
+        status: str | None = None
         try:
             with self.store.runner_connection() as connection:
                 self._hold_lease(connection)
@@ -1857,23 +2286,73 @@ class CampaignRunner:
                         {"reason": "runner_error", "error_class": error_class[:80]},
                     )
                     self._free_campaign_releases(connection, campaign_id, "campaign_blocked")
-                elif campaign["status"] == "cancel_requested":
+                else:
+                    status = campaign["status"]
+                    fingerprint = (status, campaign.get("revision"))
                     ctx = _Ctx(campaign, None, None, 0)  # type: ignore[arg-type]
-                    self._emit_once_in(
-                        connection,
-                        ctx,
-                        CANCEL_RUNNER_ERROR_EVENT,
-                        {"error_class": error_class[:80]},
-                        {"threshold": RUNNER_ERROR_THRESHOLD},
-                    )
+                    if status == "cancel_requested":
+                        self._emit_once_in(
+                            connection,
+                            ctx,
+                            CANCEL_RUNNER_ERROR_EVENT,
+                            {"error_class": error_class[:80]},
+                            {"threshold": RUNNER_ERROR_THRESHOLD},
+                        )
+                    elif (campaign.get("stop_reason") or "") != reason:
+                        # A breaker block for this same class already names it: no second
+                        # event. Any other stuck campaign records the loop once.
+                        self._emit_once_in(
+                            connection,
+                            ctx,
+                            STUCK_RUNNER_ERROR_EVENT,
+                            {"status": str(status)[:40], "error_class": error_class[:80]},
+                            {"consecutive": count, "threshold": RUNNER_ERROR_THRESHOLD},
+                        )
         except (sqlite3.Error, _LeaseLost) as error:
             log.error("campaign %s breaker could not block: %s", campaign_id, type(error).__name__)
             return
         if blocked:
             # A resumed campaign starts a fresh count.
             self._error_streaks.pop(campaign_id, None)
+            self._stuck_backoff.pop(campaign_id, None)
             log.error("campaign %s blocked: %s", campaign_id, reason)
             self._actions.append(f"blocked:{campaign_id}:{reason}")
+            return
+        if status != "blocked":
+            return
+        previous = self._stuck_backoff.get(campaign_id)
+        delay = (
+            STUCK_BACKOFF_SECONDS
+            if previous is None
+            else min(previous[1] * 2, MAX_STUCK_BACKOFF_SECONDS)
+        )
+        self._stuck_backoff[campaign_id] = (
+            self.now() + timedelta(seconds=delay),
+            delay,
+            fingerprint,
+        )
+        log.error(
+            "campaign %s (%s) keeps raising %s: backing off %.0fs",
+            campaign_id,
+            status,
+            error_class[:80],
+            delay,
+        )
+        self._actions.append(f"backing_off:{campaign_id}:{error_class[:80]}")
+
+    def _backing_off(self, campaign_id: str) -> bool:
+        """The campaign's breaker back-off still holds: it is unexpired and the campaign row
+        (status and revision) is unchanged since it was set."""
+        entry = self._stuck_backoff.get(campaign_id)
+        if entry is None:
+            return False
+        until, _delay, fingerprint = entry
+        row = self._one("SELECT status, revision FROM campaigns WHERE id=?", (campaign_id,))
+        if row is None or (row["status"], row["revision"]) != fingerprint:
+            del self._stuck_backoff[campaign_id]
+            self._error_streaks.pop(campaign_id, None)
+            return False
+        return self.now() < until
 
     def _runner_error_block_stands(self, campaign_id: str, project_id: str) -> bool:
         """A breaker block holds until a person re-approves the campaign after it."""
@@ -1907,6 +2386,26 @@ class CampaignRunner:
                 self._actions.append(f"evidence_failed:{ctx.campaign['id']}:{error.error_class}")
                 self._note_evidence_failed(ctx, provider, error)
                 continue
+            except (
+                _LeaseLost,
+                DelegationLapsed,
+                StepTransient,
+                sqlite3.OperationalError,
+                faults.HostFault,
+            ):
+                raise
+            except OSError as error:
+                if self._unit_os_error(error) == faults.IO:
+                    continue
+                self._hook_runner_error(
+                    ctx,
+                    provider,
+                    "evidence_pass",
+                    type(error).__name__,
+                    errno=faults.fault_kind(error),
+                )
+            except Exception as error:  # noqa: BLE001 - one hook must not starve the stages
+                self._hook_runner_error(ctx, provider, "evidence_pass", type(error).__name__)
 
     def _note_evidence_failed(self, ctx: _Ctx, provider: Any, error: StepFailed) -> None:
         """One ``campaign.evidence_pass_failed`` event per (campaign, provider, step, class), so a
@@ -2981,9 +3480,10 @@ class CampaignRunner:
             (ctx.campaign["id"], key),
             status="blocked_unknown",
         )
+        # ADR 0216: a cancelling campaign is never blocked; its cancel finishes at the hold.
         updated = connection.execute(
             """UPDATE campaigns SET status='blocked', updated_at=?
-            WHERE id=? AND status IN ('running','stopping','cancel_requested')""",
+            WHERE id=? AND status IN ('running','stopping')""",
             (_iso(self.now()), ctx.campaign["id"]),
         )
         if updated.rowcount:
@@ -4365,9 +4865,9 @@ class CampaignRunner:
         one event on the receipt, in the grant's own transaction."""
         previous = connection.execute(
             """SELECT id, attempt FROM campaign_stage_attempts WHERE campaign_id=?
-            AND stage_key=? AND attempt<? AND failure_class=? AND failure_detail=?
+            AND stage_key=? AND attempt<? AND failure_class=? AND failure_detail IN (?,?)
             ORDER BY attempt DESC LIMIT 1""",
-            (ctx.campaign["id"], key, attempt["attempt"], NOT_STARTED, PAUSED_RELEASE_DETAIL),
+            (ctx.campaign["id"], key, attempt["attempt"], NOT_STARTED, *UNLEASED_RELEASE_DETAILS),
         ).fetchone()
         if previous is None or previous["attempt"] != attempt["attempt"] - 1:
             return
@@ -5052,11 +5552,12 @@ class CampaignRunner:
         grant_id = attempt["grant_id"]
         settlement, basis = self._settlement_for(spec_stage, attempt)
         detail = str(attempt["failure_detail"] or "").removeprefix("salad:")
-        if attempt["failure_class"] == INFRA_SALAD_RECONCILED_NO_OUTPUT or detail.startswith(
-            INFRA_SALAD_RECONCILED_NO_OUTPUT
+        if attempt["failure_class"] in GUARDIAN_CLOSED_NO_OUTPUT_CLASSES or detail.startswith(
+            GUARDIAN_CLOSED_NO_OUTPUT_CLASSES
         ):
-            # ADR 0212: with no worker-confirmed exit, the guardian's provider-confirmed close
-            # is the termination evidence; the Salad driver re-checks it as it reconciles.
+            # ADR 0212 (and its lost-route addendum): with no worker-confirmed exit, the
+            # guardian's terminal close is the termination evidence; the Salad driver re-checks
+            # it as it reconciles.
             closed = getattr(self._provider(spec_stage), "reconcile_closed_no_output", None)
             if closed is not None and closed(self, ctx, attempt, settlement, basis):
                 return True
@@ -5687,12 +6188,86 @@ class CampaignRunner:
             return
         if self._revoke_releases(ctx):
             return
-        if self._one(
-            "SELECT 1 FROM campaign_stages WHERE campaign_id=? AND status='blocked_unknown'",
-            (ctx.campaign["id"],),
-        ):
-            return
+        # ADR 0216: a ``blocked_unknown`` stage no longer holds the cancel back; its unknown
+        # attempt keeps its hold, unsettled, and was made reduce-only above.
         self._finish(self._campaign(ctx.campaign["id"]), "cancelled")
+
+    def _settle_reconciled_unknown(self, ctx: _Ctx, key: str, attempt: dict[str, Any]) -> bool:
+        """A cancelled campaign's unknown attempt whose grant a person already reconciled
+        settles as the blocked drive would settle it (``failed_permanent``, or the retryable
+        class with no retry since the campaign is cancelling); False while its settlement
+        still waits for a charge (it is then held like any unknown attempt)."""
+        try:
+            cents, basis = self._settlement_for(self._spec_stage(ctx, key), attempt)
+        except (_Waiting, KeyError):
+            return False
+        failure_class = (
+            INFRA_RECONCILED_RETRYABLE
+            if self._reconciled_retryable(ctx, attempt["grant_id"])
+            else attempt["failure_class"]
+        )
+        with self.store.runner_connection() as connection:
+            self._touch(
+                connection,
+                "campaign_stage_attempts",
+                "id=? AND status='unknown'",
+                (attempt["id"],),
+                status="failed_permanent",
+                failure_class=failure_class,
+            )
+            self._settle(connection, attempt["id"], cents, basis)
+        return True
+
+    def _hold_unknown_for_cancel(self, ctx: _Ctx, key: str, attempt: dict[str, Any]) -> bool:
+        """ADR 0216: a cancelled campaign's unknown attempt is made reduce-only and left at its
+        hold: its provider's own stop (a Salad route is cancelled), then its grant revoked.
+        Nothing is settled or released: the hold stays held, the attempt stays ``unknown`` and
+        its grant open to a person's reconcile, and its stage is ``blocked_unknown`` without
+        blocking the campaign. True while one of those reduce-only steps is still outstanding.
+        A refused step is recorded once and does not hold the cancel back."""
+        try:
+            stop = getattr(self._provider(self._spec_stage(ctx, key)), "stop_unknown", None)
+        except KeyError:
+            stop = None
+        grant = (
+            None
+            if attempt["grant_id"] is None
+            else self._one("SELECT * FROM execution_grants WHERE id=?", (attempt["grant_id"],))
+        )
+        reconciled = grant is not None and grant["status"] == "reconciled"
+        if reconciled and self._settle_reconciled_unknown(ctx, key, attempt):
+            return False
+        try:
+            if stop is not None and stop(self, ctx, key, attempt):
+                return True
+            if grant is not None and grant["status"] == "active":
+                self._revoke(ctx, key, attempt, grant)
+                return True
+        except StepFailed as error:
+            self.emit_once(
+                ctx,
+                "campaign.cancel_unknown_step_refused",
+                {"stage_key": key, "attempt": attempt["attempt"], "step": error.step},
+                {"error_class": error.error_class},
+            )
+        except _Waiting:
+            return True
+        self.emit_once(
+            ctx,
+            "campaign.cancel_held_unknown",
+            {"stage_key": key, "attempt": attempt["attempt"]},
+            {
+                "attempt_id": attempt["id"],
+                "grant_id": attempt["grant_id"],
+                "hold_cents": attempt["hold_cents"],
+                "grant_status": None if grant is None else grant["status"],
+                "settled": False,
+            },
+        )
+        stage = self._stage_row(ctx, key)
+        if stage["status"] not in TERMINAL_STAGE:
+            self._set_stage(ctx, key, status="blocked_unknown")
+        return False
 
     def _cancel_stage_attempts(self, ctx: _Ctx, key: str) -> bool:
         """Unwind this stage's attempts; True while any authority is still outstanding."""
@@ -5702,8 +6277,10 @@ class CampaignRunner:
             if attempt["status"] == "unknown":
                 if self._auto_reconcile(ctx, key, attempt):
                     continue
-                self._stage_unknown(ctx, key)
-                return True
+                # ADR 0216: the cancel finishes past it, at its hold (reduce-only).
+                if self._hold_unknown_for_cancel(ctx, key, attempt):
+                    outstanding = True
+                continue
             if attempt["grant_id"] is None:
                 if attempt["status"] == "reserved":
                     self._cancel_unstarted(ctx, attempt)
@@ -5946,7 +6523,7 @@ class CampaignRunner:
             if fresh is None:
                 return False
             verdict = assess_unclaimed(connection, fresh, ctx.campaign, provider)
-            used = automatic_count(connection, ctx.campaign)
+            limited = self._unclaimed_limit(connection, ctx, key)
             # The owner's ``reconcile-unclaimed-attempts`` request for exactly this evidence
             # lifts only the per-campaign automatic limit; every guard still holds.
             asked = (
@@ -5956,14 +6533,9 @@ class CampaignRunner:
             )
         if isinstance(verdict, Refused):
             return self._unclaimed_refused(ctx, key, attempt, verdict)
-        limit = self.unclaimed_autoreconcile_limit
-        if used >= limit and asked is None:
+        reason, used, limit = limited
+        if reason is not None and asked is None:
             # Re-admission itself stays under the stage's own caps (attempt numbers, retries).
-            reason = (
-                "not auto-reconciled: automatic unclaimed reconcile is disabled"
-                if limit == 0
-                else f"not auto-reconciled: {used} of {limit} automatic reconciles used"
-            )
             self.emit_once(
                 ctx,
                 "campaign.autoreconcile_stopped",
@@ -5989,6 +6561,31 @@ class CampaignRunner:
             return self._unclaimed_refused(ctx, key, attempt, applied)
         return applied
 
+    def _unclaimed_limit(
+        self, connection: sqlite3.Connection, ctx: _Ctx, key: str
+    ) -> tuple[str | None, int, int]:
+        """``(reason, used, limit)``; ``reason`` is None while another automatic unclaimed
+        reconcile is allowed. ADR 0216: ``unclaimed_autoreconcile_limit`` bounds each stage, and
+        the campaign's bound is that times its stage count (0 still disables), so one stage's
+        repeats cannot use up its siblings' share and a large campaign is not stopped by the
+        same zero-spend evidence a small one may apply."""
+        per_stage = self.unclaimed_autoreconcile_limit
+        limit = per_stage * max(1, len(ctx.spec.stages))
+        used = automatic_count(connection, ctx.campaign)
+        if per_stage == 0:
+            return "not auto-reconciled: automatic unclaimed reconcile is disabled", used, 0
+        if used >= limit:
+            return f"not auto-reconciled: {used} of {limit} automatic reconciles used", used, limit
+        stage_used = automatic_count(connection, ctx.campaign, key)
+        if stage_used >= per_stage:
+            return (
+                f"not auto-reconciled: {stage_used} of {per_stage} automatic reconciles used "
+                "by this stage",
+                used,
+                limit,
+            )
+        return None, used, limit
+
     def _apply_unclaimed(
         self,
         ctx: _Ctx,
@@ -6007,10 +6604,7 @@ class CampaignRunner:
             if again.digest != verdict.digest:
                 return False  # the records moved: judge them afresh next tick
             asked = unclaimed_requested(connection, ctx.campaign, attempt["id"], again.digest)
-            if (
-                asked is None
-                and automatic_count(connection, ctx.campaign) >= self.unclaimed_autoreconcile_limit
-            ):
+            if asked is None and self._unclaimed_limit(connection, ctx, key)[0] is not None:
                 return False
             grant = connection.execute(
                 "SELECT * FROM execution_grants WHERE id=? AND project_id=?",
@@ -6427,6 +7021,10 @@ class CampaignRunner:
                 except _Waiting:
                     continue  # claimed and no recorded charge yet: wait, never zero
                 key = attempt["stage_key"]
+                if self._reconciled_retryable(ctx, grant["id"]):
+                    # ADR 0216: a person reconciled it as retryable infrastructure.
+                    self._settle_retryable(ctx, key, attempt, cents, basis)
+                    continue
                 current = self._spec_stage(ctx, key)
                 with self.store.runner_connection() as connection:
                     # ADR 0060 addendum: a reconciled attempt that provably never started,
@@ -6476,6 +7074,24 @@ class CampaignRunner:
             "SELECT 1 FROM campaign_stage_attempts WHERE campaign_id=? AND status='unknown'",
             (ctx.campaign["id"],),
         )
+        current = self._campaign(ctx.campaign["id"])
+        if remaining is not None and (current["stop_reason"] or "").startswith("cancel:"):
+            # ADR 0216: a campaign blocked while cancelling hands back to the cancel, which
+            # finishes past its unknown attempts at their holds (reduce-only).
+            with self.store.runner_connection() as connection:
+                moved = connection.execute(
+                    "UPDATE campaigns SET status='cancel_requested', updated_at=? "
+                    "WHERE id=? AND status='blocked'",
+                    (_iso(self.now()), ctx.campaign["id"]),
+                ).rowcount
+                if moved:
+                    self.store.record_runner_event(
+                        connection,
+                        current,
+                        "campaign.unblocked",
+                        {"cancelling": True, "past_unknown": True, "at": _iso(self.now())},
+                    )
+            return
         if remaining is None:
             if self._runner_error_block_stands(ctx.campaign["id"], ctx.campaign["project_id"]):
                 return  # the breaker's block: a person re-approves (or cancels) first
@@ -6484,7 +7100,10 @@ class CampaignRunner:
             cancelling = stop_reason.startswith("cancel:")
             # The breaker's own stop reason is operational, not a stop decision: a re-approved
             # campaign resumes without it (the reason stays on the runner_error event).
-            cleared = stop_reason.startswith(RUNNER_ERROR_PREFIX)
+            # A stored-spec block is the same: the spec verifies again, so the reason is gone.
+            cleared = stop_reason.startswith(RUNNER_ERROR_PREFIX) or stop_reason in (
+                STORED_SPEC_REASONS
+            )
             with self.store.runner_connection() as connection:
                 connection.execute(
                     "UPDATE campaigns SET status=?, updated_at=?, stop_reason=CASE WHEN ? "
@@ -6507,6 +7126,89 @@ class CampaignRunner:
                         **({"cleared_stop_reason": stop_reason[:300]} if cleared else {}),
                     },
                 )
+
+    def _reconciled_retryable(self, ctx: _Ctx, grant_id: str) -> bool:
+        """The grant was reconciled through the retryable-infrastructure route (ADR 0216)."""
+        return (
+            self._one(
+                """SELECT 1 FROM events WHERE project_id=? AND event_type=?
+                AND json_extract(payload_json,'$.grant_id')=? LIMIT 1""",
+                (ctx.campaign["project_id"], RETRYABLE_RECONCILE_EVENT, grant_id),
+            )
+            is not None
+        )
+
+    def _settle_retryable(
+        self, ctx: _Ctx, key: str, attempt: dict[str, Any], cents: int, basis: str
+    ) -> None:
+        """ADR 0216: settle a retryable-reconciled unknown attempt at the grant's settlement and
+        retry its stage within ``retry.infra_retries`` (never a scientific retry); with none
+        left, only this stage fails, under ``infra_reconciled_retryable``. One transaction for
+        the attempt, its settlement, its stage and one event."""
+        spec_stage = self._spec_stage(ctx, key)
+        others = [a for a in self._attempts(ctx, key) if a["id"] != attempt["id"]]
+        used, limit = infra_attempts(others), spec_stage.retry.infra_retries
+        retry = used < limit
+        detail = (
+            "reconciled by a person as retryable infrastructure at the guardian's bound; "
+            + (
+                f"infrastructure failure, retry {used + 1} of {limit} allowed"
+                if retry
+                else f"no infrastructure retry left ({used} of {limit})"
+            )
+        )[:500]
+        with self.store.runner_connection() as connection:
+            self._touch(
+                connection,
+                "campaign_stage_attempts",
+                "id=? AND status='unknown'",
+                (attempt["id"],),
+                status="failed_transient" if retry else "failed_permanent",
+                failure_class=INFRA_RECONCILED_RETRYABLE,
+                failure_detail=detail,
+            )
+            self._settle(connection, attempt["id"], cents, basis)
+            if retry:
+                self._touch(
+                    connection,
+                    "campaign_stages",
+                    "campaign_id=? AND stage_key=? AND status='blocked_unknown'",
+                    (ctx.campaign["id"], key),
+                    status="preparing",
+                )
+            else:
+                self._touch(
+                    connection,
+                    "campaign_stages",
+                    "campaign_id=? AND stage_key=?",
+                    (ctx.campaign["id"], key),
+                    status="failed",
+                )
+                connection.execute(
+                    "UPDATE campaigns SET stop_reason=? WHERE id=? AND stop_reason IS NULL",
+                    (f"stage_failed:{key}:{INFRA_RECONCILED_RETRYABLE}", ctx.campaign["id"]),
+                )
+                self._free_campaign_releases(
+                    connection, ctx.campaign["id"], "attempt_settled_while_blocked"
+                )
+            self.store.record_runner_event(
+                connection,
+                ctx.campaign,
+                "campaign.attempt_reconciled_retryable",
+                {
+                    "stage_key": key,
+                    "attempt": attempt["attempt"],
+                    "attempt_id": attempt["id"],
+                    "grant_id": attempt["grant_id"],
+                    "settlement_cents": cents,
+                    "settlement_basis": basis,
+                    "retried": retry,
+                    "infra_retries_used": used + 1 if retry else used,
+                    "infra_retries_max": limit,
+                    "consumed_scientific_retry": False,
+                },
+            )
+        self._actions.append(f"reconciled_retryable:{key}:{attempt['attempt']}:{retry}")
 
     # -- completion -----------------------------------------------------------------
 
@@ -6624,6 +7326,7 @@ def start_background(
     *,
     scheduler: bool = True,
     unclaimed_autoreconcile_limit: int = DEFAULT_UNCLAIMED_AUTORECONCILE_LIMIT,
+    on_tick: Callable[[], None] | None = None,
 ) -> RunnerHandle:
     runner = CampaignRunner(
         state_dir,
@@ -6638,6 +7341,8 @@ def start_background(
             try:
                 runner.tick()
                 failures = 0
+                if on_tick is not None:
+                    on_tick()
             except Exception as error:  # noqa: BLE001 - keep the loop alive, log no payloads
                 failures += 1
                 log.error(

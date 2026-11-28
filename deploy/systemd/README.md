@@ -31,8 +31,9 @@ owner-only files that the config names by path.
 
 The Salad units spend money only when you supply Salad profiles, credentials
 and an approved campaign. Without them the executor refuses setup (exit 2) and
-the guardian prints an `unavailable` state; neither is restarted on that exit
-code. Review the spend-safety documents before enabling them. The guardian
+the guardian prints an `unavailable` state and exits 2 for a refused configuration;
+neither is restarted on that exit code. Review the spend-safety documents before
+enabling them. The guardian
 (`--run` is required; without it the program prints `disabled` and exits 0)
 should be running before the executor.
 
@@ -56,7 +57,7 @@ should be running before the executor.
 
 ## Health and restarts
 
-`development-poll` and the executor accept `--health-file`; the units write it
+`development-poll`, the executor and the guardian accept `--health-file`; the units write it
 to `/var/lib/tessera/health/<name>.json` (schema `tessera.service-health.v1`,
 fields `state`, `last_loop_at`, `loops`, `consecutive_errors`). The file is
 written between steps, never during one, so a long Salad route step leaves it
@@ -66,12 +67,14 @@ exits 1 when the state is not `running` or the file is older than `MAX_AGE`
 interval). A failed probe appears in `systemctl --failed`; it never restarts a
 service. Enable with
 `systemctl enable --now tessera-health-check-development-poll.timer
-tessera-health-check-salad-executor.timer`.
+tessera-health-check-salad-executor.timer tessera-health-check-salad-guardian.timer`.
 
-The guardian has no health file. Check it through its own authenticated
-endpoint as described in `docs/salad-safety-service.md`; `Restart=on-failure`
-covers crashes. Exit code 2 (configuration or prerequisite refused) is not
-retried (`RestartPreventExitStatus=2`).
+The guardian writes its file from its serve loop at most every 5 seconds, so a
+stale file means a stuck loop. Its authenticated endpoint (see
+`docs/salad-safety-service.md`) remains the check of record; `Restart=on-failure`
+covers crashes. Exit code 2 means the operator's own configuration was refused
+and is not retried (`RestartPreventExitStatus=2`); every other fatal error
+(including a JWKS fetch that failed at boot) exits 1 and is restarted.
 
 ## Submit runner (starts with the target, only if admitted)
 

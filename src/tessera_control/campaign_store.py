@@ -85,6 +85,7 @@ from .campaign_salad_commands import (  # noqa: F401
     SaladWorkerCommands,
     _GuardianFinal,
 )
+from .campaign_salad_retry_default import with_salad_infra_retry_default
 from .campaign_standing_store import StandingApprovalCommands
 from .campaign_steering import CampaignSteeringCommands
 from .campaign_unclaimed_recovery import UnclaimedRecovery
@@ -811,9 +812,14 @@ class CampaignStore(
                 raise Forbidden("This credential cannot submit campaigns.")
             # ADR 0076/0077: a Salad adapter request becomes the explicit candidate before the spec
             # is digested; the identity for a spec without one.
+            # ADR 0215: a fresh Salad stage that leaves retry.infra_retries unset gets the Salad
+            # default written in before the digest; a re-run keeps its stored value.
+            submitted = (
+                body.spec if lineage is not None else with_salad_infra_retry_default(body.spec)
+            )
             # ADR 0123: image_from becomes the built image before expansion and the digest.
             image_spec, used_predecessors = self._resolve_image_refs(
-                connection, live, project_id, body.spec, body.predecessors
+                connection, live, project_id, submitted, body.predecessors
             )
             spec = expand_with_registered(
                 image_spec,

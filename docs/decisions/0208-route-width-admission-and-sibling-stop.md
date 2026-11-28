@@ -75,3 +75,58 @@ finished campaign is not offered: the rerun is the remedy. A stage still waiting
 sibling fails later takes a grant, a lease and a route slot before it is stopped at `route_started`
 and released at 0 (nothing is sent or spent). A stage that never started is reported `failed`, not
 `not_started`.
+
+## Addendum: a blocked campaign gives back its unleased grants; `unknown` keeps its route slot
+
+**Context.** The width counts every grant-holding, non-terminal Salad attempt of any campaign. An
+unleased grant was given back only by a paused campaign (ADR 0167, worker-grant providers only)
+or on expiry (ADR 0153, hours later). A live rerun went `blocked` with three grants holding no
+route at width 2, so every Salad campaign waited for a slot until those grants expired. The
+executor also leased an `awaiting_lease` item without looking at its campaign's status, and an
+`unknown` attempt freed its slot although its Salad route might still be running.
+
+**Decision.**
+1. **Blocked releases like paused.** One condition (`unleased_release_reason`) decides whether a
+   campaign gives back the grants no worker took: paused (`paused_delegation_lapsed`, or
+   `running` with a steering pause) or `blocked`. The runner checks it on each pass and again
+   inside the write transaction. The evidence and the accounting are ADR 0167's, unchanged. The
+   attempt is `granted` or `admitted`, unsettled, and has no operation. The grant is `active`,
+   with no lease row of any age and no external operation. The hold moves to settled at 0
+   (`reconcile_grant_row`). The attempt ends `failed_transient`/`not_started`, which uses an
+   attempt number but no scientific retry. Unblocking places a new attempt through the normal
+   `issue_grant` admission. Eligible providers are registered worker-grant and Salad route
+   providers. A Salad attempt must still be `awaiting_lease` with no lease or operation on its
+   Salad row, and its row moves to `unclaimed` in the same transaction, so it is never listed
+   to the executor again. Holdout stages and any other provider kind keep their grants. This also
+   applies the ADR 0167 release to a paused campaign's unleased Salad grants (it covered worker
+   grants only). For worker grants, paused behaviour is unchanged. A blocked release writes
+   `execution.blocked_unleased_grant_released` and a `campaign.slot_freed` (reason
+   `blocked_unleased_grant`, trigger `blocked_campaign_release`). A blocked campaign's input
+   releases stay under the idle-campaign rule (ADR 0153), as before.
+2. **A leased grant stays.** A grant with any lease or operation is in flight. It keeps its
+   slot until the evidence paths (ADR 0053, ADR 0153) settle it or a person reconciles it.
+3. **The executor takes no lease for a campaign that may not run it.** An `awaiting_lease`
+   item is leased only while its campaign is `running` (not steering-paused) or `stopping`.
+   Control lists the work with `steering_paused`. The executor skips any other item, never
+   failing it, and logs `lease_held` with the status (`paused` for a steering pause). `stopping`
+   stays leasable because ADR 0038 lets outstanding attempts finish: refusing the lease would
+   strand the grant, and its route slot, until expiry. An item from an older control without
+   `campaign_status` is leased, as before. A lease the executor already holds is not
+   abandoned.
+4. **`unknown` keeps its slot until the route end is confirmed.** `unknown` is still terminal
+   for `ROUTE_SLOT_SQL`. In addition, an `unknown` Salad attempt that holds a grant and has a
+   route counts as occupied until control's latest route record confirms the route stopped. A
+   reallocated route needs the provider's own read of the stopped group (ADR 0149). Any other
+   route needs termination confirmed, provider status `stopped` and a provider readback.
+   Without a route record, the slot stays occupied. An `unknown` attempt without a route frees
+   its slot (nothing was started on Salad). Leaving `unknown` through any reconcile frees it,
+   as any terminal status does.
+
+**Consequences.** At width 2, the live shape (blocked, three unleased grants) frees its slots on
+the next runner pass. A waiting stage of another campaign then takes a slot through the unchanged
+admission path. It gave its input release back while it waited, so it is granted a pass or two
+later. An `unknown` attempt whose route end is unproven now holds a slot until it is
+reconciled, which can narrow admission. This is the fail-closed choice: control never grants
+more routes than the executor may be running. Nothing loosens a claim, admission, spend,
+cancel or sealing guard. Every new path only gives back authority nobody used, or counts more.
+

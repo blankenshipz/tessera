@@ -161,6 +161,16 @@ def salad_stage(env: Env, key: str = "g1", /, *, hold: int = HOLD, attempts: int
         ),
     }
     value.update(over)
+    return _explicit_infra_retries(value)
+
+
+def _explicit_infra_retries(value: dict[str, Any]) -> dict[str, Any]:
+    """These fixtures predate the Salad submit-time ``infra_retries`` default (ADR 0215): a
+    stage that leaves it unset keeps the explicit 0 the tests were written against (0 is not
+    serialized, so every digest is unchanged). A test of the default drops the key itself."""
+    retry = value.get("retry")
+    if isinstance(retry, dict) and "infra_retries" not in retry:
+        value["retry"] = {**retry, "infra_retries": 0}
     return value
 
 
@@ -219,7 +229,7 @@ def salad_stage_v2(env: Env, key: str = "g1", /, **over: Any) -> dict[str, Any]:
         "outputs": [{"name": "output", "path": "output.json", "max_bytes": 4096}],
     }
     value.update(over)
-    return value
+    return _explicit_infra_retries(value)
 
 
 def salad_spec_v2(env: Env, stages: list[dict[str, Any]], **over: Any) -> dict[str, Any]:

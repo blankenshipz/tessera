@@ -430,8 +430,13 @@ evidence, bounded at two identical repeats per stage; a reboot or an unreported 
 needs a person, see
 [ADR 0046](docs/decisions/0046-automatic-not-started-reconciliation.md); an attempt whose
 provider proves no create or start was ever claimed, which the runner reconciles at zero and
-re-queues, at most `--campaign-unclaimed-autoreconcile-limit` times per campaign (default 2),
-see [ADR 0157](docs/decisions/0157-unclaimed-attempt-automatic-reconcile.md); and an attempt whose
+re-queues, at most `--campaign-unclaimed-autoreconcile-limit` times per stage (default 2; a
+campaign may apply that times its stage count), see
+[ADR 0157](docs/decisions/0157-unclaimed-attempt-automatic-reconcile.md) and
+[ADR 0216](docs/decisions/0216-limbo-states-automatic-exits.md); a Salad attempt still waiting
+for its compute charge an hour after a person was asked, which settles at the guardian's bound
+(its hold, provisional) when the guardian's own record shows the frame closed, or else blocks
+its campaign once until the charge is recorded; and an attempt whose
 worker confirmed the exit with no contradiction, which the runner resolves, releasing its grant
 and slot and never recording a pass (and not while its outputs are still arriving; a stalled upload, or one past the hold ceiling, no longer holds it), see
 [ADR 0053](docs/decisions/0053-resolve-attempts-on-confirmed-exit.md) and
@@ -515,9 +520,10 @@ existing state needs the documented backup/migration procedure (`tessera backup`
 `tessera migrate`, `tessera restore`; see the command index below). Backups are bounded
 at 1 GiB unless the operator passes `--max-backup-bytes`
 ([recovery](docs/recovery.md)). `tessera deploy-check` reports what a deploy still needs
-(pending migrations, the backup bound, config keys a release removed, provider profiles) and
-applies the safe fixes with a receipt ([deploy check](docs/deploy-check.md)); `tessera deploy-upgrade`
-runs the whole upgrade (preflight, capped backup, migrate, ordered restart, health, smoke, receipt) as
+(pending migrations, the backup bound, config keys a release removed, provider profiles, stored
+campaigns the new code cannot read, and each service's own startup validation run under the new
+release with `--check-config`) and applies the safe fixes with a receipt ([deploy check](docs/deploy-check.md)); `tessera deploy-upgrade`
+runs the whole upgrade (preflight, a lease-aware stop guard, capped backup, migrate, ordered restart, health, smoke, receipt) as
 one dry-run-first command ([deploy upgrade](docs/deploy-upgrade.md)); `tessera deploy-request`
 records a gated release that deploys itself once nothing blocks it ([deploy request](docs/deploy-request.md)). Follow the
 [screen-by-screen quickstart](docs/quickstart.md) for review/export and troubleshooting.

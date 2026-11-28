@@ -129,6 +129,29 @@ def backend_status(state_dir: Path) -> dict[str, str | None]:
     return {"status": "ready", "reason": None, "backend_identity": identity}
 
 
+def readiness_status(
+    state_dir: Path,
+    *,
+    runner_ticked: bool | None = None,
+    providers_registered: bool | None = None,
+) -> dict[str, str | None]:
+    """``backend_status`` plus the in-memory conditions only the readiness probe adds.
+
+    ``runner_ticked`` is None when the app runs no in-process campaign runner (nothing to
+    wait for), else whether a runner tick has completed since start. ``providers_registered``
+    is None when the app was not started by ``tessera serve``, else whether provider
+    registration finished. The request gate keeps using ``backend_status`` alone."""
+
+    status = backend_status(state_dir)
+    if status["status"] != "ready":
+        return status
+    if providers_registered is False:
+        return {**status, "status": "unready", "reason": "providers_unregistered"}
+    if runner_ticked is False:
+        return {**status, "status": "unready", "reason": "runner_not_ticked"}
+    return status
+
+
 def _valid_host(host: str) -> bool:
     # Match Host allowlist syntax, not URLs, ports, wildcard or userinfo syntax.
     if host.startswith("[") and host.endswith("]"):

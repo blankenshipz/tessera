@@ -15,6 +15,7 @@ from .approval_trust import decision_provenance, require_decision_actor
 from .campaign_io import refuse_submitted_lineage
 from .campaign_models import normalize, spec_digest
 from .campaign_salad_adapter import expand_with_registered
+from .campaign_salad_retry_default import with_salad_infra_retry_default
 from .campaign_standing import (
     MAX_WINDOW_DAYS,
     CreateStandingApproval,
@@ -94,8 +95,9 @@ class StandingApprovalCommands:
                     "A standing approval cannot use image_from: pin the built image with a "
                     "literal image (name@sha256:...) instead."
                 )
+            # ADR 0215: the same Salad infra_retries default submit writes.
             spec = expand_with_registered(
-                body.spec,
+                with_salad_infra_retry_default(body.spec),
                 self.adapter_entries(connection, live, project_id),
                 tenant=(live["org_id"], project_id),
             )

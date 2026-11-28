@@ -19,9 +19,11 @@ its hold; nothing about settlement changes. When an attempt of a stage with
 alternates ended unstable on its own route (ADR 0148: the allocation changed within the window of
 first running; ADR 0149: the route was reallocated and the provider confirmed the group stopped),
 the stage does not switch: it is held (``blocked_unknown``, the campaign blocks) with one
-``campaign.salad_profile_fallback_stopped`` event, outcome ``post_start_switch_refused``, so a
-person (or an approved delegation) makes the retry decision. The attempt keeps its own outcome
-and settlement path; nothing new is held.
+``campaign.salad_profile_fallback_stopped`` event, outcome ``post_start_switch_refused``. The hold
+lasts one runner pass: the runner then repairs the stage to ``failed`` (ADR 0218) and the
+campaign unblocks; a person (or an approved delegation) makes the retry decision by rerunning
+the failed stage (``POST /campaigns/{id}/rerun``, mode ``failed_stages``). The attempt keeps its
+own outcome and settlement path; nothing new is held.
 
 Which attempt runs on which profile is derived only from the immutable switch events: attempt N
 runs on the ``to_profile`` of the latest switch on its candidate whose ``to_attempt`` is at most
@@ -94,7 +96,7 @@ NOT_APPROVED_DETAILS = frozenset(
 )
 SOURCE_SPEC = salad_alternate_profiles.SOURCE_SPEC
 SOURCE_OPERATOR = salad_alternate_profiles.SOURCE_OPERATOR
-# Every outcome holds the stage for a person (the campaign blocks).
+# Every outcome holds the stage for one runner pass (the campaign blocks), then it is failed.
 HOLDING = OUTCOMES
 
 # The runner's verdict for the latest failed attempt.
@@ -490,7 +492,7 @@ def _operator_preapproval_covers(
     """Conservative coverage of an operator fallback by a review pre-approval (ADR 0044).
 
     A pre-approval binds plan digests a person saw; an operator fallback was never shown. It is
-    covered only when every one of these holds, else the stage is held for a person:
+    covered only when every one of these holds, else the stage is held (one pass, then failed):
 
     - the stage is on its own provider and the entry covers that provider;
     - the entry records no per-profile digests (a candidate with spec alternates binds per
@@ -570,7 +572,8 @@ def after_failure(
 
     The strict rule: a run that ended unstable on its own route started (or may have), so the
     stage never moves to another profile. It is held with one stop event
-    (``post_start_switch_refused``) for an explicit retry decision. A pre-start move that was
+    (``post_start_switch_refused``); the hold lasts one pass, then the runner fails the stage
+    (ADR 0218) and the retry decision is a ``failed_stages`` rerun. A pre-start move that was
     refused (``profile_not_approved``, recorded with the attempt's transition) holds it too.
     Anything else keeps the existing behavior. Idempotent: a recorded stop is re-applied, never
     recorded twice.

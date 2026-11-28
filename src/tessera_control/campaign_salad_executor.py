@@ -16,6 +16,11 @@ then each child waits on its own thread and a further route starts only while th
 own ``max_open_billable_frames`` admits it (docs/campaigns.md, Salad GPU stage executor).
 
     python -m tessera_control.campaign_salad_executor --config FILE [--once] [--health-file PATH]
+    python -m tessera_control.campaign_salad_executor --config FILE --check-config
+
+Exit 0 is a clean stop, 1 a runtime failure (restart it), 2 a refusal of the operator's own
+configuration (restarting cannot help; ``tessera_control.exit_codes``). ``--check-config`` runs the
+configuration checks only: no lock, no control database, no credential read, nothing started.
 """
 
 from __future__ import annotations
@@ -50,7 +55,7 @@ from pydantic import (
     model_validator,
 )
 
-from . import maintenance_lock
+from . import exit_codes, maintenance_lock
 from .campaign_infra_retry import SAFETY_STOP_CAUSES
 from .campaign_salad_lease_cap import needed_seconds
 from .campaign_salad_lease_lapse import window_shortfall
@@ -241,12 +246,30 @@ class ExecutorConfig(_Closed):
         return (self.profile,) if self.profile is not None else tuple(self.profiles or ())
 
 
-def load_config(path: Path | str) -> ExecutorConfig:
+class ExecutorConfigRefused(ValueError):
+    """The operator's configuration (config file, profiles, worker credential) is refused.
+
+    Raised only by the configuration checks, never by effectful setup, so ``main`` can tell a
+    refusal (exit ``CONFIG_REFUSED``, not restarted) from a runtime fault (exit ``RUNTIME_FAILURE``)
+    by where the error came from and not by its type."""
+
+
+def source_pin_is_stale(config: ExecutorConfig) -> bool:
+    """True when the well-formed pin is not the installed source's (deploy-upgrade re-pins it)."""
+    from .salad_live_check import installed_source_pin
+
+    commit = config.source_revision.split("+sha256:")[0]
+    return config.source_revision != installed_source_pin(commit)
+
+
+def load_config(path: Path | str, *, allow_stale_pin: bool = False) -> ExecutorConfig:
     """Closed, owner-only (0600) absolute config file; every referenced path is checked.
 
     ``source_revision`` must be the pin ``salad_live_check.run`` accepts for the source
-    installed now; a missing, malformed or stale pin is refused here with its own message."""
-    from .salad_live_check import _private_bytes, _private_path, installed_source_pin
+    installed now; a missing, malformed or stale pin is refused here with its own message.
+    ``allow_stale_pin`` (``--check-config`` only) accepts a well-formed pin of another source:
+    ``deploy-check`` runs under the new release before ``deploy-upgrade`` re-pins it."""
+    from .salad_live_check import _private_bytes, _private_path
     from .salad_workload_jwt import strict_json
 
     try:
@@ -272,8 +295,7 @@ def load_config(path: Path | str) -> ExecutorConfig:
     except (OSError, ValueError):
         raise ValueError(_CONFIG_ERROR) from None
     # The live check refuses a pin whose digest is not the installed source's.
-    commit = config.source_revision.split("+sha256:")[0]
-    if config.source_revision != installed_source_pin(commit):
+    if not allow_stale_pin and source_pin_is_stale(config):
         raise ValueError("source_revision does not pin the installed source; " + SOURCE_PIN_ERROR)
     return config
 
@@ -308,6 +330,10 @@ class ControlPort(Protocol):
     ) -> None: ...
     def record_outcome(self, attempt_id: str, payload: dict[str, Any]) -> None: ...
     def record_no_receipt(self, attempt_id: str, route_id: str) -> None: ...
+    def record_route_lost(
+        self, attempt_id: str, route_id: str, guardian_final: dict[str, Any]
+    ) -> None: ...
+    def record_refusal(self, attempt_id: str, code: str, step: str) -> None: ...
     def guardian_final(self, route_id: str) -> dict[str, Any] | None: ...
     def record_custody_evidence(self, attempt_id: str, route_id: str) -> None: ...
 
@@ -500,6 +526,22 @@ LEASE_HELD_PHASES = frozenset(
 # also lists a blocked or paused campaign's started routes, for keepalive only (v0.104.0);
 # an item without the field (an older control) is treated as launchable, as before.
 LAUNCH_CAMPAIGN_STATUSES = frozenset({"running", "stopping", "cancel_requested"})
+# Campaign statuses under which a listed ``awaiting_lease`` attempt may be leased (ADR 0208
+# addendum). ``stopping`` lets outstanding attempts finish (ADR 0038), so its grants are
+# leased; a blocked, paused, cancel-requested or finished campaign's are not, and a
+# steering-paused one (``steering_paused``) neither: the runner gives such grants back.
+LEASE_CAMPAIGN_STATUSES = frozenset({"running", "stopping"})
+
+
+def lease_held(item: Mapping[str, Any]) -> str | None:
+    """Why an ``awaiting_lease`` item must not be leased now, or None. An item without
+    ``campaign_status`` (an older control) is leased, as before."""
+    status = item.get("campaign_status", "running")
+    if status not in LEASE_CAMPAIGN_STATUSES:
+        return str(status)[:40]
+    if item.get("steering_paused"):
+        return "paused"
+    return None
 
 
 # Consecutive failed provider reads after which the termination wait gives up (ADR 0149).
@@ -513,6 +555,22 @@ GROUP_STOP_MARKER = "group-stop.json"
 CANCEL_UNRECORDED_HOLD_SECONDS = 600.0
 GROUP_STOP_MAX_FAILURES = 5
 GROUP_STOP_RECHECK_SECONDS = 30.0
+# ADR 0212 addendum: a resumed ``executing`` attempt whose live check is gone with no receipt on
+# disk is reported to control with the guardian's terminal final (read-only status), once per
+# route (a private marker in the route directory). The final must read terminal on two reads at
+# least ROUTE_LOST_SETTLE_SECONDS apart, with no receipt on disk at the second, so a live check
+# still writing its receipt is never reported lost. Failed reports are bounded per process.
+ROUTE_LOST_MARKER = "route-lost.json"
+ROUTE_LOST_SETTLE_SECONDS = 120.0
+ROUTE_LOST_MAX_FAILURES = 5
+# The executor's step breaker (ADR 0212 addendum): an attempt whose pre-launch step (grant poll,
+# lease, package) fails this many passes in a row is no longer retried by this executor and is
+# reported to control as a typed refusal (``step_breaker_open``), so control unwinds and retries
+# it at once. The streak survives a restart (a private file in the work directory), so a crash
+# loop on one attempt still trips it.
+STEP_BREAKER_THRESHOLD = 5
+STEP_BREAKER_FILE = "executor-breaker.json"
+_PRE_LAUNCH_STEPS = frozenset({"grant_poll", "lease", "package"})
 # A passed receipt whose idempotent finish steps (import, upload, exit report, guardian final)
 # failed transiently is not recorded yet: the attempt stays ``executing`` and ``_resume`` retries
 # the steps from the receipt on disk, at most FINISH_MAX_DEFERRALS times and within
@@ -867,6 +925,28 @@ class SaladCampaignExecutor:
         self._refused: dict[str, str] = {}
         # Late-importable attempts with no receipt on disk, noted once per process.
         self._late_import_noted: set[str] = set()
+        # ADR 0212 addendum: per attempt, the first time the guardian's final read terminal with
+        # no receipt on disk, the next time the guardian may be read, and failed reports.
+        self._route_lost_seen: dict[str, float] = {}
+        self._route_lost_next: dict[str, float] = {}
+        self._route_lost_failures: dict[str, int] = {}
+        # Typed refusals already delivered to control (``record_refusal``), by attempt.
+        self._refusal_reported: dict[str, str] = {}
+        # The step breaker's persisted streaks: attempt -> {"step", "count"}.
+        self._breaker_path = self.work_directory / STEP_BREAKER_FILE
+        self._streaks: dict[str, dict[str, Any]] = self._load_streaks()
+        # Health counters for the service health file (``health``): never reset by a pass.
+        self.counters: dict[str, Any] = {
+            "work_unavailable_total": 0,
+            "work_unavailable_consecutive": 0,
+            "last_work_error_class": None,
+            "item_errors_total": 0,
+            "item_errors_last_pass": 0,
+            "last_item_error_class": None,
+            "refusals_reported_total": 0,
+            "refusal_report_failures_total": 0,
+            "routes_lost_reported_total": 0,
+        }
 
     # -- one pass ---------------------------------------------------------------------------
 
@@ -882,12 +962,18 @@ class SaladCampaignExecutor:
         concurrent = self.concurrent
         if concurrent:
             self._harvest()
+        self.counters["item_errors_last_pass"] = 0
         try:
             items = self.control.work()
         except Exception as error:
+            # Counted for the health file (a supervisor sees it), never fatal to the loop.
+            self.counters["work_unavailable_total"] += 1
+            self.counters["work_unavailable_consecutive"] += 1
+            self.counters["last_work_error_class"] = type(error).__name__
             self._note("work_unavailable", None, type(error).__name__)
             self._heartbeat_once(None)
             return list(self.log)
+        self.counters["work_unavailable_consecutive"] = 0
         try:
             self._pass(items, concurrent)
         finally:
@@ -916,6 +1002,11 @@ class SaladCampaignExecutor:
         for attempt in set(self._renewal_streak) - listed:
             # An attempt control no longer lists has ended: its renewal streak goes with it.
             del self._renewal_streak[attempt]
+        if set(self._streaks) - listed - set(self._in_flight):
+            # An attempt control no longer lists (unwound, refused, finished) ends its streak.
+            for attempt in set(self._streaks) - listed - set(self._in_flight):
+                del self._streaks[attempt]
+            self._save_streaks()
         self._prune_ended(listed)
         for item in items:
             attempt = item["attempt_id"]
@@ -927,9 +1018,17 @@ class SaladCampaignExecutor:
                 # child's keepalive does.
                 self._renew_running(attempt)
                 continue
+            if item["phase"] == "awaiting_lease" and self._breaker_open(item):
+                continue
             try:
                 self._step = "grant_poll"
                 if item["phase"] == "awaiting_lease":
+                    held = lease_held(item) if attempt not in self._leases else None
+                    if held is not None:
+                        # Skipped, never failed: no lease is taken, the grant stays for the
+                        # runner to give back or for the campaign to run once it may.
+                        self._note("lease_held", attempt, held)
+                        continue
                     if pending is None:
                         pending = self.control.pending_grants()
                     self._lease_and_package(item, pending)
@@ -955,11 +1054,18 @@ class SaladCampaignExecutor:
                     self._step = "renew"
                     self._keepalive(item)
                 self._refused.pop(attempt, None)
+                if attempt in self._streaks:
+                    del self._streaks[attempt]
+                    self._save_streaks()
             except Exception as error:
                 # Class name only: messages can carry identifiers from provider paths.
                 self._note("error", attempt, type(error).__name__)
+                self.counters["item_errors_total"] += 1
+                self.counters["item_errors_last_pass"] += 1
+                self.counters["last_item_error_class"] = type(error).__name__
                 self._refused[attempt] = self._step
                 self._record_rejection(attempt, error)
+                self._count_failure(attempt, self._step)
 
     def _prune_ended(self, listed: set[str]) -> None:
         """Drop per-attempt finish state of attempts that have definitely ended: control no
@@ -986,6 +1092,93 @@ class SaladCampaignExecutor:
         except Exception as failure:  # noqa: BLE001 - recording must not break the pass
             self._note("rejection_unrecorded", attempt_id, type(failure).__name__)
 
+    # -- refusals, the step breaker and health (ADR 0212 addendum) -------------------------
+
+    def _report_refusal(self, attempt_id: str, code: str, step: str) -> bool:
+        """Tell control this executor will not run the attempt (a closed code), once per
+        attempt and code per process; control then unwinds it at once instead of waiting out
+        the grant. True when control has it. A failure is noted and counted, never fatal."""
+        if self._refusal_reported.get(attempt_id) == code:
+            return True
+        record = getattr(self.control, "record_refusal", None)
+        if record is None:
+            return False
+        try:
+            record(attempt_id, code, step)
+        except Exception as error:  # noqa: BLE001 - recorded, retried on a later pass
+            self.counters["refusal_report_failures_total"] += 1
+            self._note("refusal_report_failed", attempt_id, type(error).__name__)
+            return False
+        self._refusal_reported[attempt_id] = code
+        self.counters["refusals_reported_total"] += 1
+        self._note("refusal_reported", attempt_id, code)
+        return True
+
+    def _load_streaks(self) -> dict[str, dict[str, Any]]:
+        """The persisted step streaks; an unreadable file starts empty (noted on first save)."""
+        try:
+            document = _read_private_json(self._breaker_path)
+        except Exception:  # noqa: BLE001 - a bad file never stops the executor
+            document = None
+        streaks = (document or {}).get("streaks") if type(document) is dict else None
+        if type(streaks) is not dict:
+            return {}
+        return {
+            key: {"step": str(value.get("step"))[:20], "count": value["count"]}
+            for key, value in streaks.items()
+            if type(key) is str
+            and _IDENT.fullmatch(key)
+            and type(value) is dict
+            and type(value.get("count")) is int
+            and value["count"] > 0
+        }
+
+    def _save_streaks(self) -> None:
+        try:
+            _write_private_json(self._breaker_path, {"streaks": self._streaks})
+        except Exception as error:  # noqa: BLE001 - held in memory; the next save retries
+            self._note("breaker_unsaved", None, type(error).__name__)
+
+    def _count_failure(self, attempt_id: str, step: str) -> None:
+        """One more consecutive failure of ``attempt_id`` (persisted); a different step starts
+        the streak again."""
+        streak = self._streaks.get(attempt_id)
+        if streak is None or streak.get("step") != step:
+            streak = {"step": step, "count": 0}
+        streak["count"] += 1
+        self._streaks[attempt_id] = streak
+        self._save_streaks()
+
+    def _breaker_open(self, item: dict[str, Any]) -> bool:
+        """True when the attempt's pre-launch step failed STEP_BREAKER_THRESHOLD passes in a
+        row: it is not tried again here, and control is told (``step_breaker_open``)."""
+        attempt = item["attempt_id"]
+        streak = self._streaks.get(attempt)
+        if (
+            streak is None
+            or streak["count"] < STEP_BREAKER_THRESHOLD
+            or streak["step"] not in _PRE_LAUNCH_STEPS
+        ):
+            return False
+        self._note("breaker_open", attempt, f"{streak['step']}:{streak['count']}")
+        self._report_refusal(attempt, "step_breaker_open", streak["step"])
+        return True
+
+    def health(self) -> dict[str, Any]:
+        """Counters for the service health file (``run_service``'s ``health_extra``)."""
+        open_steps = [
+            value
+            for value in self._streaks.values()
+            if value["count"] >= STEP_BREAKER_THRESHOLD and value["step"] in _PRE_LAUNCH_STEPS
+        ]
+        return {
+            **self.counters,
+            "breaker_open_attempts": len(open_steps),
+            "longest_failure_streak": max(
+                (value["count"] for value in self._streaks.values()), default=0
+            ),
+        }
+
     def _note(self, action: str, attempt_id: str | None, detail: str = "") -> None:
         self.log.append({"action": action, "attempt_id": attempt_id, "detail": detail})
 
@@ -1003,10 +1196,12 @@ class SaladCampaignExecutor:
         profile = self._profile_for(item)
         if profile is None:
             self._note("refused_profile", attempt, "different_profile")
+            self._report_refusal(attempt, "different_profile", "grant_poll")
             return
         plan = self.control.plan(grant)
         if not 1 <= plan["budget_cents"] <= profile.max_task_cents:
             self._note("refused_budget", attempt, "plan_budget_above_profile")
+            self._report_refusal(attempt, "plan_budget_above_profile", "grant_poll")
             return
         if attempt not in self._leases:
             self._step = "lease"
@@ -1629,6 +1824,7 @@ class SaladCampaignExecutor:
             self._note("no_receipt", item["attempt_id"], "resumed_without_launch_effect")
             self._report_no_receipt(item)
         self._report_group_stop(item)
+        self._report_route_lost(item)
 
     def _late_import(self, item: dict[str, Any]) -> None:
         """A late-importable ``unknown`` attempt (the runner called it silent): finish it only
@@ -1641,9 +1837,64 @@ class SaladCampaignExecutor:
             if attempt not in self._late_import_noted:
                 self._late_import_noted.add(attempt)
                 self._note("late_import_no_receipt", attempt)
+            self._report_route_lost(item)
             return
         self._note("late_import", attempt)
         self._finish(item, self._with_keepalive(item["route_id"], receipt))
+
+    def _report_route_lost(self, item: dict[str, Any]) -> None:
+        """ADR 0212 addendum: the route's live check is gone (no child of this process runs it)
+        and no receipt is on disk; once the guardian's read-only status for the route is
+        terminal (``stopped`` or ``reconciled``) on two reads ROUTE_LOST_SETTLE_SECONDS apart,
+        report it with that final (``record_route_lost``). Once per route: a private marker
+        fixes the final so a retry replays the same request. Nothing is launched, nothing about
+        effects or spend is asserted, and control alone decides from its own records."""
+        attempt, route_id = item["attempt_id"], item["route_id"]
+        report = getattr(self.control, "record_route_lost", None)
+        if report is None or self._route_lost_failures.get(attempt, 0) >= ROUTE_LOST_MAX_FAILURES:
+            return
+        directory = self._route_dir(route_id)
+        if not directory.is_dir():
+            return  # never launched here: this executor cannot speak for the route
+        marker = directory / ROUTE_LOST_MARKER
+        recorded = _read_private_json(marker)
+        if recorded is not None and recorded.get("reported") is True:
+            return
+        if recorded is None or type(recorded.get("guardian_final")) is not dict:
+            now = self.clock()
+            if now < self._route_lost_next.get(attempt, 0.0):
+                return
+            self._route_lost_next[attempt] = now + GROUP_STOP_RECHECK_SECONDS
+            try:
+                final = self.control.guardian_final(route_id)
+            except Exception as error:  # noqa: BLE001 - an unreadable guardian holds
+                self._note("route_lost_held", attempt, type(error).__name__)
+                return
+            status = final.get("status") if type(final) is dict else None
+            if status not in ("stopped", "reconciled"):
+                self._route_lost_seen.pop(attempt, None)
+                self._note("route_lost_held", attempt, f"guardian_{status}"[:40])
+                return
+            first = self._route_lost_seen.setdefault(attempt, now)
+            if now - first < ROUTE_LOST_SETTLE_SECONDS:
+                self._note("route_lost_held", attempt, "settling")
+                return
+            receipts = directory / "receipts"
+            if receipts.is_dir() and read_receipt(receipts) is not None:
+                return  # a receipt arrived after all: the ordinary finish takes it next pass
+            recorded = {"guardian_final": final, "reported": False}
+            _write_private_json(marker, recorded)
+        try:
+            report(attempt, route_id, recorded["guardian_final"])
+        except Exception as error:  # noqa: BLE001 - recorded and bounded, never fatal
+            self._route_lost_failures[attempt] = self._route_lost_failures.get(attempt, 0) + 1
+            self._note("route_lost_report_failed", attempt, type(error).__name__)
+            return
+        recorded["reported"] = True
+        _write_private_json(marker, recorded)
+        self._route_lost_failures.pop(attempt, None)
+        self.counters["routes_lost_reported_total"] += 1
+        self._note("route_lost_reported", attempt, str(recorded["guardian_final"]["status"]))
 
     def _never_launched(self, item: dict[str, Any]) -> bool:
         """True when the route has no create or start effect and names no provider group (a
@@ -2338,6 +2589,25 @@ class StoreControl:
             self.worker, attempt_id, _key("no-receipt", attempt_id), {"route_id": route_id}
         )
 
+    def record_route_lost(self, attempt_id, route_id, guardian_final):
+        """ADR 0212 addendum: the live check is gone with no receipt; the guardian's terminal
+        final for the route, as the executor read it."""
+        self.campaigns.record_salad_route_lost(
+            self.worker,
+            attempt_id,
+            _key("route-lost", attempt_id),
+            {"route_id": route_id, "guardian_final": guardian_final},
+        )
+
+    def record_refusal(self, attempt_id, code, step):
+        """ADR 0212 addendum: this executor will not run the attempt (a closed code)."""
+        self.campaigns.record_salad_refusal(
+            self.worker,
+            attempt_id,
+            _key(f"refusal-{code}", attempt_id),
+            {"code": code, "step": step},
+        )
+
     def record_custody_evidence(self, attempt_id, route_id):
         """Record the guardian's own custody status for the route (read over the authenticated
         admin channel) before a partial manifest is uploaded. Raises when it cannot be read."""
@@ -2588,23 +2858,46 @@ def trusted_observer(config: ExecutorConfig, worker, state_dir):
     return observe
 
 
-def build_executor(config: ExecutorConfig) -> SaladCampaignExecutor:
-    from .salad_live_check import _private_bytes
-    from .store import Store
+def check_profiles(config: ExecutorConfig) -> list[Any]:
+    """The pure part of ``build_executor``: the named profiles exist and match the custody name.
 
-    loaded = load_profiles(config.profiles_file)
+    Reads the profiles file only; shared with ``--check-config``. Refuses with
+    ``ExecutorConfigRefused``."""
+    try:
+        loaded = load_profiles(config.profiles_file)
+    except ValueError as error:
+        raise ExecutorConfigRefused(str(error)) from None
     profiles = [loaded.get(name) for name in config.profile_names]
     if any(profile is None for profile in profiles):
-        raise ValueError("Unknown Salad campaign profile.")
+        raise ExecutorConfigRefused("Unknown Salad campaign profile.")
     # The executor may only hand workloads a custody name it owns: the name it was configured to
     # advertise (``workload_host``, else ``host``) must be the profile's ``custody_host``. The
     # admin ``host`` it connects to may differ.
     if any(config.custody.workload_name() != profile.custody_host for profile in profiles):
-        raise ValueError("Custody host differs from the profile.")
+        raise ExecutorConfigRefused("Custody host differs from the profile.")
+    return profiles
+
+
+def _authenticate_executor_worker(config: ExecutorConfig, state_dir: Path) -> dict[str, Any]:
+    from .salad_live_check import _private_bytes
+    from .store import Forbidden, Store
+
+    try:
+        token = _private_bytes(config.worker_credential_file, 4096).decode("ascii").strip()
+    except ValueError:  # an empty, oversized or non-ASCII credential file: the operator's file
+        raise ExecutorConfigRefused("Worker credential file is unusable.") from None
+    try:
+        return Store(state_dir).authenticate_worker(token)
+    except Forbidden:
+        # The database answered and does not accept this credential (unknown, revoked, expired or
+        # not a worker credential): the operator's file, which a restart does not change.
+        raise ExecutorConfigRefused("Worker credential is not accepted.") from None
+
+
+def build_executor(config: ExecutorConfig) -> SaladCampaignExecutor:
+    profiles = check_profiles(config)
     state_dir = Path(config.state_dir)
-    worker = Store(state_dir).authenticate_worker(
-        _private_bytes(config.worker_credential_file, 4096).decode("ascii").strip()
-    )
+    worker = _authenticate_executor_worker(config, state_dir)
 
     def guardian_status(state):
         from .salad_server import SaladSafetyHTTPSClient
@@ -2640,6 +2933,47 @@ def build_executor(config: ExecutorConfig) -> SaladCampaignExecutor:
     )
 
 
+def _print_closed(payload: dict[str, str]) -> None:
+    print(json.dumps(payload))
+
+
+def _check_config(options) -> int:
+    """``--check-config``: the configuration checks of a real start and nothing effectful.
+
+    No maintenance lock, no control database, no credential read, nothing started."""
+    try:
+        config = load_config(options.config, allow_stale_pin=True)
+        notes = []
+        if source_pin_is_stale(config):
+            notes.append("source_revision is stale for this release; deploy-upgrade re-pins it")
+        check_profiles(config)
+    except ValueError as error:
+        print(f"salad executor refused: {error}", file=sys.stderr)
+        _print_closed({"status": "refused", "reason": "executor_config_refused"})
+        return exit_codes.CONFIG_REFUSED
+    except Exception as error:
+        _print_closed(
+            {
+                "status": "unavailable",
+                "reason": "executor_check_failed",
+                "error_class": type(error).__name__,
+            }
+        )
+        return exit_codes.RUNTIME_FAILURE
+    print(
+        json.dumps(
+            {
+                "schema": exit_codes.CONFIG_CHECK_SCHEMA,
+                "program": "salad-executor",
+                "status": "ok",
+                "widths": {"max_concurrent_paid_routes": config.max_concurrent_paid_routes},
+                "notes": notes,
+            }
+        )
+    )
+    return exit_codes.OK
+
+
 def main(argv=None) -> int:
     from tessera_worker.service_loop import StopFlag, run_service
 
@@ -2648,19 +2982,36 @@ def main(argv=None) -> int:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--max-cycles", type=int, default=None)
     parser.add_argument("--health-file", type=Path, default=None)
+    parser.add_argument("--check-config", action="store_true")
     options = parser.parse_args(argv)
+    if options.check_config:
+        return _check_config(options)
+    # Refusal of the operator's configuration (exit 2, not restarted) is decided by which step
+    # raised, not by the exception type: ``load_config`` refuses with ``ValueError`` and
+    # ``build_executor``'s configuration checks with ``ExecutorConfigRefused``; every other fault
+    # in the effectful steps below exits 1 (restarted).
     try:
         config = load_config(options.config)
+    except ValueError as error:
+        print(f"salad executor refused: {error}", file=sys.stderr)
+        _print_closed({"status": "refused", "reason": "executor_config_refused"})
+        return exit_codes.CONFIG_REFUSED
+    except Exception as error:
+        return _setup_failed(error)
+    try:
         # Before anything opens the control database: `tessera db compact` refuses while this
         # shared lock is held, and a running compaction makes this start refuse (exit 1).
         maintenance_lock.hold_shared_for_process(config.state_dir)
         executor = build_executor(config)
     except maintenance_lock.MaintenanceBusy as error:
         print(f"salad executor refused: {error}", file=sys.stderr)
-        return 1
-    except Exception:
-        print(json.dumps({"status": "refused", "reason": "executor_setup_unavailable"}))
-        return 2
+        return exit_codes.RUNTIME_FAILURE
+    except ExecutorConfigRefused as error:
+        print(f"salad executor refused: {error}", file=sys.stderr)
+        _print_closed({"status": "refused", "reason": "executor_config_refused"})
+        return exit_codes.CONFIG_REFUSED
+    except Exception as error:
+        return _setup_failed(error)
     stop = StopFlag()
     stop.install()
     return run_service(
@@ -2671,7 +3022,20 @@ def main(argv=None) -> int:
         health_file=options.health_file,
         name="campaign-salad-executor",
         stop=stop,
+        health_extra=executor.health,
     )
+
+
+def _setup_failed(error: BaseException) -> int:
+    """A setup fault that is not a refusal of the operator's configuration: restart it."""
+    _print_closed(
+        {
+            "status": "unavailable",
+            "reason": "executor_setup_failed",
+            "error_class": type(error).__name__,
+        }
+    )
+    return exit_codes.RUNTIME_FAILURE
 
 
 if __name__ == "__main__":

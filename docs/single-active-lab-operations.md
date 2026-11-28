@@ -21,8 +21,10 @@ a writer.
    header, bearer credential, secret, ConfigMap values, or artifact bytes there.
 2. Read `/operator/health`. Treat `worker_heartbeat_stale`,
     `reconciliation_backlog`, `backup_failed`, `backup_stale`,
-    `backup_unverified`, and exhausted resource-budget alerts as open operational
-    work; do not admit replacement work to resolve an alert by itself.
+    `backup_unverified`, `runner_host_fault` (the campaign runner paused on a full,
+    read-only or failing disk; it resumes on its own once the host recovers), and
+    exhausted resource-budget alerts as open operational work; do not admit
+    replacement work to resolve an alert by itself.
     `backup_stale` is a 24-hour local warning threshold, not an RPO claim.
 3. Identify all active/cancel-requested grants and external operation IDs from
    authenticated control records. A Pod restart, PVC detach, or a cancellation

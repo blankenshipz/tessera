@@ -417,6 +417,11 @@ class OperatorObservabilityStore(Store):
             database = db_compaction_health.recommendation(connection)
             if database["recommended"]:
                 alerts.append({"code": "db_compaction_recommended", "severity": "warning"})
+            from .runner_faults import HOST_ALARM
+
+            if HOST_ALARM.active() is not None:
+                # The campaign runner paused on a host fault (disk full, read-only, I/O).
+                alerts.append({"code": "runner_host_fault", "severity": "critical"})
             return {
                 "projection_at": utc_now(),
                 "alerts": alerts,

@@ -3,7 +3,8 @@
 A stage attempt can end because the infrastructure under it failed, not because the task
 did: the engine or the kernel killed the container (exit 137, the out-of-memory killer
 among them). The runner then retries the stage itself, within a bound the approved spec
-sets (``retry.infra_retries``, default 2), and nothing else qualifies: a task failure, a
+sets (``retry.infra_retries``: 0 unless set, 2 written at submit for a Salad stage that leaves it
+unset, ADR 0215), and nothing else qualifies: a task failure, a
 refused step, a policy denial or a budget refusal is never retried here, and a failure
 whose effect is unknown stays with a person.
 
@@ -79,15 +80,17 @@ GUARDIAN_UNAVAILABLE_PRESTART_CLASSES = frozenset(
 
 # The Salad safety plane (guardian or safety service) stopped the route for its own health, not
 # for anything the stage did: control fell silent, the service restarted, the provider or the
-# published rate could not be read, the service clock was uncertain, or the frame's own loop pass
-# failed closed. The stop is correct and fail-closed; it is not evidence about the stage. Only the
-# guardian's FIRST recorded stop cause, carried on the executor's recorded guardian final
-# (``safety_stop_cause``) and validated against this closed table, selects the class; a cause
-# only on the live receipt never does. Retried within ``retry.infra_retries`` (then the
-# class/profile fallback). Settlement is unchanged: the whole bounded hold on a clean final, or a
-# recorded charge. Never in this table: ``cost_cap``, ``total_cap``, ``deadline``,
-# ``control_cancel``, ``workload_failed:*``, ``start_failure_suspected``, ``allocation_changed``
-# or ``allocation_timeout`` (each has its own class or is the stage's own).
+# published rate could not be read, the service clock was uncertain, the frame's own loop pass
+# failed closed, or the service could not read its own aggregate accounting
+# (``accounting_unavailable``: fenced fail-closed, but the cap was never shown breached). The stop
+# is correct and fail-closed; it is not evidence about the stage. Only the guardian's FIRST
+# recorded stop cause, carried on the executor's recorded guardian final (``safety_stop_cause``)
+# and validated against this closed table, selects the class; a cause only on the live receipt
+# never does. Retried within ``retry.infra_retries`` (then the class/profile fallback). Settlement
+# is unchanged: the whole bounded hold on a clean final, or a recorded charge. Never in this table:
+# ``cost_cap``, ``total_cap``, ``deadline``, ``control_cancel``, ``workload_failed:*``,
+# ``start_failure_suspected``, ``allocation_changed`` or ``allocation_timeout`` (each has its own
+# class or is the stage's own).
 INFRA_SALAD_SAFETY_STOP = "infra_salad_safety_stop"
 SAFETY_STOP_CAUSES = frozenset(
     {
@@ -100,6 +103,7 @@ SAFETY_STOP_CAUSES = frozenset(
         "rate_unknown",
         "provider_unknown",
         "provider_unavailable",
+        "accounting_unavailable",
     }
 )
 
@@ -114,6 +118,27 @@ SAFETY_STOP_CAUSES = frozenset(
 INFRA_SALAD_RECONCILED_NO_OUTPUT = "infra_salad_reconciled_no_output"
 RECONCILED_NO_OUTPUT_REASON = "provider_reconciled_no_output"
 
+# ADR 0216: a person reconciled an unknown attempt as retryable infrastructure through the
+# dedicated route (``POST /execution-grants/{id}/reconcile-retryable-salad``), which settles the
+# grant at the guardian's bound (the hold; never a caller-supplied amount) only when the guardian's
+# final says the frame closed and no output was kept. The runner then retries the stage within
+# ``retry.infra_retries`` (never a scientific retry); with none left the stage alone fails under
+# this class. The route's event, keyed by grant, is the marker the runner reads.
+INFRA_RECONCILED_RETRYABLE = "infra_reconciled_retryable"
+RETRYABLE_RECONCILE_EVENT = "execution.grant_reconciled_retryable_infra"
+# ADR 0212 addendum: the route's live check is gone (the executor crashed, was killed for memory,
+# rebooted or timed the child out) with no receipt on the executor's disk, and the guardian's own
+# final for the route is terminal: ``stopped`` (the exact group stopped), or ``reconciled`` by the
+# safety service's provider-confirmed close. Nothing of the run can be imported (an executor
+# finishes only from a receipt) and its spend has ended, so it is infrastructure: a fresh attempt
+# may retry it within ``retry.infra_retries``. It settles at the guardian's recorded estimate
+# rounded up, at least one cent, within the hold (provisional). ``campaign_salad.
+# route_lost_no_output_refusal`` holds the fail-closed conditions.
+INFRA_SALAD_EXECUTOR_LOST = "infra_salad_executor_lost"
+EXECUTOR_LOST_REASON = "live_check_lost_no_receipt"
+# The ADR 0212 family: attempts settled at the guardian's bound with no worker-confirmed exit.
+GUARDIAN_CLOSED_NO_OUTPUT_CLASSES = (INFRA_SALAD_RECONCILED_NO_OUTPUT, INFRA_SALAD_EXECUTOR_LOST)
+
 # Transient Salad infrastructure classes the runner retries through ``_placement_failure``
 # (one ``retry.infra_retries`` each; with none left, the class/profile fallback decides and the
 # attempt fails permanently under the same class, never ``salad_not_passed``).
@@ -124,6 +149,7 @@ PLACEMENT_RETRY_CLASSES = frozenset(
         INFRA_SALAD_GUARDIAN_UNAVAILABLE,
         INFRA_SALAD_SAFETY_STOP,
         INFRA_SALAD_RECONCILED_NO_OUTPUT,
+        INFRA_SALAD_EXECUTOR_LOST,
     }
 )
 

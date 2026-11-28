@@ -63,6 +63,29 @@ warning when losing the run is accepted. The receipt records the count as `salad
 Reserved, preparing and queued (`route_started`) attempts do not block: after v0.104.0 a restart
 while stages are only in those states is safe.
 
+**Leases across the stop (ADR 0214).** A Salad lease lasts 150 s and the executor renews it; a
+lapsed lease cannot be renewed, so a stop longer than a held lease's remaining time requeues the
+stage and spends one of its requeues. Preflight therefore reads every lease-holding Salad attempt
+(an attempt from `leased` through `executing` whose grant is still unresolved and whose lease has
+not expired) and refuses with `salad.lease_lapse` when any held lease expires within the plan's
+`expected_downtime_seconds` (5 to 3600, default 120). A lease is renewed to at most 150 s ahead,
+so a downtime of 150 s or more refuses whenever any lease is held. `--allow-lease-lapse` turns
+the refusal into a warning. The same read is taken again immediately before the first service is
+stopped (after the focused tests); if it blocks then, the step `preflight:lease_recheck` fails and
+nothing is stopped. A database that exists but cannot be read blocks (`salad.lease_state`) rather
+than counting as no leases. The receipt records `salad_executing`, `salad_route_holding`,
+`salad_lease_holding`, `salad_leases_lapsing` and `expected_downtime_seconds`.
+
+**Startup checks (ADR 0214).** A service may name `"config_check": {"program": "serve" |
+"salad-executor" | "salad-guardian", "args": [...]}` with the exact arguments its unit passes (not
+`--check-config`). Preflight runs that program's own `--check-config` with them under the release
+running `deploy-upgrade`, before anything is stopped, and the post-install smoke runs it again.
+A refused configuration blocks the upgrade; see the [deploy check](deploy-check.md#startup-checks).
+The stored-state check (`state.stored_specs`, `state.stored_attempts`) runs only at the current
+schema: for a release that carries a migration it is skipped in preflight and first runs in the
+post-migrate smoke, after the stop and restart. A spec it finds then blocks its campaign (not
+failed) until a fix or a rollback.
+
 **Service venvs (optional).** A service that runs from its own virtualenv (for example the
 reasoning service) declares `"venv": "/abs/path/to/venv"`. Then the plan also needs
 `install_source` (a checkout or built wheel path; default `repo_root`) and may set

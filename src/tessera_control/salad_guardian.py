@@ -30,6 +30,9 @@ STOP_CAUSE_PREFIX = "stop_cause:"
 CONTROL_CANCEL_CAUSE = "control_cancel"  # control (the trusted server) asked for the stop
 GUARDIAN_RESTART_CAUSE = "guardian_restart"  # every open frame is stop-only after a restart
 STOP_ONLY_RECOVERY_CAUSE = "stop_only_recovery"  # recovery the service set with no other cause
+# The service could not read its own aggregate accounting (``_committed`` raised): every frame
+# that may bill is fenced, fail-closed, but the cap was never shown breached (not ``total_cap``).
+ACCOUNTING_UNAVAILABLE_CAUSE = "accounting_unavailable"
 SERVICE_STOP_CAUSES = frozenset(
     {
         "heartbeat_silence",  # no control heartbeat reached the service for 30 s
@@ -38,6 +41,7 @@ SERVICE_STOP_CAUSES = frozenset(
         "rate_unknown",  # the published rate could not be read fresh or changed
         "cost_cap",  # the frame's worst-case exposure passed its approved cost cap
         "total_cap",  # the aggregate cap over every frame was breached
+        ACCOUNTING_UNAVAILABLE_CAUSE,  # the aggregate accounting could not be read
         "loop_frame_failed",  # the frame's loop pass raised and it was failed closed
         "container_exited_nonzero",  # the container process exited non-zero (salad_exit_watch)
         GUARDIAN_RESTART_CAUSE,

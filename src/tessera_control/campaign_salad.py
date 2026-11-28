@@ -27,8 +27,11 @@ from . import campaign_salad_lease_lapse as lease_lapse
 from . import execution_frames as frames
 from .artifact_manifests import grant_manifest_is_partial
 from .campaign_autoreconcile import MAX_AUTO_REQUEUES, NOT_STARTED, repeat_count
+from .campaign_checkpoint import CHECKPOINT_PATH, composed_checkpoint
 from .campaign_infra_retry import (
+    EXECUTOR_LOST_REASON,
     INFRA_SALAD_CREATE_NOT_SENT,
+    INFRA_SALAD_EXECUTOR_LOST,
     INFRA_SALAD_REALLOCATED,
     INFRA_SALAD_RECONCILED_NO_OUTPUT,
     REALLOCATED_PRECUSTODY,
@@ -45,9 +48,12 @@ from .campaign_models import (
     StageSpec,
     stage_on_candidate,
 )
-from .campaign_checkpoint import CHECKPOINT_PATH, composed_checkpoint
 from .campaign_salad_adapter import MIB, bind_workload, is_late_bound
-from .campaign_salad_commands import LIVE_CHECK_NO_RECEIPT, SILENT_EXECUTOR
+from .campaign_salad_commands import (
+    EXECUTOR_REFUSED_PREFIX,
+    LIVE_CHECK_NO_RECEIPT,
+    SILENT_EXECUTOR,
+)
 from .campaign_salad_executor import (
     FINISH_RETRY_SECONDS,
     SUBPROCESS_GRACE_SECONDS,
@@ -80,6 +86,15 @@ from .salad_campaign_profiles import (
     target_policy,
 )
 from .salad_guardian import RECONCILE_PROVIDER
+from .salad_guardian_bound import (
+    CHARGE_DEADLINE_SECONDS,
+    CHARGE_DEADLINE_SETTLED_EVENT,
+    CHARGE_OVERDUE,
+    CHARGE_OVERDUE_BLOCK_REASON,
+    CHARGE_OVERDUE_EVENT,
+    CHARGE_OVERDUE_RESUMED_EVENT,
+    guardian_bound_refusal,
+)
 from .salad_precreate import sent_launch_effects
 from .salad_termination import (
     UNCONFIRMED_CODE,
@@ -475,6 +490,9 @@ PROVIDER_MOVED_CLASSES = (
     INFRA_SALAD_REALLOCATED,
     REALLOCATED_PRECUSTODY,
     INFRA_SALAD_RECONCILED_NO_OUTPUT,
+    # ADR 0212 addendum: a lost route the guardian stopped (or closed by the same provider-
+    # confirmed reconcile) settles on the guardian's estimate the same way.
+    INFRA_SALAD_EXECUTOR_LOST,
 )
 
 # The verify step's word for a route whose own provider receipts never confirmed termination.
@@ -654,6 +672,10 @@ def _safety_stopped(row: dict[str, Any]) -> bool:
         return False
 
 
+# Attempt statuses a charge-overdue attempt may return to (the settle step's own statuses).
+_RESUMABLE_STATUSES = frozenset({"exited", "collected", "resolved", "measured", "reconciled"})
+
+
 def _phase_open(connection: sqlite3.Connection, campaign_id: str, phases: tuple[str, ...]) -> bool:
     marks = ",".join("?" for _ in phases)
     return (
@@ -684,6 +706,12 @@ class SaladStageDriver:
         # of the last read (repeated while throttled, so the held code stays stable).
         self._final_refresh_at: dict[str, datetime] = {}
         self._final_refresh_code: dict[str, str | None] = {}
+        # ADR 0216: per attempt, when control may next read the guardian record for its bound
+        # (each read is appended to the frame's guardian records, so never once per pass).
+        self._bound_read_at: dict[str, datetime] = {}
+        # The last successful bound read per attempt: a read skipped by that throttle returns
+        # it, never "no bound" (review F1: a skipped read must not re-block).
+        self._bound_ok: dict[str, int] = {}
 
     # -- small helpers --------------------------------------------------------------
 
@@ -853,6 +881,11 @@ class SaladStageDriver:
         if self._guardian_overrun(attempt, row):
             self._block_overrun(attempt)
             return None
+        # ADR 0216: past the charge deadline the guardian's bound settles it (never blocks
+        # here: a person already reconciled this grant).
+        default = self._charge_deadline(attempt, row, block=False)
+        if default is not None:
+            return default
         self._await_charge(attempt)
         return None
 
@@ -1288,6 +1321,21 @@ class SaladStageDriver:
         phase = row["phase"]
         grant = self._grant(attempt)
         expired = self.runner.now() >= _parse_utc(grant["expires_at"])
+        refused = str(row.get("waiting_reason") or "")
+        if refused.startswith(EXECUTOR_REFUSED_PREFIX) and phase in (
+            "awaiting_lease",
+            *PRE_ROUTE_PHASES,
+        ):
+            # ADR 0212 addendum: the executor reported it will not run this attempt (a closed
+            # code) before any route started: unwound at once on control's own no-claim proof
+            # and retried within the stage's budget, never by waiting out the grant. With no
+            # lease taken, the grant is given back at zero; with one, the packaged unwind.
+            if phase != "awaiting_lease":
+                return self._abandon(ctx, stage, spec_stage, attempt, refused)
+            from . import campaign_salad_route_lost as route_lost
+
+            if route_lost.release_refused_unleased(self, ctx, attempt, refused):
+                return True
         if phase == "awaiting_lease":
             if expired:
                 return self.runner._do_observe(ctx, stage, spec_stage, attempt)
@@ -2147,6 +2195,14 @@ class SaladStageDriver:
             # reconcile at 0 with the store's own no-claim proof) ends it. Anything else waits
             # as before.
             return self._abandon(ctx, stage, spec_stage, attempt, LIVE_CHECK_NO_RECEIPT)
+        if row["phase"] == "executing":
+            from . import campaign_salad_route_lost as route_lost
+
+            # ADR 0212 addendum: the executor reported the live check gone with no receipt and
+            # the guardian's terminal final; resolved now when the rule holds, never waited
+            # out. Otherwise the held code is recorded and today's wait decides.
+            if route_lost.resolve(self, ctx, attempt, row):
+                return True
         if row["phase"] == "route_started" and self._lease_fresh(row):
             # Queued behind the executor's own route limits but alive (it renews the lease):
             # not silent. The route-window clock starts at ``mark_executing`` (v0.104.0).
@@ -2385,6 +2441,9 @@ class SaladStageDriver:
           to run but was provably never sent anything, gets the reduce-only ``cancel_route``
           when the only unclaimed refusal is ``route_wants_run``; the unchanged unclaimed proof
           then decides on the runner's own reconcile.
+        * An attempt ``unknown`` for the silent reason whose executor reported the live check
+          gone with no receipt and the guardian's terminal final (ADR 0212 addendum) resolves
+          as retryable infrastructure when that rule holds (``campaign_salad_route_lost``).
         * An attempt already ``unknown`` because its route never confirmed termination is
           re-read once per pass: when the guardian's recorded final now shows the provider-
           confirmed close of an uncertain allocation with no output (ADR 0212), it resolves
@@ -2398,9 +2457,9 @@ class SaladStageDriver:
             WHERE a.campaign_id=? AND a.settled_cents IS NULL
             AND g.status IN ('active','cancel_requested')
             AND ((sa.phase='outcome_recorded' AND a.status IN ('running','unknown'))
-              OR (sa.phase='unknown' AND sa.waiting_reason IN (?,?) AND a.status='unknown'))
+              OR (sa.phase='unknown' AND sa.waiting_reason IN (?,?,?) AND a.status='unknown'))
             ORDER BY a.stage_key, a.attempt""",
-            (ctx.campaign["id"], SILENT_EXECUTOR, ROUTE_UNCONFIRMED),
+            (ctx.campaign["id"], SILENT_EXECUTOR, ROUTE_UNCONFIRMED, CHARGE_OVERDUE),
         )
         for attempt in rows:
             key = attempt["stage_key"]
@@ -2416,7 +2475,15 @@ class SaladStageDriver:
                     self._verify(ctx, self.runner._stage_row(ctx, key), spec_stage, attempt, row)
                 elif row["phase"] == "unknown" and row["waiting_reason"] == ROUTE_UNCONFIRMED:
                     self._resume_guarded(ctx, attempt, row)
+                elif row["phase"] == "unknown" and row["waiting_reason"] == CHARGE_OVERDUE:
+                    self._resume_charge_overdue(ctx, attempt, row)
                 else:
+                    from . import campaign_salad_route_lost as route_lost
+
+                    # ADR 0212 addendum: a silent attempt whose executor later reported the
+                    # live check gone with the guardian's terminal final resolves here.
+                    if route_lost.resolve_guarded(self, ctx, attempt, row):
+                        continue
                     self._cancel_never_sent(ctx, key, attempt, row)
             except StepFailed as error:
                 # A refused reduce-only step inside verification (``_abandon``'s unwind: a
@@ -2529,9 +2596,16 @@ class SaladStageDriver:
             refusal = reconciled_no_output_refusal(connection, attempt, row, state)
         return refusal or "verify_unknown"
 
-    def _note_held(self, ctx: _Ctx, attempt: dict[str, Any], code: str) -> None:
-        """One ``campaign.salad_reconciled_no_output_held`` event each time the held code
-        changes (never one per pass); the waiting reason is never rewritten."""
+    def _note_held(
+        self,
+        ctx: _Ctx,
+        attempt: dict[str, Any],
+        code: str,
+        event_type: str = RECONCILED_NO_OUTPUT_HELD_EVENT,
+    ) -> None:
+        """One ``event_type`` event (``campaign.salad_reconciled_no_output_held`` by default)
+        each time the held code changes (never one per pass); the waiting reason is never
+        rewritten."""
         runner = self.runner
         with runner.store.runner_connection() as connection:
             last = connection.execute(
@@ -2541,7 +2615,7 @@ class SaladStageDriver:
                 AND json_extract(payload_json,'$.attempt_id')=? ORDER BY cursor DESC LIMIT 1""",
                 (
                     ctx.campaign["project_id"],
-                    RECONCILED_NO_OUTPUT_HELD_EVENT,
+                    event_type,
                     ctx.campaign["id"],
                     attempt["id"],
                 ),
@@ -2552,7 +2626,7 @@ class SaladStageDriver:
             runner.store.record_runner_event(
                 connection,
                 ctx.campaign,
-                RECONCILED_NO_OUTPUT_HELD_EVENT,
+                event_type,
                 {
                     "stage_key": attempt["stage_key"],
                     "attempt": attempt["attempt"],
@@ -2635,9 +2709,17 @@ class SaladStageDriver:
         False when the ordinary ``reconcile_grant`` step applies (a confirmed exit exists, or the
         grant is no longer unresolved). When the rule no longer holds the attempt goes back to
         ``unknown`` for a person (True: the step ran) and nothing is reconciled."""
+        from . import campaign_salad_route_lost as route_lost
+
         runner = self.runner
         row = self.row(attempt["id"])
         state = self.route_state(row["route_id"])
+        detail = str(attempt.get("failure_detail") or "").removeprefix("salad:")
+        # The ADR 0212 addendum's lost route (no receipt, the guardian's terminal final) takes
+        # the same step under its own rule; ``refused`` keeps it re-readable when it fails.
+        lost = attempt.get("failure_class") == INFRA_SALAD_EXECUTOR_LOST or detail.startswith(
+            INFRA_SALAD_EXECUTOR_LOST
+        )
         with runner.store.runner_connection() as connection:
             reconciliation = current_operation_reconciliation(connection, row["operation_id"])
             if (
@@ -2651,11 +2733,12 @@ class SaladStageDriver:
             ).fetchone()
             if grant is None or grant["status"] not in ("active", "cancel_requested"):
                 return False
-            refusal = (
-                "route_state_missing"
-                if state is None
-                else reconciled_no_output_refusal(connection, attempt, row, state)
-            )
+            if lost:
+                refusal = route_lost.route_lost_no_output_refusal(connection, attempt, row, state)
+            elif state is None:
+                refusal = "route_state_missing"
+            else:
+                refusal = reconciled_no_output_refusal(connection, attempt, row, state)
             if refusal is None:
                 runner._hold_lease(connection)
                 now = self._stamp()
@@ -2692,8 +2775,12 @@ class SaladStageDriver:
                         "settlement_basis": basis,
                         # The amount is the guardian's recorded estimate rounded up, not a bill.
                         "settlement_is_estimate": True,
-                        "termination_evidence": "guardian_provider_confirmed_close",
-                        "reason": RECONCILED_NO_OUTPUT_REASON,
+                        "termination_evidence": (
+                            "guardian_confirmed_stop"
+                            if lost
+                            else "guardian_provider_confirmed_close"
+                        ),
+                        "reason": EXECUTOR_LOST_REASON if lost else RECONCILED_NO_OUTPUT_REASON,
                         "operational_only": True,
                     },
                     task_id=grant["task_id"],
@@ -2701,6 +2788,12 @@ class SaladStageDriver:
                 return True
         # The waiting reason stays the one the blocked re-read keys on (a temporary refusal is
         # re-checked on the next pass); the refusal code is recorded on its own event.
+        if lost:
+            route_lost.held_back(self, attempt)
+            self._note_held(
+                ctx, attempt, f"reconcile_{refusal}"[:60], route_lost.ROUTE_LOST_HELD_EVENT
+            )
+            return True
         self._unknown(attempt, ROUTE_UNCONFIRMED)
         self._note_held(ctx, attempt, f"reconcile_{refusal}"[:60])
         return True
@@ -3076,6 +3169,20 @@ class SaladStageDriver:
             )
         return done
 
+    def stop_unknown(self, ctx: _Ctx, key: str, attempt: dict[str, Any]) -> bool:
+        """ADR 0216: cancel the route of an unknown attempt whose campaign is cancelled, so the
+        executor stops it (reduce-only; nothing is settled). True when the cancel was sent."""
+        row = self.runner._one(
+            "SELECT * FROM campaign_salad_attempts WHERE attempt_id=?", (attempt["id"],)
+        )
+        if row is None or row["route_id"] is None:
+            return False
+        route = self.route_state(row["route_id"])
+        if route is None or route["desired"] == "stop":
+            return False
+        self._cancel_route(ctx, self.runner._stage_row(ctx, key), attempt, dict(row))
+        return True
+
     def unwind(self, ctx: _Ctx, key: str, attempt: dict[str, Any]) -> bool:
         """Drive a packaged Salad attempt to settled; True when nothing is outstanding."""
         runner = self.runner
@@ -3262,6 +3369,11 @@ class SaladStageDriver:
         bounded = self.bounded_hold(attempt, row)
         if bounded is not None and self._read_verdict(attempt, row):
             return bounded, "guardian_bounded_hold"
+        # ADR 0216: a charge wait is bounded. Past the deadline the guardian's bound settles it,
+        # or the campaign blocks once on this attempt (re-read every blocked pass).
+        default = self._charge_deadline(attempt, row, block=True)
+        if default is not None:
+            return default
         self._await_charge(attempt)
         raise _waiting()()
 
@@ -3374,7 +3486,9 @@ class SaladStageDriver:
             return None
         return hold
 
-    def _read_verdict(self, attempt: dict[str, Any], row: dict[str, Any]) -> bool:
+    def _read_verdict(
+        self, attempt: dict[str, Any], row: dict[str, Any], *, provider_closed: bool = False
+    ) -> bool:
         """Read the guardian's per-frame record ourselves; True only when it says ``stopped``
         (or, for a provider-confirmed interruption, ``reconciled``: the guardian closed the
         frame by reconciling a stop it could not issue itself, ``stop_only``).
@@ -3435,6 +3549,7 @@ class SaladStageDriver:
                     or _retained_before_move(row)
                     or _provider_closed(row)
                     or _safety_stopped(row)
+                    or provider_closed
                     else {"stopped"}
                 )
                 if record["verdict"] not in closed:
@@ -3539,8 +3654,267 @@ class SaladStageDriver:
                         "records": [attempt["admitted_attempt_id"]],
                         "experiment_id": stage["experiment_id"],
                         "reason": reason,
+                        # ``at`` (the runner's clock) starts the charge deadline (ADR 0216).
+                        "at": self._stamp(),
                     },
                 )
+
+    # charge deadline (ADR 0216) ---------------------------------------------------------
+
+    def _charge_wait_started(self, attempt: dict[str, Any]) -> datetime | None:
+        """When a person was first asked to record this attempt's charge; None if never."""
+        event = self.runner._one(
+            """SELECT created_at, json_extract(payload_json,'$.at') AS at FROM events
+            WHERE event_type='campaign.stage_awaiting_human'
+            AND json_extract(payload_json,'$.campaign_id')=?
+            AND json_extract(payload_json,'$.attempt_id')=?
+            ORDER BY cursor LIMIT 1""",
+            (attempt["campaign_id"], attempt["id"]),
+        )
+        if event is None:
+            return None
+        try:
+            return _parse_utc(event["at"] or event["created_at"])
+        except (TypeError, ValueError):
+            return None
+
+    def _charge_overdue(self, attempt: dict[str, Any], row: dict[str, Any]) -> bool:
+        if row["phase"] != "awaiting_charge":
+            return False
+        started = self._charge_wait_started(attempt)
+        return started is not None and self.runner.now() > started + timedelta(
+            seconds=CHARGE_DEADLINE_SECONDS
+        )
+
+    def guardian_bound(self, attempt: dict[str, Any], row: dict[str, Any]) -> int | None:
+        """The attempt's hold when the guardian's final bounds its cost and control's own read
+        of the guardian record confirms the frame closed (``salad_guardian_bound``); else None."""
+        if guardian_bound_refusal(attempt, row) is not None:
+            self._bound_ok.pop(attempt["id"], None)
+            return None
+        now = self.runner.now()
+        due = self._bound_read_at.get(attempt["id"])
+        if due is not None and now < due:
+            return self._bound_ok.get(attempt["id"])  # the last successful read stands
+        self._bound_read_at[attempt["id"]] = now + timedelta(seconds=GUARDIAN_FINAL_REFRESH_SECONDS)
+        if not self._read_verdict(attempt, row, provider_closed=True):
+            self._bound_ok.pop(attempt["id"], None)
+            return None
+        bound = int(attempt["hold_cents"])
+        self._bound_ok[attempt["id"]] = bound
+        return bound
+
+    def _resumed_bound(self, attempt: dict[str, Any]) -> int | None:
+        """The settlement a charge-overdue resume decided on the guardian's bound (recorded on
+        its resume event, after control's own read), or None. Durable, so neither a restart nor
+        a throttled read can send the attempt back to the block."""
+        found = self.runner._one(
+            """SELECT json_extract(payload_json,'$.settlement_cents') AS cents FROM events
+            WHERE event_type=? AND json_extract(payload_json,'$.campaign_id')=?
+            AND json_extract(payload_json,'$.attempt_id')=?
+            AND json_extract(payload_json,'$.basis')='guardian_bounded_hold'
+            ORDER BY cursor DESC LIMIT 1""",
+            (CHARGE_OVERDUE_RESUMED_EVENT, attempt["campaign_id"], attempt["id"]),
+        )
+        if found is None or type(found["cents"]) is not int:
+            return None
+        return found["cents"] if found["cents"] == int(attempt["hold_cents"]) else None
+
+    def _charge_deadline(
+        self, attempt: dict[str, Any], row: dict[str, Any], *, block: bool
+    ) -> tuple[int, str] | None:
+        """ADR 0216: ``(hold, guardian_bounded_hold)`` once the charge deadline has passed and
+        the guardian bounds the cost (one event); None while inside the deadline. Past it with
+        no bound, ``block`` blocks the campaign once on this attempt (and the caller waits)."""
+        if not self._charge_overdue(attempt, row):
+            return None
+        resumed = self._resumed_bound(attempt)
+        bound = resumed if resumed is not None else self.guardian_bound(attempt, row)
+        if bound is not None:
+            campaign = self.runner._campaign(attempt["campaign_id"])
+            self._record_once(
+                campaign,
+                CHARGE_DEADLINE_SETTLED_EVENT,
+                attempt["id"],
+                {
+                    "stage_key": attempt["stage_key"],
+                    "attempt": attempt["attempt"],
+                    "settlement_cents": bound,
+                    "settlement_basis": "guardian_bounded_hold",
+                    "settlement_is_estimate": True,
+                    "deadline_seconds": CHARGE_DEADLINE_SECONDS,
+                },
+            )
+            return bound, "guardian_bounded_hold"
+        if block:
+            self._block_charge_overdue(attempt, guardian_bound_refusal(attempt, row))
+        return None
+
+    def _record_once(
+        self, campaign: dict[str, Any], event_type: str, attempt_id: str, payload: dict
+    ) -> None:
+        with self.runner.store.runner_connection() as connection:
+            seen = connection.execute(
+                """SELECT 1 FROM events WHERE project_id=? AND event_type=?
+                AND json_extract(payload_json,'$.campaign_id')=?
+                AND json_extract(payload_json,'$.attempt_id')=? LIMIT 1""",
+                (campaign["project_id"], event_type, campaign["id"], attempt_id),
+            ).fetchone()
+            if seen is None:
+                self.runner._hold_lease(connection)
+                self.runner.store.record_runner_event(
+                    connection, campaign, event_type, {"attempt_id": attempt_id, **payload}
+                )
+
+    def _block_charge_overdue(self, attempt: dict[str, Any], refusal: str | None) -> None:
+        """The deadline passed with no bound: in one transaction the attempt goes ``unknown``
+        (its prior status kept on the event, so it can resume), its stage ``blocked_unknown``
+        and the campaign ``blocked`` with one ``campaign.blocked`` event. Holds stay held."""
+        runner = self.runner
+        with runner.store.runner_connection() as connection:
+            runner._hold_lease(connection)
+            fresh = connection.execute(
+                "SELECT * FROM campaign_stage_attempts WHERE id=?", (attempt["id"],)
+            ).fetchone()
+            if fresh is None or fresh["status"] == "unknown" or fresh["settled_cents"] is not None:
+                return
+            runner._touch(
+                connection,
+                "campaign_salad_attempts",
+                "attempt_id=? AND phase='awaiting_charge'",
+                (attempt["id"],),
+                phase="unknown",
+                waiting_reason=CHARGE_OVERDUE,
+            )
+            runner._touch(
+                connection,
+                "campaign_stage_attempts",
+                "id=?",
+                (attempt["id"],),
+                status="unknown",
+                failure_class="observed_unknown",
+                failure_detail=CHARGE_OVERDUE,
+            )
+            runner._touch(
+                connection,
+                "campaign_stages",
+                "campaign_id=? AND stage_key=? AND status NOT IN "
+                "('succeeded','failed','refused_budget','cancelled','skipped')",
+                (attempt["campaign_id"], attempt["stage_key"]),
+                status="blocked_unknown",
+            )
+            campaign = dict(
+                connection.execute(
+                    "SELECT * FROM campaigns WHERE id=?", (attempt["campaign_id"],)
+                ).fetchone()
+            )
+            blocked = connection.execute(
+                """UPDATE campaigns SET status='blocked', updated_at=?
+                WHERE id=? AND status IN ('running','stopping')""",
+                (self._stamp(), attempt["campaign_id"]),
+            ).rowcount
+            # One event: the block, or (a cancelling campaign is never blocked) the overdue
+            # record alone. Either carries the prior status the re-read restores.
+            runner.store.record_runner_event(
+                connection,
+                campaign,
+                "campaign.blocked" if blocked else CHARGE_OVERDUE_EVENT,
+                {
+                    "reason": CHARGE_OVERDUE_BLOCK_REASON,
+                    "stage_key": attempt["stage_key"],
+                    "attempt": attempt["attempt"],
+                    "attempt_id": attempt["id"],
+                    "refusal": refusal or "guardian_verdict_unread",
+                    "deadline_seconds": CHARGE_DEADLINE_SECONDS,
+                    "was": {
+                        "status": fresh["status"],
+                        "failure_class": fresh["failure_class"],
+                        "failure_detail": fresh["failure_detail"],
+                    },
+                },
+            )
+            if blocked:
+                runner._free_campaign_releases(
+                    connection, attempt["campaign_id"], "campaign_blocked"
+                )
+
+    def _resume_charge_overdue(
+        self, ctx: _Ctx, attempt: dict[str, Any], row: dict[str, Any]
+    ) -> None:
+        """Every blocked pass re-reads a charge-overdue attempt: once a compute charge is
+        recorded or the guardian's bound holds, it returns to ``awaiting_charge`` with its prior
+        status (from its block event) and its stage resumes, in one transaction with one event;
+        the running pass then settles it as usual. Anything else holds, unchanged."""
+        count, _ = self.charges(attempt)
+        if not count:
+            # A stored final that is not terminal yet is refreshed from control's own guardian
+            # read first (ADR 0212 item 7, throttled), then the bound is re-read (throttled).
+            row, _ = self._refresh_guardian_final(ctx, attempt, row)
+            if self.guardian_bound(attempt, row) is None:
+                return
+        runner = self.runner
+        event = runner._one(
+            """SELECT json_extract(payload_json,'$.was') AS was FROM events
+            WHERE event_type IN ('campaign.blocked', ?)
+            AND json_extract(payload_json,'$.campaign_id')=?
+            AND json_extract(payload_json,'$.attempt_id')=?
+            AND json_extract(payload_json,'$.reason')=? ORDER BY cursor DESC LIMIT 1""",
+            (CHARGE_OVERDUE_EVENT, ctx.campaign["id"], attempt["id"], CHARGE_OVERDUE_BLOCK_REASON),
+        )
+        try:
+            was = json.loads(event["was"]) if event is not None else None
+        except (TypeError, ValueError):
+            was = None
+        if type(was) is not dict or was.get("status") not in _RESUMABLE_STATUSES:
+            return  # no readable prior state: a person decides
+        with runner.store.runner_connection() as connection:
+            runner._hold_lease(connection)
+            held = connection.execute(
+                """SELECT 1 FROM campaign_salad_attempts sa JOIN campaign_stage_attempts a
+                ON a.id = sa.attempt_id WHERE sa.attempt_id=? AND sa.phase='unknown'
+                AND sa.waiting_reason=? AND a.status='unknown' AND a.settled_cents IS NULL""",
+                (attempt["id"], CHARGE_OVERDUE),
+            ).fetchone()
+            if held is None:
+                return
+            runner._touch(
+                connection,
+                "campaign_salad_attempts",
+                "attempt_id=?",
+                (attempt["id"],),
+                phase="awaiting_charge",
+                waiting_reason=None,
+            )
+            runner._touch(
+                connection,
+                "campaign_stage_attempts",
+                "id=? AND status='unknown'",
+                (attempt["id"],),
+                status=was["status"],
+                failure_class=was.get("failure_class"),
+                failure_detail=was.get("failure_detail"),
+            )
+            runner._touch(
+                connection,
+                "campaign_stages",
+                "campaign_id=? AND stage_key=? AND status='blocked_unknown'",
+                (ctx.campaign["id"], attempt["stage_key"]),
+                status="running",
+            )
+            runner.store.record_runner_event(
+                connection,
+                ctx.campaign,
+                CHARGE_OVERDUE_RESUMED_EVENT,
+                {
+                    "stage_key": attempt["stage_key"],
+                    "attempt": attempt["attempt"],
+                    "attempt_id": attempt["id"],
+                    "basis": "human_charge" if count else "guardian_bounded_hold",
+                    # Resumed by the bound: the settlement is decided here, in the resume's own
+                    # transaction, and the settle step applies exactly it (never a re-block).
+                    **({} if count else {"settlement_cents": int(attempt["hold_cents"])}),
+                },
+            )
 
     # exposure, late charges ----------------------------------------------------------
 

@@ -175,6 +175,7 @@ class _GuardianFinal(BaseModel):
             "rate_unknown",
             "provider_unknown",
             "provider_unavailable",
+            "accounting_unavailable",
         ]
         | None
     ) = None
@@ -200,6 +201,32 @@ def _final_dump(final: _GuardianFinal) -> dict:
     if type(cut) is dict and cut.get("custody_work_begun") is None:
         cut.pop("custody_work_begun", None)
     return dumped
+
+
+def _stored_final(final: _GuardianFinal) -> str:
+    """The guardian final as the control plane stores it (``guardian_final_json``)."""
+    return json.dumps(
+        {
+            key: value
+            for key, value in _final_dump(final).items()
+            # Absent unless used, so the stored shape (and its digest) of every run without one
+            # of these additive records is unchanged.
+            if key
+            not in (
+                "allocation_timeout",
+                "prestart_rebinds",
+                "route_deadline",
+                "start_failure",
+                "start_events",
+                "safety_stop_cause",
+                "retained_before_move",
+                "container_log",
+            )
+            or value is not None
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _partial_without_custody_evidence(connection, row, manifest_id, receipt) -> bool:
@@ -240,6 +267,39 @@ class _SaladOutcome(BaseModel):
 
 
 LIVE_CHECK_NO_RECEIPT = "live_check_no_receipt"
+# ADR 0212 addendum: the executor's word that the route's live check is gone (a crash, an
+# out-of-memory kill, a reboot or a timeout of the executor) with no receipt on its disk, carrying
+# the guardian's terminal final for the route as the executor read it (read-only status).
+ROUTE_LOST_EVENT = "campaign.salad_route_lost_no_receipt"
+_TERMINAL_GUARDIAN = frozenset({"stopped", "reconciled"})
+# The executor's typed refusal of an attempt it was handed but will not run (ADR 0212 addendum):
+# the waiting reason is ``EXECUTOR_REFUSED_PREFIX + code`` and the runner unwinds it at once.
+EXECUTOR_REFUSED_PREFIX = "executor_refused:"
+EXECUTOR_REFUSAL_CODES = frozenset(
+    {"different_profile", "plan_budget_above_profile", "step_breaker_open"}
+)
+EXECUTOR_REFUSED_EVENT = "campaign.salad_executor_refused"
+# Phases before any route is started: nothing can have been sent to the provider.
+_REFUSABLE_PHASES = (
+    "awaiting_lease",
+    "leased",
+    "awaiting_review",
+    "reviewed",
+    "capability_ready",
+    "route_proposed",
+)
+
+
+class _SaladRouteLost(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    route_id: _Ident
+    guardian_final: _GuardianFinal
+
+
+class _SaladRefusal(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    code: Annotated[str, StringConstraints(min_length=1, max_length=60)]
+    step: Annotated[str, StringConstraints(pattern=r"^[a-z_]{1,20}$")] | None = None
 
 
 class _SaladCustodyEvidence(BaseModel):
@@ -493,6 +553,108 @@ class SaladWorkerCommands:
             audience="worker",
         )
 
+    def record_salad_route_lost(self, worker, attempt_id, key, payload):
+        """ADR 0212 addendum: the executor resumed an attempt whose live check is gone with no
+        receipt on its disk, and the guardian's read-only status for the route is terminal.
+
+        Records that guardian final (``guardian_final_json``) and one ``ROUTE_LOST_EVENT``; the
+        runner alone decides from control's own records whether the attempt resolves as
+        retryable infrastructure. Accepted only for an ``executing`` attempt with no recorded
+        outcome, or the sanctioned late-importable ``unknown`` (``late_importable``). A stored
+        terminal final is never overwritten. Nothing about effects or spend is asserted."""
+        try:
+            body = _SaladRouteLost.model_validate(payload)
+        except ValidationError as error:
+            raise _invalid(error) from None
+        if body.guardian_final.status not in _TERMINAL_GUARDIAN:
+            raise Conflict("The guardian has not stopped the route.")
+
+        def command(connection, live):
+            row = _salad_attempt(connection, live, attempt_id, _EVIDENCE_CAMPAIGN_STATUSES)
+            if row["phase"] != "executing" and not late_importable(row):
+                raise Conflict("Salad attempt has no executing route.")
+            if row["route_id"] != body.route_id:
+                raise Conflict("Report names a route this attempt did not start.")
+            if row["live_receipt_json"] is not None:
+                raise Conflict("Salad attempt already has a recorded outcome.")
+            fields: dict[str, Any] = {}
+            try:
+                stored = json.loads(row["guardian_final_json"] or "null")
+            except ValueError:
+                stored = None
+            if type(stored) is not dict or stored.get("status") not in _TERMINAL_GUARDIAN:
+                fields["guardian_final_json"] = _stored_final(body.guardian_final)
+            else:
+                # Already terminal: keep it; only the executor's no-receipt word is recorded.
+                fields["waiting_reason"] = row["waiting_reason"]
+            return 200, _salad_move(
+                self,
+                connection,
+                live,
+                row,
+                fields,
+                ROUTE_LOST_EVENT,
+                {
+                    "route_id": body.route_id,
+                    "guardian_status": body.guardian_final.status,
+                    "guardian_reason": body.guardian_final.reason[:80],
+                },
+            )
+
+        return self._mutate(
+            worker,
+            key,
+            "POST",
+            f"/worker/campaign-salad/{attempt_id}/route-lost",
+            canonical_digest(dict(payload)),
+            command,
+            audience="worker",
+        )
+
+    def record_salad_refusal(self, worker, attempt_id, key, payload):
+        """ADR 0212 addendum: the executor will not run this attempt (a closed code: its stage
+        names a profile it does not serve, its plan budget is above the profile's cap, or its
+        per-attempt step breaker opened). Only before any route is started, so nothing was
+        sent; the waiting reason becomes ``EXECUTOR_REFUSED_PREFIX + code`` and the runner
+        unwinds the attempt at once on control's own no-claim proof, never by waiting out the
+        grant."""
+        try:
+            body = _SaladRefusal.model_validate(payload)
+        except ValidationError as error:
+            raise _invalid(error) from None
+        if body.code not in EXECUTOR_REFUSAL_CODES:
+            raise StoreError("Unknown executor refusal code.")
+
+        def command(connection, live):
+            row = _salad_attempt(connection, live, attempt_id, _EVIDENCE_CAMPAIGN_STATUSES)
+            if row["phase"] not in _REFUSABLE_PHASES or row["attempt_status"] not in (
+                "admitted",
+                "running",
+            ):
+                raise Conflict("Salad attempt is past the point an executor may refuse it.")
+            reason = EXECUTOR_REFUSED_PREFIX + body.code
+            if row["waiting_reason"] == reason:
+                return 200, {"attempt_id": row["attempt_id"], "waiting_reason": reason}
+            return 200, _salad_move(
+                self,
+                connection,
+                live,
+                row,
+                {"waiting_reason": reason},
+                EXECUTOR_REFUSED_EVENT,
+                {"code": body.code, "step": body.step, "phase": row["phase"]},
+            )
+
+        return self._mutate(
+            worker,
+            key,
+            "POST",
+            f"/worker/campaign-salad/{attempt_id}/refusal",
+            canonical_digest(dict(payload)),
+            command,
+            audience="worker",
+        )
+
     def record_salad_outcome(self, worker, attempt_id, key, payload):
         try:
             body = _SaladOutcome.model_validate(payload)
@@ -524,30 +686,7 @@ class SaladWorkerCommands:
                 else json.dumps(body.estimated_exposure, sort_keys=True)[:2000]
             )
             guardian_final = (
-                None
-                if body.guardian_final is None
-                else json.dumps(
-                    {
-                        key: value
-                        for key, value in _final_dump(body.guardian_final).items()
-                        # Absent unless used, so the stored shape (and its digest) of every
-                        # run without one of these additive records is unchanged.
-                        if key
-                        not in (
-                            "allocation_timeout",
-                            "prestart_rebinds",
-                            "route_deadline",
-                            "start_failure",
-                            "start_events",
-                            "safety_stop_cause",
-                            "retained_before_move",
-                            "container_log",
-                        )
-                        or value is not None
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
+                None if body.guardian_final is None else _stored_final(body.guardian_final)
             )
             # The control plane computes the digest and infers no status from the receipt.
             return 200, _salad_move(
@@ -594,14 +733,18 @@ class SaladWorkerCommands:
         lease-held ones too (``leased`` through ``route_started``), for keepalive only, never
         ``awaiting_lease``: ``campaign_status`` tells the executor
         never to launch them. A late-importable ``unknown`` attempt (``late_importable``) is
-        listed so a receipt already on disk can still be recorded (v0.104.0).
+        listed so a receipt already on disk can still be recorded (v0.104.0). ``steering_paused``
+        tells the executor a running campaign is paused, so it takes no lease for it (ADR 0208
+        addendum).
         """
         connection = _connect(self.database_path)
         try:
             rows = connection.execute(
                 """SELECT sa.attempt_id, sa.phase, sa.route_id, sa.operation_id, sa.updated_at,
                 a.campaign_id, a.stage_key, a.grant_id, a.admitted_attempt_id,
-                ss.profile, c.status AS campaign_status
+                ss.profile, c.status AS campaign_status,
+                EXISTS (SELECT 1 FROM campaign_steering st WHERE st.campaign_id = a.campaign_id
+                  AND st.paused = 1) AS steering_paused
                 FROM campaign_salad_attempts sa
                 JOIN campaign_stage_attempts a ON a.id = sa.attempt_id
                 JOIN campaigns c ON c.id = a.campaign_id

@@ -52,6 +52,33 @@ one frame allowed, every per-frame rule below holds for each frame and the total
 aggregate (see **Open billable frames**); the unseen-run gap each admission charges grows with
 the setting (ADR 0041 section 7.2, resolved question 4b).
 
+The configuration is a closed set. Required: `state_directory`, `credential_directory`,
+`credential_reference`, `credential_version`, `organization_ids`, `destination`, `listen_host`,
+`listen_port`, `tls_certificate`, `tls_key`, `admin_token_file`. Optional: `total_cap_cents`,
+`allocation_deadline_seconds`, `provisioning_deadline_seconds`, `control_origin`,
+`max_open_billable_frames`, `max_prestart_rebinds`, `prestart_read_deadline_seconds`,
+`unix_socket` and `proxy_uid` (given together). Any other key (a misspelt `total_cap_cent`, say),
+a missing required key or a value of the wrong type (a JSON boolean is not an integer) refuses the
+whole file before anything is fetched or opened; the message names the key, never its value
+(an unknown key's name is cut to 64 characters). A real start and `--check-config` call the same
+parser (`validate_guardian_config`, ADR 0214 and ADR 0215).
+
+Exit codes: `0` for a clean stop or `--check-config` success, `2` only when the operator's own
+configuration is refused (the file, a key, or a file it names being unsafe), `1` for every other
+fatal error (the 2-second JWKS fetch failing at boot, a bind or TLS error, an exception in the
+serve loop). The stdout line says which: `{"state":"unavailable","reason":"config_refused"}` or
+`..."reason":"service_prerequisite_or_runtime_failure"`. The systemd unit restarts exit 1 and
+not exit 2.
+
+`--check-config --config FILE` runs the same read and validation plus the owner/mode checks on the
+TLS key, the admin token, the state and credential directories and the unix-socket directory, then
+prints one `tessera.config-check.v1` JSON line (`widths`: `max_open_billable_frames`) and exits 0
+or 2. It fetches no JWKS, reads no key or token bytes, binds nothing and opens or writes no state.
+
+`--health-file PATH` writes a `tessera.service-health.v1` file (`name` `salad-guardian`) before the
+serve loop, from the loop at most every 5 seconds, and `stopped` on exit. A failed health write is
+reported on stderr and never stops the guardian.
+
 The admin token is an independently provisioned random bearer credential of at
 least 32 bytes, never the Salad management credential. Trusted clients pin the
 server certificate digest and verify hostname/CA with TLS 1.3. Workloads use only
@@ -293,8 +320,11 @@ With `max_open_billable_frames` above 1 the guardian keeps these rules:
   accounted on its own rate, start time and ledger row; one frame's accrual never offsets
   another frame's hold. After every loop pass the guardian recomputes the total. If an
   overshoot or a cap lowered across a restart puts it over `total_cap_cents`, every frame
-  that may still bill is fenced and stopped (event `total_cap_breached`), not only the one
-  that overshot.
+  that may still bill is fenced and stopped (event `total_cap_breached`, cause `total_cap`), not
+  only the one that overshot. If the total cannot be read at all, every such frame is fenced the
+  same way but under its own cause `accounting_unavailable` (event of that kind, the exception
+  type name only): the cap was never shown breached, so control may retry the stage within
+  `retry.infra_retries` (ADR 0215), while a real `total_cap` stop is never retried.
 - *Per-frame stops.* A frame's own cap breach, rate change, deadline, heartbeat loss or
   reallocation fences and stops that frame only. Stopping or settling one frame frees one
   slot. An ambiguous create still counts.
@@ -371,7 +401,7 @@ receipt. The first cause of a guardian's own stop decision
 `deadline`, ...) is kept as `stop_cause` in status, even after the operation later turns
 `stopped`, and as `guardian_stop_cause` on the live receipt. A stop the service itself
 starts records its first closed cause the same way (`heartbeat_silence`, `deadline`,
-`clock_uncertain`, `rate_unknown`, `cost_cap`, `total_cap`, `loop_frame_failed`,
+`clock_uncertain`, `rate_unknown`, `cost_cap`, `total_cap`, `accounting_unavailable`, `loop_frame_failed`,
 `guardian_restart`, `control_cancel`, or `stop_only_recovery` when a recovery names no other
 cause), also kept on the reservation as `stop_cause` (ADR 0075). A refused workload call
 (begin-once, input, output) records its closed refusal code (never the token or body) as a
@@ -637,7 +667,8 @@ attempt keeps its outcome class: only its settlement changes (a `salad_not_passe
 The guardian's first stop cause is carried on the executor's recorded final as
 `safety_stop_cause` only when it is one the safety plane made for its own health:
 `heartbeat_silence`, `control_disconnect`, `missed_poll`, `clock_uncertain`, `guardian_restart`,
-`loop_frame_failed`, `rate_unknown`, `provider_unknown` or `provider_unavailable`. Control then
+`loop_frame_failed`, `rate_unknown`, `provider_unknown`, `provider_unavailable` or
+`accounting_unavailable` (ADR 0215). Control then
 records the transient `infra_salad_safety_stop` (retried within `retry.infra_retries`, then the
 class/profile fallback) instead of `salad_not_passed`; a cause seen only on the live receipt never
 selects it. Settlement is unchanged.

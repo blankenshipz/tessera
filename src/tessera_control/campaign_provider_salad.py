@@ -21,6 +21,7 @@ from .campaign_delegation import STEP_TABLE
 from .campaign_image_pull import DEFAULT_INTERRUPTIBLE_MAX_IMAGE_PULL_BYTES
 from .campaign_infra_retry import (
     GUARDIAN_UNAVAILABLE_PRESTART_CLASSES,
+    INFRA_SALAD_EXECUTOR_LOST,
     INFRA_SALAD_GUARDIAN_UNAVAILABLE,
     INFRA_SALAD_PROVISIONING_OVERRUN,
     INFRA_SALAD_REALLOCATED,
@@ -112,6 +113,54 @@ ROUTE_SLOT_SQL = (
 def route_slot_params() -> tuple[str, ...]:
     """Bind values for ``ROUTE_SLOT_SQL``, in order."""
     return (*_TERMINAL, PROVIDER_ID, *ROUTE_SLOT_PHASES)
+
+
+# ``unknown`` is terminal for the count above, but it is a verdict about evidence, not about the
+# route: the route may still be running on Salad. So an ``unknown`` Salad attempt that holds a
+# grant and has a route keeps its slot until control's own route record confirms the route
+# ended (``route_end_confirmed``), fail closed (ADR 0208 addendum). A reconcile that moves the
+# attempt out of ``unknown`` frees it as any terminal status does.
+UNKNOWN_ROUTE_SQL = """SELECT sa.route_id FROM campaign_stage_attempts a
+    JOIN campaign_salad_attempts sa ON sa.attempt_id=a.id
+    WHERE a.grant_id IS NOT NULL AND a.status='unknown' AND sa.route_id IS NOT NULL"""
+
+
+def route_end_confirmed(state: Mapping[str, Any] | None) -> bool:
+    """True only when the route's latest state shows the Salad route stopped: for a
+    reallocated route, the provider's own read of the stopped group (ADR 0149); otherwise
+    termination confirmed, provider status ``stopped`` and a provider readback, the same
+    precondition ``verify_outcome`` reads. A missing or unreadable state is not confirmed."""
+    from .salad_termination import provider_termination
+
+    if not isinstance(state, Mapping):
+        return False
+    if state.get("reallocated") is True:
+        return provider_termination(dict(state)).confirmed
+    receipts = state.get("receipts")
+    return (
+        state.get("termination_confirmed") is True
+        and state.get("provider_status") == "stopped"
+        and isinstance(receipts, list)
+        and any(isinstance(r, Mapping) and r.get("provenance") == "provider" for r in receipts)
+    )
+
+
+def unknown_route_holders(rt: RunnerServices) -> int:
+    """``unknown`` Salad attempts whose route end control has not confirmed (they hold a slot)."""
+    held = 0
+    for row in rt.rows(UNKNOWN_ROUTE_SQL):
+        state = rt.one(
+            """SELECT payload_json FROM events WHERE event_type='remote_execution.state'
+            AND json_extract(payload_json,'$.id')=? ORDER BY cursor DESC LIMIT 1""",
+            (row["route_id"],),
+        )
+        try:
+            parsed = None if state is None else json.loads(state["payload_json"])
+        except (TypeError, ValueError):
+            parsed = None
+        if not route_end_confirmed(parsed):
+            held += 1
+    return held
 
 
 RUNTIME = SALAD_RUNTIME
@@ -900,6 +949,27 @@ class SaladRouteProvider:
                 evidence_digest=evidence,
                 manifest_id=attempt.get("manifest_id"),
             )
+        if deadline is not None and self._executor_lost(attempt):
+            # ADR 0212 addendum: the executor died mid-route (route loss reported, no receipt),
+            # so nothing collected the run and the guardian's route-deadline stop is the likely
+            # shape of that death, not the stage's own failure. It ends as the lost-route class,
+            # retried within ``retry.infra_retries``; a provisioning overrun keeps its class
+            # (checked above). Outputs are never accepted.
+            lost_detail = self._failure_detail(attempt)
+            tail = (
+                f"; the guardian stopped the group at the route deadline after "
+                f"{deadline['running_seconds']}s running"
+            )
+            if tail not in lost_detail:  # a repeated observe gives the same detail
+                lost_detail += tail
+            return Observation(
+                "failed_transient",
+                failure_class=INFRA_SALAD_EXECUTOR_LOST,
+                detail=f"salad:{lost_detail}"[:500],
+                evidence_kind="salad_live_receipt",
+                evidence_digest=evidence,
+                manifest_id=attempt.get("manifest_id"),
+            )
         if deadline is not None:
             # The guardian stopped a run after an instance was seen because the route window
             # ran out: not a workload bug, and not retried here (retry policy is separate).
@@ -914,11 +984,10 @@ class SaladRouteProvider:
                 evidence_digest=evidence,
                 manifest_id=attempt.get("manifest_id"),
             )
-        failure_detail = str(attempt.get("failure_detail") or "")
         # The class is durable: before the runner records its observation the detail carries it;
         # afterwards the stored failure_class (and the ``salad:``-prefixed detail) do, so a
         # repeated observe of the same attempt gives the same answer.
-        failure_detail = failure_detail.removeprefix("salad:")
+        failure_detail = self._failure_detail(attempt)
         stored_class = attempt.get("failure_class")
         if stored_class == REALLOCATED_PRECUSTODY or failure_detail.startswith(
             REALLOCATED_PRECUSTODY
@@ -967,6 +1036,18 @@ class SaladRouteProvider:
             return Observation(
                 "failed_transient",
                 failure_class=INFRA_SALAD_RECONCILED_NO_OUTPUT,
+                detail=f"salad:{failure_detail}"[:500],
+                evidence_kind="salad_live_receipt",
+                evidence_digest=evidence,
+                manifest_id=attempt.get("manifest_id"),
+            )
+        if self._executor_lost(attempt):
+            # ADR 0212 addendum: the live check is gone with no receipt and the guardian's own
+            # final is terminal with no output kept (control's driver checked every condition).
+            # Outputs are never accepted; retried within ``retry.infra_retries`` by the runner.
+            return Observation(
+                "failed_transient",
+                failure_class=INFRA_SALAD_EXECUTOR_LOST,
                 detail=f"salad:{failure_detail}"[:500],
                 evidence_kind="salad_live_receipt",
                 evidence_digest=evidence,
@@ -1039,6 +1120,19 @@ class SaladRouteProvider:
         )
 
     @staticmethod
+    def _failure_detail(attempt: Mapping[str, Any]) -> str:
+        """The attempt's failure detail without the ``salad:`` prefix the runner stores."""
+        return str(attempt.get("failure_detail") or "").removeprefix("salad:")
+
+    @classmethod
+    def _executor_lost(cls, attempt: Mapping[str, Any]) -> bool:
+        """The attempt was resolved as a lost route (ADR 0212 addendum): its stored class, or
+        before the runner records one, the detail the route-lost resolve wrote."""
+        return attempt.get("failure_class") == INFRA_SALAD_EXECUTOR_LOST or cls._failure_detail(
+            attempt
+        ).startswith(INFRA_SALAD_EXECUTOR_LOST)
+
+    @staticmethod
     def _route_deadline(rt: RunnerServices, attempt: Mapping[str, Any]) -> dict[str, Any] | None:
         """The guardian's recorded route-deadline cut after an instance was seen, or None."""
         if rt is None or attempt.get("id") is None:
@@ -1107,6 +1201,11 @@ class SaladRouteProvider:
     def cancel(self, rt: RunnerServices, ctx: Any, key: str, attempt: Mapping) -> bool:
         return self._translate(lambda: self.driver(rt).unwind(ctx, key, dict(attempt)))
 
+    def stop_unknown(self, rt: RunnerServices, ctx: Any, key: str, attempt: Mapping) -> bool:
+        """ADR 0216: the reduce-only stop of a cancelled campaign's unknown attempt (its route
+        cancelled); True while that step is still outstanding."""
+        return self._translate(lambda: self.driver(rt).stop_unknown(ctx, key, dict(attempt)))
+
     # -- cost / settle ----------------------------------------------------------------------
 
     def settle(self, rt: RunnerServices, attempt: Mapping[str, Any]) -> Settlement:
@@ -1122,7 +1221,8 @@ class SaladRouteProvider:
         """Route slots left, or None when the operator recorded no executor width (unbounded,
         as before). Counts every Salad attempt, of any campaign, that occupies a route slot
         (``ROUTE_SLOT_SQL``): it holds a grant, its status is not terminal, and its phase is
-        between the grant and the end of its route."""
+        between the grant and the end of its route; plus every ``unknown`` attempt whose route
+        end is not confirmed (``unknown_route_holders``)."""
         if self.route_width is None:
             return None
         row = rt.one(
@@ -1131,7 +1231,8 @@ class SaladRouteProvider:
             WHERE {ROUTE_SLOT_SQL}""",
             route_slot_params(),
         )
-        return max(self.route_width - (int(row["n"]) if row else 0), 0)
+        held = (int(row["n"]) if row else 0) + unknown_route_holders(rt)
+        return max(self.route_width - held, 0)
 
     def slot_free(self, rt: RunnerServices, ctx: Any, stage: Any) -> bool:
         slots = self.free_slots(rt, ctx, stage)

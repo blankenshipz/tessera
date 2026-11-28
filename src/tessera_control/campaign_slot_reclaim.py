@@ -38,9 +38,17 @@ PLACED_NOT_GRANTED = "placed_not_granted"
 EXPIRED_UNCLAIMED_GRANT = "expired_unclaimed_grant"
 NOT_STARTED_EVIDENCE = "not_started_evidence"
 PAUSED_UNLEASED_GRANT = "paused_unleased_grant"
+BLOCKED_UNLEASED_GRANT = "blocked_unleased_grant"
 SLOT_REACQUIRED_EVENT = "campaign.slot_reacquired"
 # Marks an attempt closed by the paused-campaign release; the re-acquire event looks for it.
 PAUSED_RELEASE_DETAIL = "grant released while the campaign was paused (paused_slot_release)"
+BLOCKED_RELEASE_DETAIL = "grant released while the campaign was blocked (blocked_slot_release)"
+# Every detail an unleased-grant release writes (paused or blocked).
+UNLEASED_RELEASE_DETAILS = (PAUSED_RELEASE_DETAIL, BLOCKED_RELEASE_DETAIL)
+# Provider kinds whose never-leased grants the release may give back: a worker grant and a
+# Salad route grant before its executor's lease (ADR 0167, ADR 0208 addendum). Any other kind
+# keeps its grant (fail closed).
+UNLEASED_RELEASE_KINDS = ("worker_grant", "salad_route")
 # Non-terminal statuses in which the runner issues no grant and drives no attempt forward.
 STUCK_CAMPAIGN = ("blocked", "paused_delegation_lapsed")
 # Events after which a campaign may be running again; a later freeing is a new spell.
@@ -207,20 +215,43 @@ def idle_slot_holders(
     return ids, (ids[-1] if ids and len(ids) >= limit else None)
 
 
-def releasable_paused_grant(connection: sqlite3.Connection, attempt_id: str) -> sqlite3.Row | None:
-    """The attempt's grant when a paused campaign may give it back, else None (fail closed).
+def unleased_release_reason(status: str, steering_paused: bool) -> tuple[str, str] | None:
+    """``(slot_freed reason, failure detail)`` when a campaign in this state gives back each
+    grant no worker took, else None (it may still run them).
 
-    Unlike ``unclaimed_expired_grant`` the grant may still be live: a paused campaign starts
+    The one condition both the runner's pass and its in-transaction re-read use: paused
+    (``paused_delegation_lapsed``, or ``running`` with a steering pause; ADR 0167) or
+    ``blocked`` (ADR 0208 addendum). A blocked campaign starts nothing until a person or the
+    evidence path unblocks it, so a grant nobody leased is as unusable as a paused one's and,
+    under a recorded route width, would hold a route slot for every campaign until it expires."""
+    if status == "paused_delegation_lapsed" or (status == "running" and steering_paused):
+        return PAUSED_UNLEASED_GRANT, PAUSED_RELEASE_DETAIL
+    if status == "blocked":
+        return BLOCKED_UNLEASED_GRANT, BLOCKED_RELEASE_DETAIL
+    return None
+
+
+def releasable_unleased_grant(
+    connection: sqlite3.Connection, attempt_id: str
+) -> sqlite3.Row | None:
+    """The attempt's grant when a paused or blocked campaign may give it back, else None
+    (fail closed).
+
+    Unlike ``unclaimed_expired_grant`` the grant may still be live: such a campaign starts
     nothing, so a grant nobody ever took cannot be used by the campaign. The evidence is that
     no worker ever took a lease on it, no external operation exists for it and the attempt
-    has recorded no operation of its own. The store refuses a lease on a reconciled grant,
-    and the caller re-reads all of this inside the write transaction. A grant in
+    has recorded no operation of its own; a Salad attempt is also still ``awaiting_lease``
+    with no lease or operation on its Salad row. The store refuses a lease on a reconciled
+    grant, and the caller re-reads all of this inside the write transaction. A grant in
     ``cancel_requested``, with any lease row (even an expired one) or with any operation is
     never released here."""
     attempt = connection.execute(
-        """SELECT * FROM campaign_stage_attempts WHERE id=? AND grant_id IS NOT NULL
-        AND status IN ('granted','admitted') AND settled_cents IS NULL
-        AND operation_id IS NULL""",
+        """SELECT * FROM campaign_stage_attempts a WHERE a.id=? AND a.grant_id IS NOT NULL
+        AND a.status IN ('granted','admitted') AND a.settled_cents IS NULL
+        AND a.operation_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM campaign_salad_attempts sa WHERE sa.attempt_id=a.id
+            AND (sa.phase<>'awaiting_lease' OR sa.lease_id IS NOT NULL
+                OR sa.operation_id IS NOT NULL))""",
         (attempt_id,),
     ).fetchone()
     if attempt is None:

@@ -102,7 +102,110 @@ provider's own read. Only the bookkeeping was left, and a person had to do it.
   person.
 - Other `unknown` verify outcomes are not re-read here: a route that confirmed termination only
   later, a missing confirmed exit observation on a confirmed route, a manifest that does not
-  match, and an executor that went silent mid-route.
+  match, and an executor that went silent mid-route without reporting the route lost (the
+  addendum below covers the reported case).
 - The guardian final's observation time stands in for the reconcile time when ordering route
   readbacks. A readback taken between the reconcile and the executor's record of the final, and
   listing a live instance, is ignored.
+
+## Addendum: a lost route resolves without a person; executor refusals and breaker
+
+### Context
+
+The executor finishes a route only from the live check's receipt on its disk. After a crash, an
+out-of-memory kill, a reboot or a timeout of the executor mid-route, no receipt is ever written.
+The runner waited one route window plus 600 s (up to two windows plus about 6,900 s), then left the
+attempt `unknown` for the silent reason (`executor silent past the route window`) and blocked the
+campaign. Rule 1 could not help: there is no live receipt and usually no guardian final. Meanwhile
+the guardian keeps running and stops the group by itself, so its own final says the spend ended.
+
+Separately, the executor only wrote a note when it refused an attempt (its stage names a profile it
+does not serve, or its plan budget is above the profile's cap). Control then waited out the grant,
+twice, and blocked. One handler caught every per-attempt error with no bound, and a failed
+`control.work()` was swallowed, so the health file never showed errors.
+
+### Decision
+
+8. **Lost-route report.** When the executor resumes an `executing` attempt (no child of its own runs
+   it) and finds no receipt in the route's directory, it reads the guardian's status for the route
+   (read-only, the same projection as the outcome's guardian final). It reports only a terminal
+   final (`stopped`, or `reconciled`) that reads terminal on two reads at least 120 s apart, with no
+   receipt on disk at the second read, so a live check still writing its receipt is never reported
+   lost. The report goes once per route: a private marker in the route directory fixes the final, so
+   a retry or a restart replays the same request. Failed reports are bounded per process. A
+   late-importable silent attempt with no receipt is reported the same way. No route directory means
+   the executor never launched the route, and it says nothing.
+   `record_salad_route_lost` accepts the report only for an `executing` attempt with no recorded
+   live receipt, or for the late-importable silent `unknown`. It stores the final, never over a stored
+   terminal one, and records one `campaign.salad_route_lost_no_receipt` event. Nothing about effects
+   or spend is asserted.
+9. **The rule for a lost route.** The attempt ends `failed` with the new class
+   `infra_salad_executor_lost` (receipt reason `live_check_lost_no_receipt`) only when **all** of
+   these hold. Otherwise today's path stands (fail closed): the wait, then `unknown` for a person.
+   - the executor reported the route lost, and no live receipt was ever recorded;
+   - the recorded guardian final is `stopped`, or `reconciled` by the safety service's own
+     provider-confirmed close. An operator attestation never counts;
+   - that final is clean: no orphan, escalation, budget fence or unknown rate, and no billed cost.
+     `allocation_uncertain` is allowed only where the settlement rule already tolerates it (a
+     provider-confirmed close, or a stop on an allocation change);
+   - it carries a finite estimate whose next whole cent (at least 1) fits the hold;
+   - no output was retained, sealed or collected: no retained-before-move marker, and no manifest or
+     uploaded artifact under the grant;
+   - no provider readback recorded on the route since that final lists a live instance (rule 1's
+     ordering).
+
+   The runner applies the rule on the first pass after the report, without waiting out a window. It
+   also applies it on each blocked pass for an attempt already left `unknown` as silent. In one
+   transaction the attempt leaves its phase with the failed verdict, a blocked stage leaves
+   `blocked_unknown`, and one `campaign.salad_route_lost_resolved` event is recorded. Why an attempt
+   is still held is a closed code on `campaign.salad_route_lost_held`, recorded only when that code
+   changes. The guardian's records of the run's own outcome still decide the class first: an
+   allocation timeout (`infra_allocation_timeout`), a start failure (`start_failure_suspected`, or
+   the pre-custody reallocation when no exit was read), a workload non-zero exit
+   (`salad_container_exited_nonzero`) and a provisioning overrun (`infra_salad_provisioning_overrun`)
+   keep their own classes. A route-deadline stop that is not a provisioning overrun does not: with
+   the executor dead nothing collected the run, so the guardian's deadline stop is the likely shape
+   of that death, and it ends as the retryable `infra_salad_executor_lost` (its detail names the
+   deadline), never `failed_permanent / route_deadline_reached`. `infra_salad_executor_lost` covers
+   that and every other final. The `failure_class` on `campaign.salad_route_lost_resolved` is read
+   from the same provider classification the runner records, against the same guardian final (the
+   resolve refuses if the final changed in between), so the event always names the class the
+   attempt ends with. Outputs are never accepted: with no receipt, nothing of the run can be
+   imported.
+10. **Retry and settlement.** As in rules 2 to 4: one `retry.infra_retries` per attempt; settlement
+   at the guardian's estimate rounded up, at least 1 cent and within the hold (provisional
+   `guardian_bounded_hold`), which control's own guardian record read must confirm. Without a
+   worker-confirmed exit, the driver reconciles the grant under this rule in the same transaction
+   (`termination_evidence: guardian_confirmed_stop`). If the rule no longer holds there, the attempt
+   goes back to `unknown` for the silent reason, so the blocked re-read checks it again.
+11. **Typed refusals.** The executor reports a refusal with `record_salad_refusal` and a closed code
+   (`different_profile`, `plan_budget_above_profile`, `step_breaker_open`), once per attempt and code
+   per process. Control accepts it only before any route has started. The waiting reason becomes
+   `executor_refused:<code>`, and the runner unwinds the attempt on its next pass:
+   - for an unleased attempt, the grant is given back at zero, with the same evidence as a paused
+     campaign's release (no lease, no operation);
+   - for a leased one, the packaged unwind runs (cancel the route, revoke, the no-claim proof).
+
+   The attempt ends `failed_transient` / `t1_salad_unclaimed` and the stage's own retry budget
+   decides. Nothing waits out the grant. This assumes one executor per worker principal, which the
+   executor's `profiles` list already provides.
+12. **Step breaker.** Each attempt's consecutive per-step errors are persisted in the work directory
+   (`executor-breaker.json`), so a crash loop keeps counting. After 5 consecutive failures of a
+   pre-launch step (grant poll, lease, package), the executor stops trying that attempt and reports
+   `step_breaker_open`. A success, or the attempt leaving control's list, ends the streak. Errors
+   after launch (renewal, finish) are counted but never refused: the lease must stay held for the
+   runner's own release.
+13. **Health.** The service health file gains a `service` object with the executor's counters:
+   `work()` failures (total, consecutive, last class), per-item errors (total, last pass, last
+   class), refusals reported and failed, lost routes reported, attempts with an open breaker and
+   the longest failure streak.
+
+### Limits
+
+- A lost route whose guardian never reaches a terminal final, or whose final fails the rule, still
+  ends `unknown` for a person after the wait.
+- A route directory removed by the operator makes the executor silent for that route.
+- With two executors sharing one worker principal and serving different profiles, a
+  `different_profile` refusal would unwind the other executor's attempt. That deployment is not
+  supported.
+

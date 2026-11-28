@@ -34,6 +34,38 @@ auto-settling and every guardian-bounded hold waits for a human charge (ADR 0041
 upgrade the guardian, confirm its status carries `frame_record`, then give control the config. Without
 `--guardian-status-file` the guardian version is not checked and the finding says so.
 
+## Startup checks
+
+```
+tessera deploy-check \
+  --serve-args "--state-dir /var/lib/tessera/state --port 8765 --campaign-providers /etc/tessera/providers.json" \
+  --executor-args "--config /etc/tessera/salad-executor.json" \
+  --guardian-args "--run --config /etc/tessera/salad-guardian.json"
+```
+
+Each option is the argument string the service's unit passes (shell-quoted, without
+`--check-config`; `--executor-args` and `--guardian-args` repeat). The command runs the service's
+own `--check-config` with them in a fresh process under the interpreter running `deploy-check`,
+so run it from the release you are about to install, before stopping anything ([ADR
+0214](decisions/0214-deploy-gate-startup-equal-check.md)). `--check-config` is the startup path
+itself: the same parsing and validation a start runs, then an exit without binding a socket,
+writing state, taking a lock, contacting anything or reading a secret value. So `startup.*` fails
+exactly when that service's start would refuse its configuration (exit 2), and also when the
+check could not run (any other exit). Two parts of a start are not exercised: the guardian's
+certificate is not loaded together with its key (that reads the key), and `serve` does not open
+the control database (`state.schema` covers it). A stale executor `source_revision` is a note,
+not a failure, because `deploy-upgrade` re-pins it; the start itself still refuses a stale pin.
+
+| Check | What it reads | Fix |
+| --- | --- | --- |
+| `startup.serve.N`, `startup.salad-executor.N`, `startup.salad-guardian.N` | the service's `--check-config` exit code and its one `tessera.config-check.v1` line | edit the file the message names |
+| `startup.route_width` | the widths those checks parsed: control's `salad_max_concurrent_routes` ≤ the executors' `max_concurrent_paid_routes` (summed) ≤ the guardians' `max_open_billable_frames` (summed); every level that is set is compared (an executor wider than its guardians fails even with control unset), a width that is not an integer fails, then an unset control width is a warning | make the three agree |
+| `state.stored_specs`, `state.stored_attempts` (with `--state-dir`) | every non-terminal campaign's stored spec, re-parsed and re-digested with this release (its Salad workload contracts are part of the spec), and the stored guardian finals and live receipts of its unsettled attempts, read-only; skipped until the schema is current, so for a release with a migration it first runs in the post-migrate smoke, after the restart, not before the stop | a person reviews the named campaign; at runtime such a campaign is blocked, not failed |
+
+Exit codes of the services themselves: 2 only when the operator's configuration is refused
+(the units set `RestartPreventExitStatus=2`), 1 for every other fatal error, so
+`Restart=on-failure` restarts a transient fault (a key fetch at boot, a busy database).
+
 An applied fix writes an owner-only receipt (`tessera.deploy-fix-receipt.v1`) to `--receipt-dir`.
 It records the digests before and after and the key names or schema versions that changed, never a
 path or a value. Applying again changes nothing and writes no second receipt.

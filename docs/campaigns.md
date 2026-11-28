@@ -285,8 +285,16 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
   16 MiB per declared output.
 - If an experiment budget's exposure is unknown the stage is `refused_budget` with reason
   `exposure_unknown` (not `budget_refused`); nothing is dispatched.
-- A stored spec whose digest no longer matches its approval fails the campaign with
-  `spec_digest_mismatch`.
+- A stored spec whose digest no longer matches its approval (`spec_digest_mismatch`), or that
+  the running code can no longer parse (`stored_spec_unreadable`, for example a stricter model
+  after a deploy), blocks a running or stopping campaign with one `campaign.blocked` event
+  naming that reason (error class, count, types and field locations only; never spec text).
+  The block is reduce-only: no stage or attempt changes and every attempt, grant and hold stays
+  for a person. A campaign in another live status keeps it and gets one
+  `campaign.stored_spec_unverified` event; a cancel is recorded but its unwind waits for a
+  readable spec, since it needs each stage's provider. Once the spec verifies again (a fix or
+  rollback of the code) the block lifts and the reason is cleared. `deploy-check` runs the same
+  check read-only on every non-terminal campaign (`state.stored_specs`, ADR 0214).
 
 ## Budget, retry, data class, cancel and restart
 
@@ -360,7 +368,9 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
   a fresh grant under the same approval. A scientific replicate is a separate stage.
 - **Infrastructure retries (ADR 0058).** A confirmed exit with a code the spec names as
   infrastructure (`retry.infra_exit_codes`, default 137: the container was killed) is
-  retried by the runner itself, up to `retry.infra_retries` (off by default; 0 to 3) extra
+  retried by the runner itself, up to `retry.infra_retries` (0 to 3; off by default, except that a
+  stage that may run on Salad and leaves it unset gets 2 written into its spec at submit, before
+  the digest, ADR 0215) extra
   attempts that use no scientific retry; enabling it puts it in the approved digest and in the
   stage's worst-case exposure (and a Salad stage's per-task ceiling), the approval view
   (`infra_retry_policy` on submit and every read) states it per stage, together with
@@ -454,9 +464,25 @@ resolves the attempt, derives measurements, reconciles the grant, and records li
   `campaign.attempt_unclaimed_reconciled` (attempt id, proof code, evidence digest). Any failed
   guard keeps the human path and records `campaign.unclaimed_autoreconcile_refused` with a
   closed reason and a readable sentence. At most `--campaign-unclaimed-autoreconcile-limit`
-  (default 2, 0 disables) such reconciles per campaign; past it the attempt stays `unknown`
-  with `campaign.autoreconcile_stopped` (`kind: unclaimed`). The operator route
-  `reconcile-unclaimed-salad` is unchanged and still human-only.
+  (default 2, 0 disables) such reconciles per stage, and that times the stage count per campaign
+  (ADR 0216); past either the attempt stays `unknown` with `campaign.autoreconcile_stopped`
+  (`kind: unclaimed`). The operator route `reconcile-unclaimed-salad` is unchanged and still
+  human-only.
+- **Retryable-infrastructure reconcile (ADR 0216).** For an `unknown` Salad attempt whose
+  guardian final shows the frame closed (stopped, or reconciled) with no orphan, escalation, or
+  estimate or bill above the hold, and with no output kept, a person may run
+  `tessera campaign reconcile-retryable --grant-id ID --expected-revision N --owner-header FILE
+  --idempotency-key KEY` (`POST /execution-grants/{id}/reconcile-retryable-salad` with only
+  `expected_revision`). The grant settles at the attempt's hold, never an amount the caller
+  names, and the stage retries within `retry.infra_retries` (`infra_reconciled_retryable`);
+  with none left only that stage fails. Anything short of those conditions is refused with a
+  reason; the ordinary `POST /execution-grants/{id}/reconcile` stays for those.
+- **Charge deadline and cancel at the hold (ADR 0216).** A Salad attempt still waiting for its
+  compute charge an hour after a person was asked settles at its hold (provisional
+  `guardian_bounded_hold`) when the guardian's own record shows the frame closed; otherwise the
+  campaign blocks once (`charge_overdue`) until the charge is recorded, which resumes it. A
+  cancel finishes past an `unknown` attempt: its route is cancelled and its grant revoked, and
+  its hold stays held, unsettled, for a person's reconcile (`campaign.cancel_held_unknown`).
 - **Owner-requested unclaimed recovery (ADR 0205 amendment).** An attempt that is `unknown`
   past that limit, or one left `unknown` by an earlier build, keeps its campaign `blocked`.
   The owner recovers it with
@@ -777,8 +803,8 @@ stops holding capacity it provably is not using:
   and not-started evidence applied (ADR 0046), each with its own accounting. Nothing is
   started, cancelled or re-run, and no lease is issued.
 
-A live (unexpired) grant keeps its slot and is not touched: the run may still be going. An
-expired leased grant that no evidence settles keeps its slot, hold and exposure until a person
+A live (unexpired) leased grant keeps its slot and is not touched: the run may still be going
+(a live grant no worker took is given back, see below). An expired leased grant that no evidence settles keeps its slot, hold and exposure until a person
 reconciles it, and gets one `campaign.slot_held` event per attempt per spell (`stage_key`,
 `attempt`, `attempt_id`, `attempt_status`, `provider_id`, `grant_id`, `campaign_status`,
 `trigger`, `reason`: `leased_grant_unconfirmed`, or `exited_awaiting_collection` for an exit
@@ -802,9 +828,15 @@ doubt (no recorded identity, another container, a container that may still run, 
 answering) holds it, with the reason in the grant's local `termination-evidence.json`.
 
 A paused campaign (steering pause or delegation lapsed) also gives back a grant no worker ever
-took, even a live one (ADR 0167): no lease row, no operation, no recorded attempt operation, a
-registered worker-grant provider and no holdout. The attempt is settled at zero as
-`not_started` and consumes no scientific retry. Resuming places a new attempt that waits for a
+took, even a live one (ADR 0167), and so does a `blocked` campaign (ADR 0208 addendum): no lease
+row, no operation, no recorded attempt operation, a registered worker-grant or Salad route
+provider (a Salad attempt still `awaiting_lease`, its Salad row moved to `unclaimed`) and no
+holdout. The attempt is settled at zero as `not_started` and consumes no scientific retry. The
+events are `execution.paused_unleased_grant_released` or
+`execution.blocked_unleased_grant_released` and a `campaign.slot_freed` with reason
+`paused_unleased_grant` or `blocked_unleased_grant`. The Salad executor takes no lease for a
+blocked, paused, cancel-requested or finished campaign; it skips the item (`lease_held`) and
+never fails it. Resuming (or unblocking) places a new attempt that waits for a
 project slot in first-come order and records `campaign.slot_reacquired` when it gets one. The
 line counts any earlier waiter for the project, including one that is itself stuck on a
 provider slot, so such a waiter can delay later attempts for other providers. A pause between

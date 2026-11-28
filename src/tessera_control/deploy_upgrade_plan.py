@@ -92,6 +92,24 @@ class HealthHttp(_Closed):
         return value
 
 
+class ConfigCheck(_Closed):
+    """How a service is started, so the preflight can run its own ``--check-config`` (ADR 0214).
+
+    ``args`` are the service's arguments as its unit passes them, without ``--check-config``."""
+
+    program: Literal["serve", "salad-executor", "salad-guardian"]
+    args: Annotated[
+        list[Annotated[str, StringConstraints(max_length=512)]], Field(max_length=64)
+    ] = []
+
+    @field_validator("args")
+    @classmethod
+    def _plain_args(cls, value: list[str]) -> list[str]:
+        if any("\0" in item or item == "--check-config" for item in value):
+            raise ValueError("argument")
+        return value
+
+
 class Service(_Closed):
     name: _ServiceName
     restart_argv: _Argv
@@ -103,6 +121,9 @@ class Service(_Closed):
     # release into it after the stop and before the restart (ADR 0161).
     venv: _Path | None = None
     health: Annotated[HealthFile | HealthHttp, Field(discriminator="kind")]
+    # Optional: the program and arguments this service starts with. The preflight (and the
+    # post-install smoke check) runs its ``--check-config`` under this release.
+    config_check: ConfigCheck | None = None
     health_wait_seconds: Annotated[int, Field(ge=5, le=900)] = 120
     command_timeout_seconds: Annotated[int, Field(ge=5, le=300)] = 60
 
@@ -136,6 +157,12 @@ class UpgradePlan(_Closed):
     providers_file: _Path | None = None
     services: Annotated[list[Service], Field(min_length=1, max_length=8)]
     smoke_cpu: bool = False
+    # How long the services are expected to stay stopped. An active execution lease that would
+    # expire within this time lapses during the stop (the executor renews to 150 s and cannot
+    # renew while stopped), so the run refuses. Recorded stops took 20 s to 3.5 min; 120 s
+    # covers a typical stop-install-start and is below the 150 s lease, so it passes only when
+    # every lease was just renewed. Set 150 or more to refuse whenever any lease is held.
+    expected_downtime_seconds: Annotated[int, Field(ge=5, le=3600)] = 120
 
     @field_validator(
         "state_dir", "backup_dir", "receipt_dir", "providers_file", "repo_root", "install_source"
@@ -235,6 +262,7 @@ def load_plan(path: Path | str) -> UpgradePlan:
 
 __all__ = [
     "PLAN_SCHEMA",
+    "ConfigCheck",
     "HealthFile",
     "HealthHttp",
     "PlanError",
