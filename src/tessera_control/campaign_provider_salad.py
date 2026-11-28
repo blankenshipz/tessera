@@ -110,6 +110,73 @@ ROUTE_SLOT_SQL = (
 )
 
 
+# GPU runtime status-line reasons (workloads/gpu_runtime_v1 ``Failure`` codes) that name a
+# custody or input call the guardian refused or could not answer, never the stage's own code:
+# the claim or a custody POST (``custody``), the input read (``input_fetch``,
+# ``input_unavailable``) and the output plan (``output_plan``). ``entry``/``entry_timeout`` (the
+# stage's code failed) and every other reason are not in it.
+RUNTIME_CUSTODY_REASONS = frozenset({"custody", "input_fetch", "input_unavailable", "output_plan"})
+RUNTIME_ENTRY_REASONS = frozenset({"entry", "entry_timeout"})
+RUNTIME_EXIT_SIGNAL = "runtime_exit"
+
+
+def _provider_moved_final(final: Any) -> bool:
+    """The guardian's own final shows a provider move: ``allocation_uncertain`` (set only by an
+    allocation or machine change it could not adopt) with the ``allocation_changed`` stop, or the
+    safety service's provider-confirmed close that only an uncertain allocation reaches."""
+    from .salad_guardian import RECONCILE_PROVIDER
+
+    if type(final) is not dict or final.get("allocation_uncertain") is not True:
+        return False
+    return final.get("reason") == "allocation_changed" or (
+        final.get("status") == "reconciled" and final.get("reason") == RECONCILE_PROVIDER
+    )
+
+
+def _runtime_exit_on_moved_frame(final: Any, receipt: Any) -> str | None:
+    """``infra_salad_reallocated`` detail for a recorded non-zero exit the provider move caused,
+    else None (the exit stays ``salad_container_exited_nonzero``, permanent).
+
+    Needs the guardian's own final to show a provider move, and then one of:
+
+    * the runtime's last status line in the guardian's log tail names a custody or input
+      refusal (``RUNTIME_CUSTODY_REASONS``) and no status line names ``entry``; or
+    * the tail holds no runtime status line (unavailable, unread, sealed or cut) and the run
+      never began custody (the receipt's ``custody_work_begun`` is exactly False, from the
+      guardian's status), so the stage's code never ran.
+
+    The tail is untrusted text, so it only narrows what the guardian's record shows: a status
+    line naming ``entry``/``entry_timeout`` anywhere keeps the exit permanent, and an
+    unavailable or unreadable tail with custody begun stays permanent (an unknown cause is not
+    loosened). Exit codes are never consulted (``infra_exit_codes`` is unchanged)."""
+    from .salad_container_log import runtime_status_lines
+
+    if not _provider_moved_final(final):
+        return None
+    lines = runtime_status_lines(final.get("container_log"))
+    if any(line.get("reason") in RUNTIME_ENTRY_REASONS for line in lines):
+        return None
+    failed = [line for line in lines if line.get("status") == "failed"]
+    last = failed[-1] if failed else None
+    begun = receipt.get("custody_work_begun") if type(receipt) is dict else None
+    if last is not None:
+        # The runtime said why it failed: only a custody or input refusal is the move's doing.
+        # A pre-claim failure (argv, manifest, fetch, install) is the stage's own, even though
+        # custody never began, and a crash loop is what makes the provider move a group.
+        if last.get("reason") not in RUNTIME_CUSTODY_REASONS:
+            return None
+        step = f", step {last['step']}" if "step" in last else ""
+        cause = f"the runtime reported {last['reason']}{step}"
+    elif begun is False:
+        cause = "custody never began"
+    else:
+        return None
+    return (
+        f"{INFRA_SALAD_REALLOCATED}: signal={RUNTIME_EXIT_SIGNAL}; the container exited non-zero "
+        f"after the provider moved the allocation ({cause}); the stage's own code did not fail"
+    )[:500]
+
+
 def route_slot_params() -> tuple[str, ...]:
     """Bind values for ``ROUTE_SLOT_SQL``, in order."""
     return (*_TERMINAL, PROVIDER_ID, *ROUTE_SLOT_PHASES)
@@ -903,6 +970,21 @@ class SaladRouteProvider:
                 manifest_id=attempt.get("manifest_id"),
             )
         exited = exit_failure_detail(self._guardian_record(rt, attempt, "start_events"))
+        moved = None if exited is None else self._moved_runtime_exit(rt, attempt)
+        if moved is not None:
+            # A provider move broke the run's custody calls, not the stage's own code: the
+            # guardian's own final shows the move, and either the run never began custody or
+            # the GPU runtime's status line names a custody/input refusal (never ``entry``).
+            # Infrastructure, retried within ``retry.infra_retries`` and settled like any
+            # provider-moved attempt (``_runtime_exit_on_moved_frame``).
+            return Observation(
+                "failed_transient",
+                failure_class=INFRA_SALAD_REALLOCATED,
+                detail=moved,
+                evidence_kind="salad_live_receipt",
+                evidence_digest=evidence,
+                manifest_id=attempt.get("manifest_id"),
+            )
         if exited is not None:
             # The recorded system events name a non-zero process exit (not a kill or a platform
             # stop): the workload's own entry failure. A replacement machine would fail the same
@@ -1154,6 +1236,29 @@ class SaladRouteProvider:
         ):
             return found  # a declared-run cap overrun is the workload's, not the route's
         return None
+
+    def _moved_runtime_exit(self, rt: RunnerServices, attempt: Mapping[str, Any]) -> str | None:
+        """The retryable detail for a non-zero exit on a provider-moved frame, else None."""
+        row = None
+        if rt is not None and attempt.get("id") is not None:
+            row = rt._one(
+                "SELECT guardian_final_json, live_receipt_json FROM campaign_salad_attempts "
+                "WHERE attempt_id=?",
+                (attempt["id"],),
+            )
+        if row is None:
+            return None
+
+        def parsed(name: str) -> Any:
+            try:
+                value = row[name]
+                return json.loads(value) if value is not None else None
+            except (IndexError, KeyError, TypeError, ValueError):
+                return None
+
+        return _runtime_exit_on_moved_frame(
+            parsed("guardian_final_json"), parsed("live_receipt_json")
+        )
 
     @staticmethod
     def _guardian_record(rt: RunnerServices, attempt: Mapping[str, Any], key: str) -> Any:

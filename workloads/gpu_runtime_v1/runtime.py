@@ -32,6 +32,7 @@ read-only input tree.
 
 import base64
 import binascii
+import contextlib
 import fcntl
 import hashlib
 import http.client
@@ -141,6 +142,24 @@ _INDEX_KEYS = {"seq", "relative_path", "offset", "size", "sha256"}
 _INPUT_RANGE_KEYS = {"schema", "snapshot_id", "seq", "offset", "length", "content_base64"}
 
 
+# The custody phase a failure happened in; the status line carries only these tokens.
+STEPS = frozenset({"claim", "manifest", "chunk", "output_plan", "upload"})
+
+
+@contextlib.contextmanager
+def _step(name):
+    """Tag an exception leaving this block with the phase it came from (innermost wins)."""
+    try:
+        yield
+    except BaseException as exc:
+        if name in STEPS and getattr(exc, "step", None) is None:
+            try:
+                exc.step = name
+            except Exception:  # pragma: no cover - an exception that refuses attributes
+                pass
+        raise
+
+
 class Failure(Exception):
     """Intentionally detail-free; ``code`` is a closed, non-sensitive token."""
 
@@ -150,6 +169,7 @@ class Failure(Exception):
         self.exit_code = None  # the entry's exit status when the entry itself failed
         self.partial = False  # declared outputs that existed were uploaded, marked partial
         self.outputs = None  # what that partial upload retained
+        self.step = None  # the custody phase it failed in (one of STEPS), when it is one
         self.reported = False  # the guardian recorded the failure and will stop the container
 
 
@@ -1256,23 +1276,24 @@ def fetch_input(custody, expected, work, deadline):
                 spare[0] -= 1
         raise Failure("input_fetch")  # pragma: no cover
 
-    reply = call(request="manifest")
-    if (
-        set(reply) != {"schema", "snapshot_id", "digest", "manifest", "delivery", "chunks"}
-        or reply["schema"] != "tessera.input-manifest.v1"
-        or reply["delivery"] != "chunked"
-        or not isinstance(reply["snapshot_id"], str)
-        or not reply["snapshot_id"]
-    ):
-        raise Failure("input")
-    if reply["digest"] != expected["digest"]:
-        raise Failure("input_digest")
-    snapshot = {k: reply[k] for k in ("digest", "manifest", "delivery", "chunks")}
-    snapshot["id"] = reply["snapshot_id"]
-    files = verify_input_manifest(snapshot, expected["digest"])
-    index = verify_input_index(snapshot)
-    if snapshot["manifest"]["total_bytes"] > expected["max_bytes"]:
-        raise Failure("input_size")
+    with _step("manifest"):
+        reply = call(request="manifest")
+        if (
+            set(reply) != {"schema", "snapshot_id", "digest", "manifest", "delivery", "chunks"}
+            or reply["schema"] != "tessera.input-manifest.v1"
+            or reply["delivery"] != "chunked"
+            or not isinstance(reply["snapshot_id"], str)
+            or not reply["snapshot_id"]
+        ):
+            raise Failure("input")
+        if reply["digest"] != expected["digest"]:
+            raise Failure("input_digest")
+        snapshot = {k: reply[k] for k in ("digest", "manifest", "delivery", "chunks")}
+        snapshot["id"] = reply["snapshot_id"]
+        files = verify_input_manifest(snapshot, expected["digest"])
+        index = verify_input_index(snapshot)
+        if snapshot["manifest"]["total_bytes"] > expected["max_bytes"]:
+            raise Failure("input_size")
     root = os.path.join(work, INPUT_DIR)
     os.mkdir(root, 0o700)  # never pre-existing: prepare_work emptied <work>
     directories = {root}
@@ -1301,14 +1322,17 @@ def fetch_input(custody, expected, work, deadline):
                 with os.fdopen(fd, "wb") as out:
                     for item in by_path.get(path, []):
                         parts = []
-                        for offset in range(0, item["size"], INPUT_RANGE_BYTES):
-                            length = min(INPUT_RANGE_BYTES, item["size"] - offset)
-                            reply = call(
-                                request="chunk", seq=item["seq"], offset=offset, length=length
-                            )
-                            parts.append(decode_input_range(snapshot, item, offset, length, reply))
-                        # Nothing is written until the whole stored chunk verifies.
-                        content = verify_input_chunk(item, b"".join(parts))
+                        with _step("chunk"):
+                            for offset in range(0, item["size"], INPUT_RANGE_BYTES):
+                                length = min(INPUT_RANGE_BYTES, item["size"] - offset)
+                                reply = call(
+                                    request="chunk", seq=item["seq"], offset=offset, length=length
+                                )
+                                parts.append(
+                                    decode_input_range(snapshot, item, offset, length, reply)
+                                )
+                            # Nothing is written until the whole stored chunk verifies.
+                            content = verify_input_chunk(item, b"".join(parts))
                         written += len(content)
                         total += len(content)
                         if written > entry["size"] or total > expected["max_bytes"]:
@@ -1932,10 +1956,11 @@ def upload_outputs(custody, staged, require_complete=True):
     """
     spare = UPLOAD_RETRY_BUDGET
     complete = False
-    for name, path, size, digest in staged:
-        spare, complete = _put_file(custody, name, path, size, digest, spare)
-    if require_complete and not complete:
-        raise Failure("custody")
+    with _step("upload"):
+        for name, path, size, digest in staged:
+            spare, complete = _put_file(custody, name, path, size, digest, spare)
+        if require_complete and not complete:
+            raise Failure("custody")
     return [{"name": n, "sha256": d, "bytes": z} for n, _, z, d in staged]
 
 
@@ -1991,8 +2016,9 @@ def execute(
     if deadline - time.monotonic() < MIN_CLAIM_SECONDS:
         raise Failure("deadline")
     custody = custody_factory(binding_of(request), deadline + UPLOAD_GRACE_SECONDS)
-    if custody.begin_once() is not True:
-        raise Failure("custody")
+    with _step("claim"):
+        if custody.begin_once() is not True:
+            raise Failure("custody")
     # The claim is spent: from here a failure is reported to the guardian, which stops
     # the group at once, so the exit is never taken for a provider move.
     try:
@@ -2009,7 +2035,8 @@ def _run_claimed(
     request, deadline, work, out_dir, custody, opener, installer, entry_runner,
     manifest, expected_input, from_input, paths, site, fetched,
 ):  # fmt: skip
-    plan = validate_plan(custody.output_plan(), request)
+    with _step("output_plan"):
+        plan = validate_plan(custody.output_plan(), request)
     names = {name for name, _ in plan}
     caps = dict(plan)
     ckpt_dir = os.path.join(work, "ckpt")
@@ -2134,6 +2161,9 @@ def main(argv):
     except BaseException as exc:
         reason = exc.code if isinstance(exc, Failure) else "failed"
         line = {"schema": STATUS_SCHEMA, "status": "failed", "reason": reason}
+        step = getattr(exc, "step", None)
+        if step in STEPS:
+            line["step"] = step
         exit_code = getattr(exc, "exit_code", None)
         if exit_code is not None:
             line["exit_code"] = exit_code

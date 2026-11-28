@@ -698,7 +698,7 @@ writers and stops the exact group through the ordinary stop-only path; the provi
 still confirms the stop. A kill that came first (`[137, 1]`) keeps today's handling. Once the
 watch recorded the events, the post-stop events read is not sent again. Control classifies the
 attempt `failed_permanent` / `salad_container_exited_nonzero` with the exit code in its detail,
-whatever stop cause the guardian recorded, so it never spends `retry.infra_retries`. A group
+whatever stop cause the guardian recorded, so it never spends `retry.infra_retries`. The one exception is an exit on a frame the provider moved whose runtime status line names a custody or input refusal (or, with no status line, custody never began): that is `failed_transient` / `infra_salad_reallocated` and spends one (ADR 0224). A group
 whose guardian already stopped (a reported workload failure included) is not watched.
 
 After a recorded non-zero exit (from the watch or the post-stop read) the service sends one

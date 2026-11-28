@@ -8,6 +8,7 @@ anything malformed yields an empty or unavailable record, never an exception.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from typing import Any
 
@@ -87,6 +88,62 @@ def sanitize_line(line: str) -> str:
     return text.strip()[:MAX_LINE_CHARS]
 
 
+# The GPU runtime's own last line (workloads/gpu_runtime_v1): one compact JSON object. Only these
+# keys are kept, each a closed token or a small integer, so it never carries workload text.
+RUNTIME_STATUS_SCHEMA = "tessera.gpu-runtime-status.v1"
+RUNTIME_STATUS_TOKEN = re.compile(r"[a-z][a-z0-9_]{0,39}")
+RUNTIME_STEPS = frozenset({"claim", "manifest", "chunk", "output_plan", "upload"})
+
+
+def _runtime_status_line(body: dict) -> str | None:
+    """A ``json_log`` object that is the runtime's status line, as one closed compact JSON line
+    (``schema``, ``status``, ``reason``, ``step`` and an integer ``exit_code``), else None.
+
+    Salad may hand a JSON stdout line back parsed; without this its keys and its integer
+    ``exit_code`` were dropped and the line could not be read again."""
+    if body.get("schema") != RUNTIME_STATUS_SCHEMA:
+        return None
+    kept: dict[str, Any] = {"schema": RUNTIME_STATUS_SCHEMA}
+    for key in ("status", "reason"):
+        if type(body.get(key)) is str and RUNTIME_STATUS_TOKEN.fullmatch(body[key]):
+            kept[key] = body[key]
+    if body.get("step") in RUNTIME_STEPS:
+        kept["step"] = body["step"]
+    code = body.get("exit_code")
+    if type(code) is int and -255 <= code <= 255:
+        kept["exit_code"] = code
+    return json.dumps(kept, sort_keys=True, separators=(",", ":"))
+
+
+def runtime_status_lines(container_log: Any) -> list[dict[str, Any]]:
+    """The runtime status lines a closed tail holds, in order, each reduced to closed tokens.
+
+    The tail is untrusted (the workload writes to the same stream), so a caller may only use
+    these to narrow a decision the guardian's own record already supports."""
+    closed = closed_container_log(container_log)
+    found: list[dict[str, Any]] = []
+    for line in (closed or {}).get("lines") or []:
+        if RUNTIME_STATUS_SCHEMA not in line:
+            continue
+        try:
+            body = json.loads(line)
+        except ValueError:
+            continue
+        if type(body) is not dict or body.get("schema") != RUNTIME_STATUS_SCHEMA:
+            continue
+        status = {
+            key: body[key]
+            for key in ("status", "reason")
+            if type(body.get(key)) is str and RUNTIME_STATUS_TOKEN.fullmatch(body[key])
+        }
+        if body.get("step") in RUNTIME_STEPS:
+            status["step"] = body["step"]
+        if type(body.get("exit_code")) is int:
+            status["exit_code"] = body["exit_code"]
+        found.append(status)
+    return found
+
+
 def _texts(entry: Any) -> list[str]:
     if not isinstance(entry, dict):
         return []
@@ -96,7 +153,11 @@ def _texts(entry: Any) -> list[str]:
         found.append(text)
     body = entry.get("json_log")
     if isinstance(body, dict):
-        found.extend(v for v in body.values() if isinstance(v, str))
+        status = _runtime_status_line(body)
+        if status is not None:
+            found.append(status)
+        else:
+            found.extend(v for v in body.values() if isinstance(v, str))
     return found
 
 

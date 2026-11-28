@@ -286,7 +286,10 @@ declared outputs well under 16 MiB until a live run has measured the uplink.
 Success prints `{"schema":"tessera.gpu-runtime-status.v1","status":"retained",
 "outputs":[{name, sha256, bytes}, ...]}`. Failures print only
 `{"schema":"tessera.gpu-runtime-status.v1","status":"failed","reason":<closed code>}`
-plus, when the entry itself failed, its `exit_code` and, for a partial upload,
+plus, when the failure happened in a custody phase, a closed `step` token (`claim`
+for begin-once, `manifest` and `chunk` for the input reads, `output_plan`, `upload`
+for the output chunks and final post; omitted for any other phase, e.g. argv, fetch,
+install, entry or staging), when the entry itself failed, its `exit_code` and, for a partial upload,
 `"partial":true` and the uploaded `outputs`; no exception text or provider detail.
 
 ## Failure custody (ADR 0198)

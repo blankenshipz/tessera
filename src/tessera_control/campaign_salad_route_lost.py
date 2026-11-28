@@ -305,17 +305,19 @@ def release_refused_unleased(
     """ADR 0212 addendum: the executor refused an ``awaiting_lease`` attempt (a closed code).
     No worker ever took a lease and no operation exists, so the grant is given back at zero in
     one transaction (the shared reconcile accounting, ADR 0048; the same evidence as a paused
-    campaign's release, ``releasable_paused_grant``) and the attempt ends ``failed_transient``
+    or blocked campaign's release, ``releasable_unleased_grant``, which also re-reads inside
+    this transaction that the Salad row is still ``awaiting_lease`` with no lease or
+    operation) and the attempt ends ``failed_transient``
     / ``t1_salad_unclaimed`` with the refusal as its detail: the stage's own retry budget
     decides, at once, never by waiting out the grant. False (nothing changed) when that
     evidence no longer holds; the caller then waits for the next phase."""
-    from .campaign_slot_reclaim import record_slot_freed, releasable_paused_grant
+    from .campaign_slot_reclaim import record_slot_freed, releasable_unleased_grant
     from .execution import reconcile_grant_row
 
     runner = driver.runner
     with runner.store.runner_connection() as connection:
         runner._hold_lease(connection)
-        grant = releasable_paused_grant(connection, attempt["id"])
+        grant = releasable_unleased_grant(connection, attempt["id"])
         if grant is None:
             return False
         actor = runner._actor_principal(connection, ctx.campaign["id"])
